@@ -58,6 +58,12 @@ type JailConfig struct {
 	// on_match is always executed on a threshold hit.  When true, the query is
 	// run first; an exit code of 0 suppresses on_match (IP already handled).
 	QueryBeforeMatch bool `yaml:"query_before_match"`
+	// ActionTimeout is the maximum time allowed for each on_match action command
+	// to complete.  Defaults to 60s.  Scripts that perform remote lookups (e.g.
+	// WHOIS) may need more than the old implicit 10-second cap.
+	// Set to 0 to disable per-command timeouts (commands block until they exit
+	// or the daemon shuts down).
+	ActionTimeout Duration `yaml:"action_timeout"`
 }
 
 // JailActions holds the shell command templates run at various lifecycle points.
@@ -84,3 +90,7 @@ const defaultSocketPath = "/run/jailtime/jailtimed.sock"
 
 // defaultPollInterval is the default engine poll interval.
 const defaultPollInterval = 2 * time.Second
+
+// defaultActionTimeout is the default per-command timeout for on_match actions.
+// 60 seconds gives scripts that perform remote WHOIS lookups time to complete.
+const defaultActionTimeout = 60 * time.Second

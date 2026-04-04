@@ -61,6 +61,17 @@ func TestRunTimeout(t *testing.T) {
 	}
 }
 
+func TestRunZeroTimeoutNoDeadline(t *testing.T) {
+	// timeout=0 means no extra deadline; a short-lived command must complete normally.
+	result, err := Run(context.Background(), "sleep 0.1", Context{}, 0)
+	if err != nil {
+		t.Fatalf("expected no error with timeout=0, got: %v", err)
+	}
+	if result.ExitCode != 0 {
+		t.Errorf("expected exit code 0, got %d", result.ExitCode)
+	}
+}
+
 func TestRunAllStopsOnFailure(t *testing.T) {
 	templates := []string{"echo ok", "false", "echo never"}
 	results, err := RunAll(context.Background(), templates, Context{}, 0)

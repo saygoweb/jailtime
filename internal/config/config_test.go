@@ -153,6 +153,29 @@ func TestLoadQueryBeforeMatchFalseExplicit(t *testing.T) {
 	}
 }
 
+func TestLoadActionTimeoutDefault(t *testing.T) {
+	path := writeTemp(t, minimalValidYAML)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if c.Jails[0].ActionTimeout.Duration != 60*time.Second {
+		t.Errorf("ActionTimeout default = %v, want 60s", c.Jails[0].ActionTimeout.Duration)
+	}
+}
+
+func TestLoadActionTimeoutExplicit(t *testing.T) {
+	y := minimalValidYAML + "    action_timeout: 2m\n"
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if c.Jails[0].ActionTimeout.Duration != 2*time.Minute {
+		t.Errorf("ActionTimeout = %v, want 2m", c.Jails[0].ActionTimeout.Duration)
+	}
+}
+
 const jailFragmentYAML = `
 jails:
   - name: nginx

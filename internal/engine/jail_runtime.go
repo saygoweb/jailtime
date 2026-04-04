@@ -25,6 +25,10 @@ const (
 	StatusStopped JailStatus = "stopped"
 )
 
+// lifecycleTimeout is the per-command timeout for on_start, on_stop, and
+// on_restart actions.  These are expected to be fast administrative commands.
+const lifecycleTimeout = 10 * time.Second
+
 // debugRateLimiter allows at most maxPerSec log entries per second.
 type debugRateLimiter struct {
 	mu          sync.Mutex
@@ -121,7 +125,7 @@ func (jr *JailRuntime) Start(ctx context.Context) error {
 	cfg := jr.cfg
 	jr.mu.Unlock()
 
-	_, err := action.RunAll(ctx, cfg.Actions.OnStart, jr.lifecycleCtx(), 0)
+	_, err := action.RunAll(ctx, cfg.Actions.OnStart, jr.lifecycleCtx(), lifecycleTimeout)
 	return err
 }
 
@@ -132,7 +136,7 @@ func (jr *JailRuntime) Stop(ctx context.Context) error {
 	cfg := jr.cfg
 	jr.mu.Unlock()
 
-	_, err := action.RunAll(ctx, cfg.Actions.OnStop, jr.lifecycleCtx(), 0)
+	_, err := action.RunAll(ctx, cfg.Actions.OnStop, jr.lifecycleCtx(), lifecycleTimeout)
 	return err
 }
 
@@ -141,7 +145,7 @@ func (jr *JailRuntime) Restart(ctx context.Context) error {
 	jr.mu.RLock()
 	cfg := jr.cfg
 	jr.mu.RUnlock()
-	_, err := action.RunAll(ctx, cfg.Actions.OnRestart, jr.lifecycleCtx(), 0)
+	_, err := action.RunAll(ctx, cfg.Actions.OnRestart, jr.lifecycleCtx(), lifecycleTimeout)
 	return err
 }
 
@@ -335,6 +339,6 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		}
 	}
 
-	_, err = action.RunAll(ctx, cfg.Actions.OnMatch, actCtx, 0)
+	_, err = action.RunAll(ctx, cfg.Actions.OnMatch, actCtx, cfg.ActionTimeout.Duration)
 	return err
 }

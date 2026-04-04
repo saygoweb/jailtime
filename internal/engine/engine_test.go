@@ -557,3 +557,83 @@ if _, err := os.Stat(outFile); err == nil {
 t.Fatal("on_match should not have fired for invalid IP, but output file exists")
 }
 }
+
+// TestHandleEventActionTimeout verifies that on_match actions respect the
+// ActionTimeout config — a command that runs within the timeout completes
+// successfully, and one that exceeds it is killed and returns an error.
+func TestHandleEventActionTimeout(t *testing.T) {
+dir := t.TempDir()
+outFile := filepath.Join(dir, "output.txt")
+
+// Action sleeps briefly then writes the IP; ActionTimeout is generous enough.
+cfg := &config.JailConfig{
+Name:          "timeout-jail",
+Enabled:       true,
+Filters:       []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
+HitCount:      1,
+FindTime:      config.Duration{Duration: time.Minute},
+ActionTimeout: config.Duration{Duration: 5 * time.Second},
+Actions: config.JailActions{
+OnMatch: []string{"sleep 0.1 && echo {{ .IP }} > " + outFile},
+},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+
+evt := watch.Event{
+JailName: "timeout-jail",
+FilePath: "/var/log/auth.log",
+Line:     "Failed password from 5.6.7.8",
+Time:     time.Now(),
+}
+
+ctx := context.Background()
+if err := jr.HandleEvent(ctx, evt); err != nil {
+t.Fatalf("HandleEvent: %v", err)
+}
+
+data, err := os.ReadFile(outFile)
+if err != nil {
+t.Fatalf("on_match should have completed within ActionTimeout but output file missing: %v", err)
+}
+if got := strings.TrimSpace(string(data)); got != "5.6.7.8" {
+t.Fatalf("expected output %q, got %q", "5.6.7.8", got)
+}
+}
+
+// TestHandleEventActionTimeoutKills verifies that an on_match action that
+// exceeds ActionTimeout is killed and HandleEvent returns an error.
+func TestHandleEventActionTimeoutKills(t *testing.T) {
+cfg := &config.JailConfig{
+Name:          "timeout-kill-jail",
+Enabled:       true,
+Filters:       []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
+HitCount:      1,
+FindTime:      config.Duration{Duration: time.Minute},
+ActionTimeout: config.Duration{Duration: 100 * time.Millisecond},
+Actions: config.JailActions{
+OnMatch: []string{"sleep 10"},
+},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+
+evt := watch.Event{
+JailName: "timeout-kill-jail",
+FilePath: "/var/log/auth.log",
+Line:     "Failed password from 9.8.7.6",
+Time:     time.Now(),
+}
+
+ctx := context.Background()
+if err := jr.HandleEvent(ctx, evt); err == nil {
+t.Fatal("expected error when on_match action exceeds ActionTimeout, got nil")
+}
+}
+

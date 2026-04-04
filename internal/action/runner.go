@@ -37,20 +37,26 @@ func RunAll(ctx context.Context, templates []string, actCtx Context, timeout tim
 }
 
 // Run renders and executes a single command template.
+// A timeout of 0 means no additional per-command timeout is applied; the
+// command runs until it exits naturally or the parent context is cancelled.
+// A positive timeout adds a per-command deadline on top of any parent deadline.
+// For on_match actions, callers should pass cfg.ActionTimeout so that slow
+// scripts (e.g. those that perform a remote WHOIS lookup) are not killed
+// prematurely.
 func Run(ctx context.Context, tmpl string, actCtx Context, timeout time.Duration) (Result, error) {
-	if timeout == 0 {
-		timeout = defaultTimeout
-	}
-
 	rendered, err := Render(tmpl, actCtx)
 	if err != nil {
 		return Result{Command: tmpl, Error: err}, err
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	cmdCtx := ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		cmdCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
 
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", rendered)
+	cmd := exec.CommandContext(cmdCtx, "/bin/sh", "-c", rendered)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
