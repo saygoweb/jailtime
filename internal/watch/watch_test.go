@@ -411,6 +411,95 @@ t.Errorf("expected FilePath %q, got %q", path, ev.FilePath)
 }
 }
 
+// TestPollBackendSharedFile verifies that when two jails watch the same file,
+// each line is delivered as a separate event to each jail (file read once per tick).
+func TestPollBackendSharedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shared.log")
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	b := NewPollBackend(100 * time.Millisecond)
+	specs := []WatchSpec{
+		{JailName: "jail-a", Globs: []string{path}, ReadFromEnd: false},
+		{JailName: "jail-b", Globs: []string{path}, ReadFromEnd: false},
+	}
+	out, cancel := startBackend(t, b, specs)
+	defer cancel()
+
+	time.Sleep(150 * time.Millisecond)
+
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(af, "shared line")
+	af.Close()
+
+	seen := make(map[string]bool)
+	for i := 0; i < 2; i++ {
+		ev, ok := waitEvent(out, 2*time.Second)
+		if !ok {
+			t.Fatalf("timed out waiting for event %d/2 (got jails: %v)", i+1, seen)
+		}
+		if ev.Line != "shared line" {
+			t.Errorf("expected line %q, got %q", "shared line", ev.Line)
+		}
+		seen[ev.JailName] = true
+	}
+	if !seen["jail-a"] || !seen["jail-b"] {
+		t.Errorf("expected events for both jails, got: %v", seen)
+	}
+}
+
+// TestFsnotifyBackendSharedFile mirrors TestPollBackendSharedFile for fsnotify.
+func TestFsnotifyBackendSharedFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shared-fsnotify.log")
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	b := NewFsnotifyBackend(100 * time.Millisecond)
+	specs := []WatchSpec{
+		{JailName: "jail-c", Globs: []string{path}, ReadFromEnd: false},
+		{JailName: "jail-d", Globs: []string{path}, ReadFromEnd: false},
+	}
+	out, cancel := startBackend(t, b, specs)
+	defer cancel()
+
+	time.Sleep(150 * time.Millisecond)
+
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(af, "shared fsnotify line")
+	af.Close()
+
+	seen := make(map[string]bool)
+	for i := 0; i < 2; i++ {
+		ev, ok := waitEvent(out, 2*time.Second)
+		if !ok {
+			t.Fatalf("timed out waiting for event %d/2 (got jails: %v)", i+1, seen)
+		}
+		if ev.Line != "shared fsnotify line" {
+			t.Errorf("expected line %q, got %q", "shared fsnotify line", ev.Line)
+		}
+		seen[ev.JailName] = true
+	}
+	if !seen["jail-c"] || !seen["jail-d"] {
+		t.Errorf("expected events for both jails, got: %v", seen)
+	}
+}
+
 // TestDebugRateLimiterInWatch verifies the watch package's debugRateLimiter
 // allows exactly maxPerSec entries per window and resets after one second.
 func TestDebugRateLimiterInWatch(t *testing.T) {
