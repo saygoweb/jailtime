@@ -117,6 +117,112 @@ func TestLoadInvalidNetType(t *testing.T) {
 	}
 }
 
+const jailFragmentYAML = `
+jails:
+  - name: nginx
+    files:
+      - /var/log/nginx/access.log
+    filters:
+      - 'invalid user .* from (?P<ip>[0-9\.]+)'
+    actions:
+      on_match:
+        - 'iptables -I INPUT -s {{ .IP }} -j DROP'
+    hit_count: 3
+    find_time: 5m
+    jail_time: 30m
+`
+
+func TestLoadIncludeGlob(t *testing.T) {
+	dir := t.TempDir()
+
+	// Write a fragment file into a jails.d subdirectory.
+	jailsDir := dir + "/jails.d"
+	if err := os.Mkdir(jailsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fragPath := jailsDir + "/nginx.yaml"
+	if err := os.WriteFile(fragPath, []byte(jailFragmentYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write main config that includes the fragment via glob.
+	mainYAML := minimalValidYAML + "include:\n  - jails.d/*.yaml\n"
+	mainPath := dir + "/jail.yaml"
+	if err := os.WriteFile(mainPath, []byte(mainYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := Load(mainPath)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Jails) != 2 {
+		t.Fatalf("len(Jails) = %d, want 2", len(c.Jails))
+	}
+	names := map[string]bool{c.Jails[0].Name: true, c.Jails[1].Name: true}
+	if !names["sshd"] || !names["nginx"] {
+		t.Errorf("unexpected jail names: %v", names)
+	}
+}
+
+func TestLoadIncludeAbsoluteGlob(t *testing.T) {
+	dir := t.TempDir()
+
+	fragPath := dir + "/extra.yaml"
+	if err := os.WriteFile(fragPath, []byte(jailFragmentYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mainYAML := minimalValidYAML + "include:\n  - " + dir + "/*.yaml\n"
+	mainPath := dir + "/jail.yaml"
+	if err := os.WriteFile(mainPath, []byte(mainYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := Load(mainPath)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Jails) != 2 {
+		t.Fatalf("len(Jails) = %d, want 2 (sshd + nginx)", len(c.Jails))
+	}
+}
+
+func TestLoadIncludeNoMatch(t *testing.T) {
+	// A glob that matches nothing should be silently skipped.
+	mainYAML := minimalValidYAML + "include:\n  - jails.d/*.yaml\n"
+	path := writeTemp(t, mainYAML)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Jails) != 1 {
+		t.Errorf("len(Jails) = %d, want 1 (no extra files matched)", len(c.Jails))
+	}
+}
+
+func TestLoadIncludeDuplicateName(t *testing.T) {
+	dir := t.TempDir()
+
+	// Fragment defines a jail named "sshd" — same as the main config.
+	dupYAML := strings.Replace(jailFragmentYAML, "name: nginx", "name: sshd", 1)
+	fragPath := dir + "/dup.yaml"
+	if err := os.WriteFile(fragPath, []byte(dupYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mainYAML := minimalValidYAML + "include:\n  - " + dir + "/*.yaml\n"
+	mainPath := dir + "/jail.yaml"
+	if err := os.WriteFile(mainPath, []byte(mainYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Load(mainPath)
+	if err == nil {
+		t.Fatal("expected error for duplicate jail name, got nil")
+	}
+}
+
 func TestLoadDefaults(t *testing.T) {
 	path := writeTemp(t, minimalValidYAML)
 	c, err := Load(path)

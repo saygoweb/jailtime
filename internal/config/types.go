@@ -5,6 +5,7 @@ import "time"
 // Config is the top-level configuration structure.
 type Config struct {
 	Version int           `yaml:"version"`
+	Include []string      `yaml:"include"`
 	Logging LoggingConfig `yaml:"logging"`
 	Control ControlConfig `yaml:"control"`
 	Engine  EngineConfig  `yaml:"engine"`

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"gopkg.in/yaml.v3"
 )
@@ -32,11 +33,17 @@ type rawJailConfig struct {
 
 // rawConfig mirrors Config but uses raw sub-types to allow default detection.
 type rawConfig struct {
-	Version int              `yaml:"version"`
-	Logging LoggingConfig    `yaml:"logging"`
-	Control ControlConfig    `yaml:"control"`
-	Engine  rawEngineConfig  `yaml:"engine"`
-	Jails   []rawJailConfig  `yaml:"jails"`
+	Version int             `yaml:"version"`
+	Include []string        `yaml:"include"`
+	Logging LoggingConfig   `yaml:"logging"`
+	Control ControlConfig   `yaml:"control"`
+	Engine  rawEngineConfig `yaml:"engine"`
+	Jails   []rawJailConfig `yaml:"jails"`
+}
+
+// rawJailsFile is the schema for included fragment files, which may only define jails.
+type rawJailsFile struct {
+	Jails []rawJailConfig `yaml:"jails"`
 }
 
 // Load reads the YAML config at path, applies defaults, validates, and returns
@@ -54,8 +61,31 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config file %q: %w", path, err)
 	}
 
+	// Expand include globs and merge jails from fragment files.
+	for _, pattern := range raw.Include {
+		if !filepath.IsAbs(pattern) {
+			pattern = filepath.Join(filepath.Dir(path), pattern)
+		}
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("expanding include glob %q: %w", pattern, err)
+		}
+		for _, inc := range matches {
+			// Never re-include the main config file itself.
+			if inc == path {
+				continue
+			}
+			extra, err := loadJailsFile(inc)
+			if err != nil {
+				return nil, fmt.Errorf("include %q: %w", inc, err)
+			}
+			raw.Jails = append(raw.Jails, extra...)
+		}
+	}
+
 	c := &Config{
 		Version: raw.Version,
+		Include: raw.Include,
 		Logging: raw.Logging,
 		Control: raw.Control,
 		Engine: EngineConfig{
@@ -91,6 +121,21 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// loadJailsFile loads a jails-only fragment YAML file and returns its raw jail configs.
+func loadJailsFile(path string) ([]rawJailConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("reading file: %w", err)
+	}
+	var f rawJailsFile
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&f); err != nil {
+		return nil, fmt.Errorf("parsing file: %w", err)
+	}
+	return f.Jails, nil
 }
 
 func applyDefaults(c *Config, readFromEnd *bool) {
