@@ -118,6 +118,41 @@ func TestLoadInvalidNetType(t *testing.T) {
 	}
 }
 
+func TestLoadQueryBeforeMatchDefault(t *testing.T) {
+	path := writeTemp(t, minimalValidYAML)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if c.Jails[0].QueryBeforeMatch {
+		t.Error("QueryBeforeMatch should default to false when not set")
+	}
+}
+
+func TestLoadQueryBeforeMatchTrue(t *testing.T) {
+	y := minimalValidYAML + "    query: /usr/local/bin/ipset-test-cidr.sh mySet\n    query_before_match: true\n"
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if !c.Jails[0].QueryBeforeMatch {
+		t.Error("QueryBeforeMatch should be true when set to true in YAML")
+	}
+}
+
+func TestLoadQueryBeforeMatchFalseExplicit(t *testing.T) {
+	y := minimalValidYAML + "    query: /usr/local/bin/ipset-test-cidr.sh mySet\n    query_before_match: false\n"
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if c.Jails[0].QueryBeforeMatch {
+		t.Error("QueryBeforeMatch should be false when explicitly set to false in YAML")
+	}
+}
+
 const jailFragmentYAML = `
 jails:
   - name: nginx
