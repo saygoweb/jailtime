@@ -1,0 +1,69 @@
+# Sample D: CIDR-mode ipset DROP — idempotent, survives reboot
+#
+# On match, the offending IP is resolved to its containing network block
+# via `iptocidr` (e.g. 8.8.8.8 → 8.8.8.0/24).  The entire CIDR is added
+# to a hash:net ipset so that the whole network range is blocked, not just
+# the single IP.
+#
+# Idempotency / reboot survival:
+#   - on_start uses ipset-ensure.sh: creates the set only if missing.
+#   - on_stop uses ipset-flush.sh: clears entries but keeps the set.
+#     Combined with ipset-persistent / netfilter-persistent the set and
+#     its rules survive a reboot without needing another 'start'.
+#   - on_match uses `ipset add -exist` (via ipset-add-cidr.sh): if the
+#     CIDR is already present its timeout is refreshed, not duplicated.
+#
+# Prerequisites:
+#   - iptocidr on PATH (returns the network CIDR for a given IP)
+#   - Wrapper scripts installed: see deploy/setup.sh or copy manually:
+#       install -m755 samples/tools/*.sh /usr/local/lib/jailtime/
+#   - Optional but recommended for persistence across reboots:
+#       apt install ipset-persistent netfilter-persistent
+
+jails:
+  - name: nginx-cidr
+    enabled: true
+
+    # Nginx combined access log
+    files:
+      - /var/log/nginx/access.log
+
+    # Ignore successful responses
+    exclude_filters:
+      - '" [23][0-9][0-9] '
+
+    # Match repeated 4xx/5xx and extract the client IP.
+    # net_type: IP — jailtime validates the capture as a plain IP address.
+    # The CIDR conversion happens inside ipset-add-cidr.sh on_match.
+    filters:
+      - '^(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}) .* " [45][0-9][0-9] '
+
+    hit_count: 10
+    find_time: 1m
+    jail_time: 1h        # 3600 s — used as ipset per-entry timeout
+    net_type: IP
+
+    # Pre-check: is the CIDR for this IP already in the set?
+    # Exit 0 → already banned → skip on_match.
+    query: '/usr/local/lib/jailtime/ipset-test-cidr.sh jt_{{ .Jail }} {{ .IP }}'
+
+    actions:
+      on_start:
+        # Create ipset in hash:net (CIDR) mode with per-entry timeout support.
+        # ipset-ensure.sh is a no-op if the set already exists.
+        - '/usr/local/lib/jailtime/ipset-ensure.sh jt_{{ .Jail }} hash:net timeout 0 comment'
+        # Insert iptables INPUT DROP rule if not already present.
+        - '/usr/local/lib/jailtime/iptables-ensure.sh -I INPUT -m set --match-set jt_{{ .Jail }} src -j DROP -m comment --comment "jailtime:{{ .Jail }}"'
+
+      on_stop:
+        # Remove the iptables rule if present.
+        - '/usr/local/lib/jailtime/iptables-remove.sh -D INPUT -m set --match-set jt_{{ .Jail }} src -j DROP -m comment --comment "jailtime:{{ .Jail }}"'
+        # Flush entries but keep the ipset so ipset-persistent can save it.
+        - '/usr/local/lib/jailtime/ipset-flush.sh jt_{{ .Jail }}'
+
+      on_match:
+        # Resolve {{ .IP }} → CIDR via iptocidr, validate, add to ipset
+        # with a timeout of JailTime seconds (1 hour = 3600 s by default).
+        - '/usr/local/lib/jailtime/ipset-add-cidr.sh jt_{{ .Jail }} {{ .IP }} {{ .JailTime }}'
+
+      on_restart: []

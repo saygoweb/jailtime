@@ -60,6 +60,27 @@ install -m 755 -D tools/*.sh /usr/local/lib/jailtime/
 
 ---
 
+---
+
+### D — `d-nginx-drop-cidr.yaml` — CIDR-mode ipset DROP, idempotent, reboot-safe
+
+Like C, but bans entire network blocks rather than single IPs.  On each match
+the offending IP is resolved to its containing CIDR via the external tool
+`iptocidr` (e.g. `8.8.8.8 → 8.8.8.0/24`).  The CIDR is added to a `hash:net`
+ipset so the whole range is blocked.
+
+| Event      | Action |
+|------------|--------|
+| on_start   | `ipset-ensure.sh jt_<jail> hash:net …` + iptables INPUT DROP |
+| on_match   | `ipset-add-cidr.sh jt_<jail> <IP> <JailTime>` — calls `iptocidr`, validates output, adds CIDR |
+| on_stop    | remove iptables rule + `ipset-flush.sh` (keeps set for `ipset-persistent`) |
+| on_restart | — |
+
+Requires `iptocidr` on `$PATH`.  The query pre-check uses `ipset-test-cidr.sh`
+to skip the action if the CIDR is already in the set.
+
+---
+
 ## tools/
 
 | Script | Purpose |
@@ -68,6 +89,8 @@ install -m 755 -D tools/*.sh /usr/local/lib/jailtime/
 | `ipset-flush.sh` | Flush entries from an ipset without destroying it |
 | `iptables-ensure.sh` | Insert an iptables rule only if not already present (`-C` check before `-I`/`-A`) |
 | `iptables-remove.sh` | Delete an iptables rule only if present (`-C` check before `-D`) |
+| `ipset-add-cidr.sh` | Resolve IP→CIDR via `iptocidr`, validate output, add to `hash:net` ipset |
+| `ipset-test-cidr.sh` | Resolve IP→CIDR via `iptocidr`, test membership in `hash:net` ipset (for query pre-check) |
 
 ## Template variables
 
