@@ -289,6 +289,108 @@ func TestManagerRunRoutesEvents(t *testing.T) {
 
 	waitForContent(t, outFile, "31.24.155.180", 3*time.Second)
 }
+// writeRestartTestCfg writes a minimal jail YAML config to cfgFile.
+// The on_match action appends the literal jail_time seconds value to outFile
+// so tests can verify which config was in effect when the action ran.
+func writeRestartTestCfg(t *testing.T, cfgFile, logFile, outFile string, jailTimeSec int) {
+	t.Helper()
+	content := fmt.Sprintf(`version: 1
+engine:
+  poll_interval: 50ms
+  read_from_end: false
+jails:
+  - name: test-restart
+    enabled: true
+    files:
+      - %s
+    filters:
+      - '^(?P<ip>\S+) '
+    hit_count: 1
+    find_time: 1m
+    jail_time: %ds
+    actions:
+      on_match:
+        - 'echo %d >> %s'
+`, logFile, jailTimeSec, jailTimeSec, outFile)
+	if err := os.WriteFile(cfgFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRestartJailReloadsConfig is a regression test for the bug where
+// RestartJail did not apply updated config values to existing JailRuntimes.
+// After a restart the new jail_time (and any other changed config) must be
+// used by subsequent on_match actions.
+func TestRestartJailReloadsConfig(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "access.log")
+	outFile := filepath.Join(dir, "blocked.txt")
+	cfgFile := filepath.Join(dir, "jail.yaml")
+
+	if err := os.WriteFile(logFile, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initial config: jail_time=3600s (1h).
+	writeRestartTestCfg(t, cfgFile, logFile, outFile, 3600)
+
+	cfg, err := config.Load(cfgFile)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	mgr, err := NewManager(cfg, cfgFile)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	ctx := context.Background()
+	jr := mgr.jails["test-restart"]
+
+	// First trigger (IP 1.2.3.4) — must write "3600" to outFile.
+	if err := jr.HandleEvent(ctx, watch.Event{
+		JailName: "test-restart",
+		FilePath: logFile,
+		Line:     "1.2.3.4 - first hit",
+		Time:     time.Now(),
+	}); err != nil {
+		t.Fatalf("HandleEvent (before restart): %v", err)
+	}
+
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("outFile not created after first hit: %v", err)
+	}
+	if !strings.Contains(string(data), "3600") {
+		t.Fatalf("expected '3600' in output before restart, got %q", string(data))
+	}
+
+	// Update config on disk: jail_time=14400s (4h).
+	writeRestartTestCfg(t, cfgFile, logFile, outFile, 14400)
+
+	if err := mgr.RestartJail(ctx, "test-restart"); err != nil {
+		t.Fatalf("RestartJail: %v", err)
+	}
+
+	// Second trigger: use a different IP (2.3.4.5) so the HitTracker doesn't
+	// suppress the second event.  on_match must now write "14400".
+	if err := jr.HandleEvent(ctx, watch.Event{
+		JailName: "test-restart",
+		FilePath: logFile,
+		Line:     "2.3.4.5 - second hit",
+		Time:     time.Now(),
+	}); err != nil {
+		t.Fatalf("HandleEvent (after restart): %v", err)
+	}
+
+	data, err = os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("reading outFile after restart: %v", err)
+	}
+	if !strings.Contains(string(data), "14400") {
+		t.Fatalf("expected '14400' in output after restart (config reload), got %q", string(data))
+	}
+}
+
 // TestApacheWordpressIntegration_ThresholdResetAfterWindow verifies that hits
 // outside the find_time window are discarded and do not contribute to the
 // threshold, using HandleEvent directly with controlled timestamps.
