@@ -557,3 +557,119 @@ if _, err := os.Stat(outFile); err == nil {
 t.Fatal("on_match should not have fired for invalid IP, but output file exists")
 }
 }
+
+// TestHandleEventInflightSkip verifies that a concurrent second threshold trigger
+// for the same IP is skipped while the first on_match action is still running.
+func TestHandleEventInflightSkip(t *testing.T) {
+dir := t.TempDir()
+countFile := filepath.Join(dir, "count.txt")
+
+// Action sleeps briefly to simulate a slow command (e.g. WHOIS lookup),
+// then appends a line to countFile so we can count executions.
+cfg := &config.JailConfig{
+Name:     "inflight-jail",
+Enabled:  true,
+Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
+HitCount: 1,
+FindTime: config.Duration{Duration: time.Minute},
+Actions: config.JailActions{
+OnMatch: []string{"sleep 0.2 && echo hit >> " + countFile},
+},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+
+evt := watch.Event{
+JailName: "inflight-jail",
+FilePath: "/var/log/auth.log",
+Line:     "Failed password from 7.7.7.7",
+Time:     time.Now(),
+}
+
+ctx := context.Background()
+
+// Fire three concurrent HandleEvent calls for the same IP.  Each one
+// re-records the hit (HitCount=1 threshold, so each triggers on_match),
+// but only the first should actually run the action.
+errs := make(chan error, 3)
+for i := 0; i < 3; i++ {
+go func() {
+errs <- jr.HandleEvent(ctx, evt)
+}()
+}
+for i := 0; i < 3; i++ {
+if err := <-errs; err != nil {
+t.Errorf("HandleEvent[%d] unexpected error: %v", i, err)
+}
+}
+
+// Wait for the in-flight action to finish.
+time.Sleep(400 * time.Millisecond)
+
+data, err := os.ReadFile(countFile)
+if err != nil {
+t.Fatalf("countFile not created — no on_match ran: %v", err)
+}
+lines := strings.Count(strings.TrimSpace(string(data)), "hit")
+if lines != 1 {
+t.Fatalf("expected exactly 1 on_match execution, got %d (countFile: %q)", lines, string(data))
+}
+}
+
+// TestHandleEventInflightDifferentIPs verifies that concurrent on_match actions
+// for different IPs are NOT blocked by each other.
+func TestHandleEventInflightDifferentIPs(t *testing.T) {
+dir := t.TempDir()
+
+cfg := &config.JailConfig{
+Name:     "inflight-multi-jail",
+Enabled:  true,
+Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
+HitCount: 1,
+FindTime: config.Duration{Duration: time.Minute},
+Actions: config.JailActions{
+OnMatch: []string{"sleep 0.1 && echo {{ .IP }} >> " + filepath.Join(dir, "out.txt")},
+},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+
+ctx := context.Background()
+ips := []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}
+errs := make(chan error, len(ips))
+for _, ip := range ips {
+ip := ip
+go func() {
+errs <- jr.HandleEvent(ctx, watch.Event{
+JailName: "inflight-multi-jail",
+FilePath: "/var/log/auth.log",
+Line:     "Failed password from " + ip,
+Time:     time.Now(),
+})
+}()
+}
+for i := 0; i < len(ips); i++ {
+if err := <-errs; err != nil {
+t.Errorf("HandleEvent error: %v", err)
+}
+}
+
+time.Sleep(300 * time.Millisecond)
+
+data, err := os.ReadFile(filepath.Join(dir, "out.txt"))
+if err != nil {
+t.Fatalf("output file not created: %v", err)
+}
+got := strings.TrimSpace(string(data))
+for _, ip := range ips {
+if !strings.Contains(got, ip) {
+t.Errorf("expected IP %s in output, but it was missing:\n%s", ip, got)
+}
+}
+}

@@ -65,6 +65,10 @@ type JailRuntime struct {
 	mu       sync.RWMutex
 	status   JailStatus
 	debugLog *debugRateLimiter
+	// inflight tracks IPs that currently have an on_match action running.
+	// Only one on_match execution per IP is allowed at a time; concurrent
+	// threshold triggers for an in-flight IP are silently skipped.
+	inflight sync.Map
 }
 
 func NewJailRuntime(cfg *config.JailConfig) (*JailRuntime, error) {
@@ -309,6 +313,19 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		"count", count,
 		"threshold", threshold,
 	)
+
+	// Ensure at most one on_match action runs per IP at a time.
+	// If a previous trigger for the same IP is still executing its actions,
+	// skip this one — the IP will re-trigger once the in-flight action
+	// completes and the hit window fills again.
+	if _, alreadyInFlight := jr.inflight.LoadOrStore(result.IP, struct{}{}); alreadyInFlight {
+		slog.Info("on_match already in flight for ip, skipping duplicate trigger",
+			"jail", cfg.Name,
+			"ip", result.IP,
+		)
+		return nil
+	}
+	defer jr.inflight.Delete(result.IP)
 
 	actCtx := action.Context{
 		IP:        result.IP,
