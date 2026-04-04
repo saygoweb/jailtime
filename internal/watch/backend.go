@@ -2,6 +2,8 @@ package watch
 
 import (
 	"context"
+	"log/slog"
+	"sync"
 	"time"
 )
 
@@ -30,16 +32,54 @@ type Backend interface {
 	UpdateSpecs(specs []WatchSpec)
 }
 
-// NewAuto selects the best available backend.
-// mode can be "auto", "fsnotify", or "poll".
-// For "auto" and "fsnotify": try fsnotify backend first, fall back to poll.
-// For "poll": use poll backend directly.
-func NewAuto(mode string, pollInterval time.Duration) Backend {
-	if mode == "poll" {
-		return NewPollBackend(pollInterval)
+// debugRateLimiter allows at most maxPerSec log entries per second.
+type debugRateLimiter struct {
+	mu          sync.Mutex
+	windowStart time.Time
+	count       int
+	maxPerSec   int
+	now         func() time.Time
+}
+
+func newDebugRateLimiter(maxPerSec int) *debugRateLimiter {
+	return &debugRateLimiter{maxPerSec: maxPerSec, now: time.Now}
+}
+
+func (r *debugRateLimiter) Allow() bool {
+	t := r.now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.windowStart.IsZero() || t.Sub(r.windowStart) >= time.Second {
+		r.windowStart = t
+		r.count = 0
 	}
-	// "auto" or "fsnotify": try fsnotify, it will be used directly since
-	// fsnotify is available; the FsnotifyBackend handles its own fallback via
-	// periodic glob rescanning.
-	return NewFsnotifyBackend(pollInterval)
+	if r.count < r.maxPerSec {
+		r.count++
+		return true
+	}
+	return false
+}
+
+// NewAuto selects the best available backend based on mode.
+//
+// Accepted modes:
+//   - "poll":                use the filesystem-polling backend.
+//   - "auto", "fsnotify",
+//     "inotify", "os":       use the fsnotify backend (inotify on Linux),
+//     with automatic fallback to poll if fsnotify is unavailable.
+//
+// The selected backend is logged at Info level. For fsnotify/inotify modes,
+// the actual backend in use (fsnotify vs poll fallback) is also logged when
+// Start() is called.
+func NewAuto(mode string, pollInterval time.Duration) Backend {
+	switch mode {
+	case "poll":
+		slog.Info("watch backend selected", "requested_mode", mode, "backend", "poll")
+		return NewPollBackend(pollInterval)
+	default: // "auto", "fsnotify", "inotify", "os"
+		// "inotify" and "os" are aliases for the fsnotify backend, which uses
+		// the kernel inotify API on Linux.
+		slog.Info("watch backend selected", "requested_mode", mode, "backend", "fsnotify")
+		return NewFsnotifyBackend(pollInterval)
+	}
 }

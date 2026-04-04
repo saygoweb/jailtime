@@ -32,7 +32,8 @@ type ControlConfig struct {
 
 // EngineConfig controls file-watching behaviour.
 type EngineConfig struct {
-	// WatcherMode is "auto", "os", "fsnotify", or "poll".
+	// WatcherMode is "auto", "os", "fsnotify", "inotify", or "poll".
+	// "inotify" and "os" are aliases for "fsnotify" (uses inotify on Linux).
 	WatcherMode  string   `yaml:"watcher_mode"`
 	PollInterval Duration `yaml:"poll_interval"`
 	ReadFromEnd  bool     `yaml:"read_from_end"`

@@ -328,3 +328,116 @@ func TestFsnotifyBackendBasic(t *testing.T) {
 		t.Errorf("expected FilePath %q, got %q", path, ev.FilePath)
 	}
 }
+
+// TestInotifyBackendBasic verifies that the "inotify" mode alias creates a
+// working backend on Linux (fsnotify uses inotify under the hood).
+func TestInotifyBackendBasic(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "inotify.log")
+
+f, err := os.Create(path)
+if err != nil {
+t.Fatal(err)
+}
+f.Close()
+
+b := NewAuto("inotify", 100*time.Millisecond)
+specs := []WatchSpec{{JailName: "jail-inotify", Globs: []string{path}, ReadFromEnd: false}}
+out, cancel := startBackend(t, b, specs)
+defer cancel()
+
+time.Sleep(150 * time.Millisecond)
+
+af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+if err != nil {
+t.Fatal(err)
+}
+fmt.Fprintln(af, "inotify test line")
+af.Close()
+
+ev, ok := waitEvent(out, 2*time.Second)
+if !ok {
+t.Fatal("timed out waiting for inotify event")
+}
+if ev.Line != "inotify test line" {
+t.Errorf("expected line %q, got %q", "inotify test line", ev.Line)
+}
+if ev.JailName != "jail-inotify" {
+t.Errorf("expected JailName %q, got %q", "jail-inotify", ev.JailName)
+}
+if ev.FilePath != path {
+t.Errorf("expected FilePath %q, got %q", path, ev.FilePath)
+}
+}
+
+// TestOsModeBackendBasic verifies that the "os" mode alias creates a working
+// backend (resolves to the platform-native watcher).
+func TestOsModeBackendBasic(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "os-mode.log")
+
+f, err := os.Create(path)
+if err != nil {
+t.Fatal(err)
+}
+f.Close()
+
+b := NewAuto("os", 100*time.Millisecond)
+specs := []WatchSpec{{JailName: "jail-os", Globs: []string{path}, ReadFromEnd: false}}
+out, cancel := startBackend(t, b, specs)
+defer cancel()
+
+time.Sleep(150 * time.Millisecond)
+
+af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+if err != nil {
+t.Fatal(err)
+}
+fmt.Fprintln(af, "os mode test line")
+af.Close()
+
+ev, ok := waitEvent(out, 2*time.Second)
+if !ok {
+t.Fatal("timed out waiting for os-mode event")
+}
+if ev.Line != "os mode test line" {
+t.Errorf("expected line %q, got %q", "os mode test line", ev.Line)
+}
+if ev.JailName != "jail-os" {
+t.Errorf("expected JailName %q, got %q", "jail-os", ev.JailName)
+}
+if ev.FilePath != path {
+t.Errorf("expected FilePath %q, got %q", path, ev.FilePath)
+}
+}
+
+// TestDebugRateLimiterInWatch verifies the watch package's debugRateLimiter
+// allows exactly maxPerSec entries per window and resets after one second.
+func TestDebugRateLimiterInWatch(t *testing.T) {
+base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+mockNow := base
+
+rl := newDebugRateLimiter(2)
+rl.now = func() time.Time { return mockNow }
+
+if !rl.Allow() {
+t.Fatal("1st call in window should be allowed")
+}
+if !rl.Allow() {
+t.Fatal("2nd call in window should be allowed")
+}
+if rl.Allow() {
+t.Fatal("3rd call in window should be denied")
+}
+
+mockNow = base.Add(time.Second)
+if !rl.Allow() {
+t.Fatal("1st call after window reset should be allowed")
+}
+if !rl.Allow() {
+t.Fatal("2nd call after window reset should be allowed")
+}
+if rl.Allow() {
+t.Fatal("3rd call after window reset should be denied")
+}
+}

@@ -9,10 +9,11 @@ import (
 
 // FileTailer tails a single file, tracking inode and offset for rotation detection.
 type FileTailer struct {
-	path   string
-	file   *os.File
-	offset int64
-	inode  uint64
+	path     string
+	file     *os.File
+	offset   int64
+	inode    uint64
+	debugLog *debugRateLimiter
 }
 
 // NewFileTailer creates a tailer; if readFromEnd is true, starts at EOF.
@@ -21,7 +22,7 @@ func NewFileTailer(path string, readFromEnd bool) (*FileTailer, error) {
 	if err != nil {
 		return nil, err
 	}
-	ft := &FileTailer{path: path, file: f}
+	ft := &FileTailer{path: path, file: f, debugLog: newDebugRateLimiter(2)}
 
 	info, err := f.Stat()
 	if err != nil {

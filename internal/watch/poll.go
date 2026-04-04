@@ -2,6 +2,7 @@ package watch
 
 import (
 	"context"
+	"log/slog"
 	"path/filepath"
 	"sync"
 	"time"
@@ -95,6 +96,13 @@ func (b *PollBackend) Start(ctx context.Context, specs []WatchSpec, out chan<- E
 						continue
 					}
 					for _, line := range lines {
+						if slog.Default().Enabled(ctx, slog.LevelDebug) && ft.debugLog.Allow() {
+							slog.DebugContext(ctx, "line notified",
+								"jail", k.jailName,
+								"file", k.path,
+								"line", line,
+							)
+						}
 						select {
 						case out <- Event{
 							JailName: k.jailName,
