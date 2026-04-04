@@ -248,6 +248,47 @@ func TestApacheWordpressIntegration_FilterMatchesAllSampleLines(t *testing.T) {
 	}
 }
 
+// TestManagerRunRoutesEvents verifies that Manager.Run correctly starts the
+// watch backend in a goroutine and routes events to HandleEvent.  This is a
+// regression test for the bug where m.backend.Start was called synchronously,
+// causing the event-routing loop to never execute.
+func TestManagerRunRoutesEvents(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "access.log")
+	outFile := filepath.Join(dir, "blocked.txt")
+
+	if err := os.WriteFile(logFile, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Jails: []config.JailConfig{
+			*newApacheWPJailConfig(logFile, outFile, 1),
+		},
+		Engine: config.EngineConfig{
+			PollInterval: config.Duration{Duration: 50 * time.Millisecond},
+			ReadFromEnd:  false,
+		},
+	}
+
+	mgr, err := NewManager(cfg, "")
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = mgr.Run(ctx) }()
+
+	// Allow the manager and backend to initialise.
+	time.Sleep(200 * time.Millisecond)
+
+	// Write one matching line — threshold=1 so a single hit must trigger.
+	appendLines(t, logFile, []string{apacheWPLines[0]})
+
+	waitForContent(t, outFile, "31.24.155.180", 3*time.Second)
+}
 // TestApacheWordpressIntegration_ThresholdResetAfterWindow verifies that hits
 // outside the find_time window are discarded and do not contribute to the
 // threshold, using HandleEvent directly with controlled timestamps.

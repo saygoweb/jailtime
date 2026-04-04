@@ -73,12 +73,25 @@ func (m *Manager) Run(ctx context.Context) error {
 	m.mu.RUnlock()
 
 	events := make(chan watch.Event, 256)
-	if err := m.backend.Start(ctx, specs, events); err != nil {
-		return fmt.Errorf("starting watch backend: %w", err)
-	}
+
+	// Start the watch backend in a goroutine — its Start method blocks until
+	// ctx is cancelled, so the event-routing loop below must run concurrently.
+	backendErr := make(chan error, 1)
+	go func() {
+		if err := m.backend.Start(ctx, specs, events); err != nil && err != context.Canceled {
+			backendErr <- err
+		}
+		close(backendErr)
+	}()
 
 	for {
 		select {
+		case err := <-backendErr:
+			if err != nil {
+				return fmt.Errorf("watch backend: %w", err)
+			}
+			return nil
+
 		case <-ctx.Done():
 			stopCtx := context.Background()
 			m.mu.RLock()
@@ -99,6 +112,7 @@ func (m *Manager) Run(ctx context.Context) error {
 			jr, exists := m.jails[evt.JailName]
 			m.mu.RUnlock()
 			if !exists {
+				slog.Warn("event for unknown jail, dropping", "jail", evt.JailName)
 				continue
 			}
 			go func(jr *JailRuntime, evt watch.Event) {
