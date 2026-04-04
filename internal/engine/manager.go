@@ -163,6 +163,7 @@ func (m *Manager) RestartJail(ctx context.Context, name string) error {
 	m.mu.Lock()
 
 	// Collect jails to stop (removed or disabled) and remove them from the map.
+	// For jails that remain enabled, apply the new config in-place.
 	var toStop []*JailRuntime
 	for jailName, jr := range m.jails {
 		newJailCfg, exists := newJailCfgs[jailName]
@@ -171,6 +172,13 @@ func (m *Manager) RestartJail(ctx context.Context, name string) error {
 				toStop = append(toStop, jr)
 			}
 			delete(m.jails, jailName)
+		} else {
+			// Jail still exists and is enabled — update its config now so that
+			// subsequent HandleEvent calls and on_restart actions use the new values.
+			if err := jr.Reconfigure(newJailCfg); err != nil {
+				m.mu.Unlock()
+				return fmt.Errorf("reconfiguring jail %q: %w", jailName, err)
+			}
 		}
 	}
 

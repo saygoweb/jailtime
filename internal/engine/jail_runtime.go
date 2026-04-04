@@ -93,13 +93,35 @@ func (jr *JailRuntime) lifecycleCtx() action.Context {
 	}
 }
 
+// Reconfigure updates the jail's config and recompiles its filters.
+// It is safe to call concurrently with HandleEvent; the hit tracker is reset
+// because find_time and hit_count may have changed.
+func (jr *JailRuntime) Reconfigure(cfg *config.JailConfig) error {
+	includes, err := filter.CompileAll(cfg.Filters)
+	if err != nil {
+		return fmt.Errorf("compiling include filters: %w", err)
+	}
+	excludes, err := filter.CompileAll(cfg.ExcludeFilters)
+	if err != nil {
+		return fmt.Errorf("compiling exclude filters: %w", err)
+	}
+	jr.mu.Lock()
+	jr.cfg = cfg
+	jr.includes = includes
+	jr.excludes = excludes
+	jr.hits = NewHitTracker()
+	jr.mu.Unlock()
+	return nil
+}
+
 // Start sets status to started and runs on_start actions.
 func (jr *JailRuntime) Start(ctx context.Context) error {
 	jr.mu.Lock()
 	jr.status = StatusStarted
+	cfg := jr.cfg
 	jr.mu.Unlock()
 
-	_, err := action.RunAll(ctx, jr.cfg.Actions.OnStart, jr.lifecycleCtx(), 0)
+	_, err := action.RunAll(ctx, cfg.Actions.OnStart, jr.lifecycleCtx(), 0)
 	return err
 }
 
@@ -107,15 +129,19 @@ func (jr *JailRuntime) Start(ctx context.Context) error {
 func (jr *JailRuntime) Stop(ctx context.Context) error {
 	jr.mu.Lock()
 	jr.status = StatusStopped
+	cfg := jr.cfg
 	jr.mu.Unlock()
 
-	_, err := action.RunAll(ctx, jr.cfg.Actions.OnStop, jr.lifecycleCtx(), 0)
+	_, err := action.RunAll(ctx, cfg.Actions.OnStop, jr.lifecycleCtx(), 0)
 	return err
 }
 
 // Restart runs on_restart actions; status remains started.
 func (jr *JailRuntime) Restart(ctx context.Context) error {
-	_, err := action.RunAll(ctx, jr.cfg.Actions.OnRestart, jr.lifecycleCtx(), 0)
+	jr.mu.RLock()
+	cfg := jr.cfg
+	jr.mu.RUnlock()
+	_, err := action.RunAll(ctx, cfg.Actions.OnRestart, jr.lifecycleCtx(), 0)
 	return err
 }
 
@@ -130,9 +156,13 @@ func (jr *JailRuntime) Status() JailStatus {
 // globs, deduplicated, capped at limit (0 = no limit). If logFiles is true
 // each match is emitted via slog at Info level.
 func (jr *JailRuntime) ConfigFiles(limit int, logFiles bool) []string {
+	jr.mu.RLock()
+	cfg := jr.cfg
+	jr.mu.RUnlock()
+
 	seen := make(map[string]bool)
 	var files []string
-	for _, pattern := range jr.cfg.Files {
+	for _, pattern := range cfg.Files {
 		paths, _ := filepath.Glob(pattern)
 		for _, p := range paths {
 			if seen[p] {
@@ -140,7 +170,7 @@ func (jr *JailRuntime) ConfigFiles(limit int, logFiles bool) []string {
 			}
 			seen[p] = true
 			if logFiles {
-				slog.Info("config files match", "jail", jr.cfg.Name, "file", p)
+				slog.Info("config files match", "jail", cfg.Name, "file", p)
 			}
 			files = append(files, p)
 			if limit > 0 && len(files) >= limit {
@@ -156,6 +186,11 @@ func (jr *JailRuntime) ConfigFiles(limit int, logFiles bool) []string {
 // number that matched, and (when returnMatching is true) up to limit matching
 // lines (0 = no limit).
 func (jr *JailRuntime) ConfigTest(filePath string, limit int, returnMatching bool) (totalLines, matchingLines int, matches []string, err error) {
+	jr.mu.RLock()
+	includes := jr.includes
+	excludes := jr.excludes
+	jr.mu.RUnlock()
+
 	f, err := os.Open(filePath)
 	if err != nil {
 		return 0, 0, nil, err
@@ -166,7 +201,7 @@ func (jr *JailRuntime) ConfigTest(filePath string, limit int, returnMatching boo
 	for scanner.Scan() {
 		line := scanner.Text()
 		totalLines++
-		result, matchErr := filter.Match(line, jr.includes, jr.excludes)
+		result, matchErr := filter.Match(line, includes, excludes)
 		if matchErr != nil {
 			continue
 		}
@@ -185,7 +220,16 @@ func (jr *JailRuntime) ConfigTest(filePath string, limit int, returnMatching boo
 
 // HandleEvent processes a watch.Event through the filter/hit pipeline.
 func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
-	result, err := filter.Match(evt.Line, jr.includes, jr.excludes)
+	// Snapshot mutable config state under the read lock so a concurrent
+	// Reconfigure cannot race with this event's processing.
+	jr.mu.RLock()
+	cfg := jr.cfg
+	includes := jr.includes
+	excludes := jr.excludes
+	hits := jr.hits
+	jr.mu.RUnlock()
+
+	result, err := filter.Match(evt.Line, includes, excludes)
 	if err != nil {
 		return fmt.Errorf("filter match: %w", err)
 	}
@@ -194,7 +238,7 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		// Rate-limited debug log for non-matching lines.
 		if slog.Default().Enabled(ctx, slog.LevelDebug) && jr.debugLog.Allow() {
 			slog.DebugContext(ctx, "line considered",
-				"jail", jr.cfg.Name,
+				"jail", cfg.Name,
 				"file", evt.FilePath,
 				"line", evt.Line,
 				"matched", false,
@@ -205,18 +249,18 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 
 	// Filter matched — always log (matches are infrequent; no rate limit).
 	slog.Debug("filter matched",
-		"jail", jr.cfg.Name,
+		"jail", cfg.Name,
 		"file", evt.FilePath,
 		"line", evt.Line,
 		"ip", result.IP,
 	)
 
 	// Validate extracted address against configured net type.
-	switch jr.cfg.NetType {
+	switch cfg.NetType {
 	case "CIDR":
 		if _, _, cidrErr := net.ParseCIDR(result.IP); cidrErr != nil {
 			slog.Debug("ip validation failed",
-				"jail", jr.cfg.Name,
+				"jail", cfg.Name,
 				"ip", result.IP,
 				"net_type", "CIDR",
 				"error", cidrErr,
@@ -226,9 +270,9 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 	default: // "IP" or unset
 		if net.ParseIP(result.IP) == nil {
 			slog.Debug("ip validation failed",
-				"jail", jr.cfg.Name,
+				"jail", cfg.Name,
 				"ip", result.IP,
-				"net_type", jr.cfg.NetType,
+				"net_type", cfg.NetType,
 			)
 			return nil
 		}
@@ -239,19 +283,19 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		t = time.Now()
 	}
 
-	findTime := jr.cfg.FindTime.Duration
+	findTime := cfg.FindTime.Duration
 	if findTime == 0 {
 		findTime = time.Minute
 	}
-	threshold := jr.cfg.HitCount
+	threshold := cfg.HitCount
 	if threshold == 0 {
 		threshold = 1
 	}
 
-	count, triggered := jr.hits.Record(result.IP, t, findTime, threshold)
+	count, triggered := hits.Record(result.IP, t, findTime, threshold)
 	if !triggered {
 		slog.Debug("hit count below threshold",
-			"jail", jr.cfg.Name,
+			"jail", cfg.Name,
 			"ip", result.IP,
 			"count", count,
 			"threshold", threshold,
@@ -260,7 +304,7 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 	}
 
 	slog.Info("hit threshold reached, running on_match",
-		"jail", jr.cfg.Name,
+		"jail", cfg.Name,
 		"ip", result.IP,
 		"count", count,
 		"threshold", threshold,
@@ -268,21 +312,21 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 
 	actCtx := action.Context{
 		IP:        result.IP,
-		Jail:      jr.cfg.Name,
+		Jail:      cfg.Name,
 		File:      evt.FilePath,
 		Line:      evt.Line,
-		JailTime:  int64(jr.cfg.JailTime.Duration.Seconds()),
+		JailTime:  int64(cfg.JailTime.Duration.Seconds()),
 		FindTime:  int64(findTime.Seconds()),
 		HitCount:  count,
 		Timestamp: t.UTC().Format(time.RFC3339),
 	}
 
 	// Query pre-check: exit 0 means the IP is already blocked — skip on_match.
-	if jr.cfg.Query != "" {
-		res, _ := action.Run(ctx, jr.cfg.Query, actCtx, 10*time.Second)
+	if cfg.Query != "" {
+		res, _ := action.Run(ctx, cfg.Query, actCtx, 10*time.Second)
 		if res.ExitCode == 0 && res.Error == nil {
 			slog.Info("query pre-check suppressed on_match",
-				"jail", jr.cfg.Name,
+				"jail", cfg.Name,
 				"ip", result.IP,
 				"query_exit_code", res.ExitCode,
 			)
@@ -290,6 +334,6 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		}
 	}
 
-	_, err = action.RunAll(ctx, jr.cfg.Actions.OnMatch, actCtx, 0)
+	_, err = action.RunAll(ctx, cfg.Actions.OnMatch, actCtx, 0)
 	return err
 }
