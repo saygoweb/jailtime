@@ -3,6 +3,7 @@ package watch
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -12,6 +13,8 @@ import (
 // with periodic glob rescanning to pick up new matching files.
 type FsnotifyBackend struct {
 	pollInterval time.Duration
+	mu           sync.RWMutex
+	specs        []WatchSpec
 }
 
 func NewFsnotifyBackend(pollInterval time.Duration) *FsnotifyBackend {
@@ -20,14 +23,31 @@ func NewFsnotifyBackend(pollInterval time.Duration) *FsnotifyBackend {
 
 func (b *FsnotifyBackend) Name() string { return "fsnotify" }
 
+// UpdateSpecs replaces the current watch specs. The change takes effect on
+// the next rescan tick.
+func (b *FsnotifyBackend) UpdateSpecs(specs []WatchSpec) {
+	b.mu.Lock()
+	b.specs = specs
+	b.mu.Unlock()
+}
+
+func (b *FsnotifyBackend) getSpecs() []WatchSpec {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.specs
+}
+
 // Start watches files using fsnotify for WRITE/CREATE events.
 // Periodically rescans globs to pick up new matching files.
 // On CREATE event for a watched path, the FileTailer is reopened.
 func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan<- Event) error {
+	b.UpdateSpecs(specs)
+
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		// Fall back to poll backend.
-		return NewPollBackend(b.pollInterval).Start(ctx, specs, out)
+		pb := NewPollBackend(b.pollInterval)
+		return pb.Start(ctx, b.getSpecs(), out)
 	}
 	defer watcher.Close()
 
@@ -55,7 +75,7 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 	}
 
 	rescan := func() {
-		for _, spec := range specs {
+		for _, spec := range b.getSpecs() {
 			for _, pattern := range spec.Globs {
 				paths, err := filepath.Glob(pattern)
 				if err != nil {

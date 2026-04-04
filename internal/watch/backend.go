@@ -25,6 +25,9 @@ type WatchSpec struct {
 type Backend interface {
 	Name() string
 	Start(ctx context.Context, specs []WatchSpec, out chan<- Event) error
+	// UpdateSpecs replaces the set of watch specs. New jails are picked up on
+	// the next rescan/poll cycle; removed jails stop generating events.
+	UpdateSpecs(specs []WatchSpec)
 }
 
 // NewAuto selects the best available backend.

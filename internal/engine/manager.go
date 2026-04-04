@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -12,13 +13,14 @@ import (
 
 // Manager runs all jail runtimes and the watch backend.
 type Manager struct {
-	cfg     *config.Config
-	jails   map[string]*JailRuntime
-	backend watch.Backend
-	mu      sync.RWMutex
+	cfg        *config.Config
+	configPath string
+	jails      map[string]*JailRuntime
+	backend    watch.Backend
+	mu         sync.RWMutex
 }
 
-func NewManager(cfg *config.Config) (*Manager, error) {
+func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
 	jails := make(map[string]*JailRuntime, len(cfg.Jails))
 	for i := range cfg.Jails {
 		jailCfg := &cfg.Jails[i]
@@ -36,9 +38,10 @@ func NewManager(cfg *config.Config) (*Manager, error) {
 	backend := watch.NewAuto(cfg.Engine.WatcherMode, pollInterval)
 
 	return &Manager{
-		cfg:     cfg,
-		jails:   jails,
-		backend: backend,
+		cfg:        cfg,
+		configPath: configPath,
+		jails:      jails,
+		backend:    backend,
 	}, nil
 }
 
@@ -127,15 +130,102 @@ func (m *Manager) StopJail(ctx context.Context, name string) error {
 	return jr.Stop(ctx)
 }
 
-// RestartJail restarts a specific jail by name.
+// RestartJail reloads the config from disk, reconciles the set of running jails
+// (stopping removed/disabled jails and starting newly-added ones), then starts
+// or restarts the named jail.
 func (m *Manager) RestartJail(ctx context.Context, name string) error {
-	m.mu.RLock()
-	jr, ok := m.jails[name]
-	m.mu.RUnlock()
-	if !ok {
+	newCfg, err := config.Load(m.configPath)
+	if err != nil {
+		return fmt.Errorf("reloading config: %w", err)
+	}
+
+	newJailCfgs := make(map[string]*config.JailConfig, len(newCfg.Jails))
+	for i := range newCfg.Jails {
+		newJailCfgs[newCfg.Jails[i].Name] = &newCfg.Jails[i]
+	}
+
+	m.mu.Lock()
+
+	// Collect jails to stop (removed or disabled) and remove them from the map.
+	var toStop []*JailRuntime
+	for jailName, jr := range m.jails {
+		newJailCfg, exists := newJailCfgs[jailName]
+		if !exists || !newJailCfg.Enabled {
+			if jr.Status() == StatusStarted {
+				toStop = append(toStop, jr)
+			}
+			delete(m.jails, jailName)
+		}
+	}
+
+	// Add runtimes for newly-discovered jails and collect those to start,
+	// excluding the target jail which is handled separately below.
+	var toStart []*JailRuntime
+	for jailName, newJailCfg := range newJailCfgs {
+		if _, exists := m.jails[jailName]; !exists {
+			jr, err := NewJailRuntime(newJailCfg)
+			if err != nil {
+				m.mu.Unlock()
+				return fmt.Errorf("creating jail runtime %q: %w", jailName, err)
+			}
+			m.jails[jailName] = jr
+			if newJailCfg.Enabled && jailName != name {
+				toStart = append(toStart, jr)
+			}
+		}
+	}
+
+	targetJr, targetFound := m.jails[name]
+	targetWasStarted := targetFound && targetJr.Status() == StatusStarted
+
+	specs := buildSpecs(m.jails, newCfg.Engine.ReadFromEnd)
+
+	m.mu.Unlock()
+
+	// Stop removed/disabled jails outside the lock (may run on_stop actions).
+	for _, jr := range toStop {
+		slog.Info("stopping removed/disabled jail", "jail", jr.cfg.Name)
+		if stopErr := jr.Stop(ctx); stopErr != nil {
+			slog.Warn("stopping jail", "jail", jr.cfg.Name, "error", stopErr)
+		}
+	}
+
+	// Start newly-added jails outside the lock (may run on_start actions).
+	for _, jr := range toStart {
+		slog.Info("starting new jail", "jail", jr.cfg.Name)
+		if startErr := jr.Start(ctx); startErr != nil {
+			slog.Warn("starting new jail", "jail", jr.cfg.Name, "error", startErr)
+		}
+	}
+
+	// Let the watch backend pick up new specs (new/removed jail file globs).
+	m.backend.UpdateSpecs(specs)
+
+	if !targetFound {
 		return fmt.Errorf("jail %q not found", name)
 	}
-	return jr.Restart(ctx)
+
+	if targetWasStarted {
+		slog.Info("restarting jail", "jail", name)
+		return targetJr.Restart(ctx)
+	}
+	slog.Info("starting jail", "jail", name)
+	return targetJr.Start(ctx)
+}
+
+// buildSpecs builds watch specs for all enabled jails.
+func buildSpecs(jails map[string]*JailRuntime, readFromEnd bool) []watch.WatchSpec {
+	specs := make([]watch.WatchSpec, 0, len(jails))
+	for _, jr := range jails {
+		if jr.cfg.Enabled {
+			specs = append(specs, watch.WatchSpec{
+				JailName:    jr.cfg.Name,
+				Globs:       jr.cfg.Files,
+				ReadFromEnd: readFromEnd,
+			})
+		}
+	}
+	return specs
 }
 
 // JailStatus returns the status of a jail by name.

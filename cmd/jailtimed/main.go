@@ -78,7 +78,7 @@ func run(configPath string) error {
 		}
 	}
 
-	mgr, err := engine.NewManager(cfg)
+	mgr, err := engine.NewManager(cfg, configPath)
 	if err != nil {
 		return fmt.Errorf("creating engine manager: %w", err)
 	}
