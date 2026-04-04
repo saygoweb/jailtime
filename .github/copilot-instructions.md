@@ -1,5 +1,12 @@
 # jailtime — Copilot Instructions
 
+## Copilot Agent Setup
+
+Before starting any task, ensure the Serena MCP is active and the project is loaded:
+
+1. Call `Serena-check_onboarding_performed` — if onboarding has not been done, call `Serena-onboarding`.
+2. Call `Serena-activate_project` with the current working directory (e.g. `Serena-activate_project("/home/cambell/src/sgw/jailtime")`) to ensure the correct project is active in Serena.
+
 ## Build & Test
 
 ```sh
