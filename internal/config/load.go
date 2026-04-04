@@ -18,17 +18,18 @@ type rawEngineConfig struct {
 
 // rawJailConfig mirrors JailConfig with pointer booleans to detect unset fields.
 type rawJailConfig struct {
-	Name           string      `yaml:"name"`
-	Enabled        *bool       `yaml:"enabled"`
-	Files          []string    `yaml:"files"`
-	Filters        []string    `yaml:"filters"`
-	ExcludeFilters []string    `yaml:"exclude_filters"`
-	Actions        JailActions `yaml:"actions"`
-	HitCount       int         `yaml:"hit_count"`
-	FindTime       Duration    `yaml:"find_time"`
-	JailTime       Duration    `yaml:"jail_time"`
-	NetType        string      `yaml:"net_type"`
-	Query          string      `yaml:"query"`
+	Name             string      `yaml:"name"`
+	Enabled          *bool       `yaml:"enabled"`
+	Files            []string    `yaml:"files"`
+	Filters          []string    `yaml:"filters"`
+	ExcludeFilters   []string    `yaml:"exclude_filters"`
+	Actions          JailActions `yaml:"actions"`
+	HitCount         int         `yaml:"hit_count"`
+	FindTime         Duration    `yaml:"find_time"`
+	JailTime         Duration    `yaml:"jail_time"`
+	NetType          string      `yaml:"net_type"`
+	Query            string      `yaml:"query"`
+	QueryBeforeMatch *bool       `yaml:"query_before_match"`
 }
 
 // rawConfig mirrors Config but uses raw sub-types to allow default detection.
@@ -112,6 +113,10 @@ func Load(path string) (*Config, error) {
 		} else {
 			jc.Enabled = *rj.Enabled
 		}
+		if rj.QueryBeforeMatch != nil {
+			jc.QueryBeforeMatch = *rj.QueryBeforeMatch
+		}
+		// QueryBeforeMatch defaults to false when unset (zero value).
 		c.Jails = append(c.Jails, jc)
 	}
 

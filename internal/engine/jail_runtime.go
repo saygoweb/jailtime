@@ -321,8 +321,9 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		Timestamp: t.UTC().Format(time.RFC3339),
 	}
 
-	// Query pre-check: exit 0 means the IP is already blocked — skip on_match.
-	if cfg.Query != "" {
+	// Query pre-check: only run when query_before_match is true.
+	// Exit 0 means the IP is already blocked — skip on_match.
+	if cfg.QueryBeforeMatch && cfg.Query != "" {
 		res, _ := action.Run(ctx, cfg.Query, actCtx, 10*time.Second)
 		if res.ExitCode == 0 && res.Error == nil {
 			slog.Info("query pre-check suppressed on_match",

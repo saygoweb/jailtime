@@ -53,6 +53,11 @@ type JailConfig struct {
 	// NetType is "IP" or "CIDR".
 	NetType string `yaml:"net_type"`
 	Query   string `yaml:"query"`
+	// QueryBeforeMatch controls whether the query pre-check is run before
+	// on_match actions.  When false (the default), the query is never run and
+	// on_match is always executed on a threshold hit.  When true, the query is
+	// run first; an exit code of 0 suppresses on_match (IP already handled).
+	QueryBeforeMatch bool `yaml:"query_before_match"`
 }
 
 // JailActions holds the shell command templates run at various lifecycle points.
