@@ -1,6 +1,9 @@
 package config
 
-import "time"
+import (
+	"log/slog"
+	"time"
+)
 
 // Config is the top-level configuration structure.
 type Config struct {
@@ -57,6 +60,16 @@ type JailActions struct {
 	OnStart   []string `yaml:"on_start"`
 	OnStop    []string `yaml:"on_stop"`
 	OnRestart []string `yaml:"on_restart"`
+}
+
+// LogValue implements slog.LogValuer so EngineConfig fields are logged as a
+// structured group.
+func (e EngineConfig) LogValue() slog.Value {
+	return slog.GroupValue(
+		slog.String("watcher_mode", e.WatcherMode),
+		slog.Duration("poll_interval", e.PollInterval.Duration),
+		slog.Bool("read_from_end", e.ReadFromEnd),
+	)
 }
 
 // defaultReadFromEnd is the sentinel value used to detect whether ReadFromEnd

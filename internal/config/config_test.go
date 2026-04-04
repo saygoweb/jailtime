@@ -1,6 +1,7 @@
 package config
 
 import (
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
@@ -238,4 +239,33 @@ func TestLoadDefaults(t *testing.T) {
 	if c.Control.Socket != defaultSocketPath {
 		t.Errorf("Socket = %q, want %q", c.Control.Socket, defaultSocketPath)
 	}
+}
+
+func TestEngineConfigLogValue(t *testing.T) {
+cfg := EngineConfig{
+WatcherMode:  "fsnotify",
+PollInterval: Duration{Duration: 5 * time.Second},
+ReadFromEnd:  true,
+}
+
+val := cfg.LogValue()
+if val.Kind() != slog.KindGroup {
+t.Fatalf("expected KindGroup, got %v", val.Kind())
+}
+
+attrs := val.Group()
+m := make(map[string]slog.Value, len(attrs))
+for _, a := range attrs {
+m[a.Key] = a.Value
+}
+
+if got := m["watcher_mode"].String(); got != "fsnotify" {
+t.Errorf("watcher_mode = %q, want %q", got, "fsnotify")
+}
+if got := m["poll_interval"].Duration(); got != 5*time.Second {
+t.Errorf("poll_interval = %v, want 5s", got)
+}
+if got := m["read_from_end"].Bool(); !got {
+t.Error("read_from_end should be true")
+}
 }

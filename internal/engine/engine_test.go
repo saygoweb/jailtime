@@ -311,3 +311,72 @@ func TestJailRuntimeExcludeFilter(t *testing.T) {
 		t.Fatal("on_match should not have fired for excluded line, but output file exists")
 	}
 }
+
+// TestDebugRateLimiter verifies the rate limiter allows at most maxPerSec
+// entries per second and resets correctly after each window.
+func TestDebugRateLimiter(t *testing.T) {
+base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+mockNow := base
+
+rl := newDebugRateLimiter(2)
+rl.now = func() time.Time { return mockNow }
+
+if !rl.Allow() {
+t.Fatal("1st call in window should be allowed")
+}
+if !rl.Allow() {
+t.Fatal("2nd call in window should be allowed")
+}
+if rl.Allow() {
+t.Fatal("3rd call in window should be denied")
+}
+
+// Advance into a new window.
+mockNow = base.Add(time.Second)
+if !rl.Allow() {
+t.Fatal("1st call after window reset should be allowed")
+}
+if !rl.Allow() {
+t.Fatal("2nd call after window reset should be allowed")
+}
+if rl.Allow() {
+t.Fatal("3rd call after window reset should be denied")
+}
+}
+
+// TestDebugRateLimiterDisabledLogging verifies HandleEvent still processes
+// events correctly when debug logging is disabled (the default).
+func TestDebugRateLimiterDisabledLogging(t *testing.T) {
+dir := t.TempDir()
+outFile := filepath.Join(dir, "output.txt")
+
+cfg := &config.JailConfig{
+Name:     "rl-test-jail",
+Enabled:  true,
+Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
+HitCount: 1,
+FindTime: config.Duration{Duration: time.Minute},
+Actions: config.JailActions{
+OnMatch: []string{"echo {{ .IP }} > " + outFile},
+},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+
+// Send more events than the rate limit allows (3 > 2/s).
+ctx := context.Background()
+for i := 0; i < 3; i++ {
+evt := watch.Event{
+JailName: "rl-test-jail",
+FilePath: "/var/log/auth.log",
+Line:     "no-ip line",
+Time:     time.Now(),
+}
+if err := jr.HandleEvent(ctx, evt); err != nil {
+t.Fatalf("HandleEvent: %v", err)
+}
+}
+}

@@ -17,12 +17,44 @@ import (
 	"github.com/sgw/jailtime/internal/watch"
 )
 
+// JailStatus is the running state of a jail.
 type JailStatus string
 
 const (
 	StatusStarted JailStatus = "started"
 	StatusStopped JailStatus = "stopped"
 )
+
+// debugRateLimiter allows at most maxPerSec log entries per second.
+type debugRateLimiter struct {
+	mu          sync.Mutex
+	windowStart time.Time
+	count       int
+	maxPerSec   int
+	now         func() time.Time
+}
+
+func newDebugRateLimiter(maxPerSec int) *debugRateLimiter {
+	return &debugRateLimiter{
+		maxPerSec: maxPerSec,
+		now:       time.Now,
+	}
+}
+
+func (r *debugRateLimiter) Allow() bool {
+	t := r.now()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.windowStart.IsZero() || t.Sub(r.windowStart) >= time.Second {
+		r.windowStart = t
+		r.count = 0
+	}
+	if r.count < r.maxPerSec {
+		r.count++
+		return true
+	}
+	return false
+}
 
 // JailRuntime manages the lifecycle of a single jail.
 type JailRuntime struct {
@@ -32,6 +64,7 @@ type JailRuntime struct {
 	hits     *HitTracker
 	mu       sync.RWMutex
 	status   JailStatus
+	debugLog *debugRateLimiter
 }
 
 func NewJailRuntime(cfg *config.JailConfig) (*JailRuntime, error) {
@@ -49,6 +82,7 @@ func NewJailRuntime(cfg *config.JailConfig) (*JailRuntime, error) {
 		excludes: excludes,
 		hits:     NewHitTracker(),
 		status:   StatusStopped,
+		debugLog: newDebugRateLimiter(2),
 	}, nil
 }
 
@@ -155,6 +189,22 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 	if err != nil {
 		return fmt.Errorf("filter match: %w", err)
 	}
+
+	if slog.Default().Enabled(ctx, slog.LevelDebug) && jr.debugLog.Allow() {
+		matched := result != nil
+		ip := ""
+		if matched {
+			ip = result.IP
+		}
+		slog.DebugContext(ctx, "line considered",
+			"jail", jr.cfg.Name,
+			"file", evt.FilePath,
+			"line", evt.Line,
+			"matched", matched,
+			"ip", ip,
+		)
+	}
+
 	if result == nil {
 		return nil
 	}

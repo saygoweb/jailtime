@@ -67,6 +67,7 @@ func run(configPath string) error {
 		"version", version.Version,
 		"config", configPath,
 	)
+	slog.Info("engine config", "engine", cfg.Engine)
 
 	// Check config file permissions.
 	if info, err := os.Stat(configPath); err == nil {
