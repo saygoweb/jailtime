@@ -190,33 +190,46 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		return fmt.Errorf("filter match: %w", err)
 	}
 
-	if slog.Default().Enabled(ctx, slog.LevelDebug) && jr.debugLog.Allow() {
-		matched := result != nil
-		ip := ""
-		if matched {
-			ip = result.IP
-		}
-		slog.DebugContext(ctx, "line considered",
-			"jail", jr.cfg.Name,
-			"file", evt.FilePath,
-			"line", evt.Line,
-			"matched", matched,
-			"ip", ip,
-		)
-	}
-
 	if result == nil {
+		// Rate-limited debug log for non-matching lines.
+		if slog.Default().Enabled(ctx, slog.LevelDebug) && jr.debugLog.Allow() {
+			slog.DebugContext(ctx, "line considered",
+				"jail", jr.cfg.Name,
+				"file", evt.FilePath,
+				"line", evt.Line,
+				"matched", false,
+			)
+		}
 		return nil
 	}
+
+	// Filter matched — always log (matches are infrequent; no rate limit).
+	slog.Debug("filter matched",
+		"jail", jr.cfg.Name,
+		"file", evt.FilePath,
+		"line", evt.Line,
+		"ip", result.IP,
+	)
 
 	// Validate extracted address against configured net type.
 	switch jr.cfg.NetType {
 	case "CIDR":
-		if _, _, err := net.ParseCIDR(result.IP); err != nil {
+		if _, _, cidrErr := net.ParseCIDR(result.IP); cidrErr != nil {
+			slog.Debug("ip validation failed",
+				"jail", jr.cfg.Name,
+				"ip", result.IP,
+				"net_type", "CIDR",
+				"error", cidrErr,
+			)
 			return nil
 		}
 	default: // "IP" or unset
 		if net.ParseIP(result.IP) == nil {
+			slog.Debug("ip validation failed",
+				"jail", jr.cfg.Name,
+				"ip", result.IP,
+				"net_type", jr.cfg.NetType,
+			)
 			return nil
 		}
 	}
@@ -237,8 +250,21 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 
 	count, triggered := jr.hits.Record(result.IP, t, findTime, threshold)
 	if !triggered {
+		slog.Debug("hit count below threshold",
+			"jail", jr.cfg.Name,
+			"ip", result.IP,
+			"count", count,
+			"threshold", threshold,
+		)
 		return nil
 	}
+
+	slog.Info("hit threshold reached, running on_match",
+		"jail", jr.cfg.Name,
+		"ip", result.IP,
+		"count", count,
+		"threshold", threshold,
+	)
 
 	actCtx := action.Context{
 		IP:        result.IP,
@@ -255,6 +281,11 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 	if jr.cfg.Query != "" {
 		res, _ := action.Run(ctx, jr.cfg.Query, actCtx, 10*time.Second)
 		if res.ExitCode == 0 && res.Error == nil {
+			slog.Info("query pre-check suppressed on_match",
+				"jail", jr.cfg.Name,
+				"ip", result.IP,
+				"query_exit_code", res.ExitCode,
+			)
 			return nil
 		}
 	}

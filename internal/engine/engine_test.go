@@ -380,3 +380,129 @@ t.Fatalf("HandleEvent: %v", err)
 }
 }
 }
+
+// TestHandleEventQuerySuppresses verifies that when the query pre-check returns
+// exit 0 (IP already blocked), on_match is NOT executed.
+func TestHandleEventQuerySuppresses(t *testing.T) {
+dir := t.TempDir()
+outFile := filepath.Join(dir, "output.txt")
+
+cfg := &config.JailConfig{
+Name:     "query-jail",
+Enabled:  true,
+Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
+HitCount: 1,
+FindTime: config.Duration{Duration: time.Minute},
+// "true" always exits 0 → IP already blocked → skip on_match.
+Query: "true",
+Actions: config.JailActions{
+OnMatch: []string{"echo {{ .IP }} > " + outFile},
+},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+
+evt := watch.Event{
+JailName: "query-jail",
+FilePath: "/var/log/auth.log",
+Line:     "Failed password from 1.2.3.4",
+Time:     time.Now(),
+}
+
+ctx := context.Background()
+if err := jr.HandleEvent(ctx, evt); err != nil {
+t.Fatalf("HandleEvent: %v", err)
+}
+
+if _, err := os.Stat(outFile); err == nil {
+t.Fatal("on_match should have been suppressed by query exit 0, but output file exists")
+}
+}
+
+// TestHandleEventQueryPermits verifies that when the query pre-check returns
+// non-zero (IP not yet blocked), on_match IS executed.
+func TestHandleEventQueryPermits(t *testing.T) {
+dir := t.TempDir()
+outFile := filepath.Join(dir, "output.txt")
+
+cfg := &config.JailConfig{
+Name:     "query-permit-jail",
+Enabled:  true,
+Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
+HitCount: 1,
+FindTime: config.Duration{Duration: time.Minute},
+// "false" exits 1 → IP not yet blocked → proceed with on_match.
+Query: "false",
+Actions: config.JailActions{
+OnMatch: []string{"echo {{ .IP }} > " + outFile},
+},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+
+evt := watch.Event{
+JailName: "query-permit-jail",
+FilePath: "/var/log/auth.log",
+Line:     "Failed password from 2.3.4.5",
+Time:     time.Now(),
+}
+
+ctx := context.Background()
+if err := jr.HandleEvent(ctx, evt); err != nil {
+t.Fatalf("HandleEvent: %v", err)
+}
+
+data, err := os.ReadFile(outFile)
+if err != nil {
+t.Fatalf("on_match should have fired (query exited 1) but output file was not created: %v", err)
+}
+if got := strings.TrimSpace(string(data)); got != "2.3.4.5" {
+t.Fatalf("expected output %q, got %q", "2.3.4.5", got)
+}
+}
+
+// TestHandleEventIPValidationFails verifies that a filter match whose captured
+// group is not a valid IP address is silently dropped (no on_match).
+func TestHandleEventIPValidationFails(t *testing.T) {
+dir := t.TempDir()
+outFile := filepath.Join(dir, "output.txt")
+
+// This filter matches any line but extracts a non-IP token as the "ip" group.
+cfg := &config.JailConfig{
+Name:     "bad-ip-jail",
+Enabled:  true,
+Filters:  []string{`word=(?P<ip>[a-z]+)`},
+HitCount: 1,
+FindTime: config.Duration{Duration: time.Minute},
+Actions: config.JailActions{
+OnMatch: []string{"echo hit > " + outFile},
+},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+
+evt := watch.Event{
+JailName: "bad-ip-jail",
+FilePath: "/var/log/test.log",
+Line:     "word=notanip extra stuff",
+Time:     time.Now(),
+}
+
+ctx := context.Background()
+if err := jr.HandleEvent(ctx, evt); err != nil {
+t.Fatalf("HandleEvent: %v", err)
+}
+
+if _, err := os.Stat(outFile); err == nil {
+t.Fatal("on_match should not have fired for invalid IP, but output file exists")
+}
+}

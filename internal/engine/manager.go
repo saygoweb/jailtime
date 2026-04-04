@@ -102,7 +102,9 @@ func (m *Manager) Run(ctx context.Context) error {
 				continue
 			}
 			go func(jr *JailRuntime, evt watch.Event) {
-				_ = jr.HandleEvent(ctx, evt)
+				if err := jr.HandleEvent(ctx, evt); err != nil {
+					slog.Warn("event processing error", "jail", evt.JailName, "error", err)
+				}
 			}(jr, evt)
 		}
 	}
