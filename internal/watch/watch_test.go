@@ -155,6 +155,140 @@ drain:
 	}
 }
 
+// TestPollBackendSubdirGlob verifies that a glob with a wildcard subdirectory
+// component (e.g. apache2/*/access.log) picks up log files in new subdirectories
+// created after the backend is already running.
+func TestPollBackendSubdirGlob(t *testing.T) {
+	base := t.TempDir()
+	// Pattern: base/*/access.log — matches access.log in any direct subdirectory.
+	pattern := filepath.Join(base, "*", "access.log")
+
+	b := NewPollBackend(100 * time.Millisecond)
+	specs := []WatchSpec{{JailName: "apache", Globs: []string{pattern}, ReadFromEnd: true}}
+	out, cancel := startBackend(t, b, specs)
+	defer cancel()
+
+	// Let the backend complete at least one poll cycle before creating anything.
+	time.Sleep(150 * time.Millisecond)
+
+	// Create a new subdirectory and log file *after* the backend has started.
+	subdir := filepath.Join(base, "site1")
+	if err := os.Mkdir(subdir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(subdir, "access.log")
+	f, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for the backend to discover the new file via glob rescan.
+	time.Sleep(200 * time.Millisecond)
+	fmt.Fprintln(f, "192.168.1.1 GET /index.html 200")
+	f.Close()
+
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out: poll backend did not pick up file in new subdirectory")
+	}
+	if ev.Line != "192.168.1.1 GET /index.html 200" {
+		t.Errorf("expected line %q, got %q", "192.168.1.1 GET /index.html 200", ev.Line)
+	}
+	if ev.FilePath != logPath {
+		t.Errorf("expected FilePath %q, got %q", logPath, ev.FilePath)
+	}
+	if ev.JailName != "apache" {
+		t.Errorf("expected JailName %q, got %q", "apache", ev.JailName)
+	}
+}
+
+// TestPollBackendSubdirGlobMultiple verifies that a subdirectory glob continues
+// to pick up files in additional new subdirectories added over time.
+func TestPollBackendSubdirGlobMultiple(t *testing.T) {
+	base := t.TempDir()
+	pattern := filepath.Join(base, "*", "access.log")
+
+	b := NewPollBackend(100 * time.Millisecond)
+	specs := []WatchSpec{{JailName: "apache2", Globs: []string{pattern}, ReadFromEnd: true}}
+	out, cancel := startBackend(t, b, specs)
+	defer cancel()
+
+	time.Sleep(150 * time.Millisecond)
+
+	writeAndExpect := func(subdirName, line string) {
+		t.Helper()
+		subdir := filepath.Join(base, subdirName)
+		if err := os.Mkdir(subdir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		logPath := filepath.Join(subdir, "access.log")
+		f, err := os.Create(logPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(200 * time.Millisecond)
+		fmt.Fprintln(f, line)
+		f.Close()
+
+		ev, ok := waitEvent(out, 2*time.Second)
+		if !ok {
+			t.Fatalf("timed out waiting for event from %s/access.log", subdirName)
+		}
+		if ev.Line != line {
+			t.Errorf("subdir %s: expected line %q, got %q", subdirName, line, ev.Line)
+		}
+		if ev.FilePath != logPath {
+			t.Errorf("subdir %s: expected FilePath %q, got %q", subdirName, logPath, ev.FilePath)
+		}
+	}
+
+	writeAndExpect("vhost1", "10.0.0.1 GET /a 200")
+	writeAndExpect("vhost2", "10.0.0.2 GET /b 404")
+}
+
+// TestFsnotifyBackendSubdirGlob mirrors TestPollBackendSubdirGlob for the
+// fsnotify backend — new subdirectories created after startup must be picked
+// up via the periodic glob rescan.
+func TestFsnotifyBackendSubdirGlob(t *testing.T) {
+	base := t.TempDir()
+	pattern := filepath.Join(base, "*", "access.log")
+
+	b := NewFsnotifyBackend(100 * time.Millisecond)
+	specs := []WatchSpec{{JailName: "apache", Globs: []string{pattern}, ReadFromEnd: true}}
+	out, cancel := startBackend(t, b, specs)
+	defer cancel()
+
+	time.Sleep(150 * time.Millisecond)
+
+	subdir := filepath.Join(base, "site1")
+	if err := os.Mkdir(subdir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(subdir, "access.log")
+	f, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	fmt.Fprintln(f, "192.168.1.1 GET /index.html 200")
+	f.Close()
+
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out: fsnotify backend did not pick up file in new subdirectory")
+	}
+	if ev.Line != "192.168.1.1 GET /index.html 200" {
+		t.Errorf("expected line %q, got %q", "192.168.1.1 GET /index.html 200", ev.Line)
+	}
+	if ev.FilePath != logPath {
+		t.Errorf("expected FilePath %q, got %q", logPath, ev.FilePath)
+	}
+	if ev.JailName != "apache" {
+		t.Errorf("expected JailName %q, got %q", "apache", ev.JailName)
+	}
+}
+
 // TestFsnotifyBackendBasic mirrors TestPollBackendBasic but uses fsnotify backend.
 func TestFsnotifyBackendBasic(t *testing.T) {
 	dir := t.TempDir()
