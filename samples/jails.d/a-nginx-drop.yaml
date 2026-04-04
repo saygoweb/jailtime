@@ -1,0 +1,58 @@
+# Sample A: Simple iptables DROP via ipset
+#
+# On start:
+#   1. Create ipset jt_<jail> in hash:ip mode with per-entry timeout support.
+#   2. Add an iptables INPUT rule that DROPs TCP 80/443 traffic from any IP
+#      in the ipset.
+#
+# On match:
+#   Add the offending IP to the ipset with a timeout of JailTime seconds.
+#   The kernel removes the entry automatically when the timer expires.
+#
+# On stop:
+#   Remove the iptables rule then destroy the ipset.
+#
+# On restart:
+#   Nothing — jailtime reloads config, the ipset and rule remain in place.
+
+jails:
+  - name: nginx
+    enabled: true
+
+    # Nginx combined access log
+    files:
+      - /var/log/nginx/access.log
+
+    # Ignore successful requests and known-good bots
+    exclude_filters:
+      - '" [23][0-9][0-9] '
+
+    # Match any 4xx/5xx response and capture the client IP
+    filters:
+      - '^(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}) .* " [45][0-9][0-9] '
+
+    hit_count: 10
+    find_time: 1m
+    jail_time: 1h
+    net_type: IP
+
+    # Pre-check: is this IP already in the ipset?
+    query: 'ipset test jt_{{ .Jail }} {{ .IP }} 2>/dev/null'
+
+    actions:
+      on_start:
+        # Create ipset with timeout support (timeout 0 = entries use per-entry timeout)
+        - 'ipset create jt_{{ .Jail }} hash:ip timeout 0 comment'
+        # Drop TCP 80/443 for any IP in the set
+        - 'iptables -I INPUT -p tcp -m multiport --dports 80,443 -m set --match-set jt_{{ .Jail }} src -j DROP -m comment --comment "jailtime:{{ .Jail }}"'
+
+      on_stop:
+        # Remove the iptables rule first, then destroy the ipset
+        - 'iptables -D INPUT -p tcp -m multiport --dports 80,443 -m set --match-set jt_{{ .Jail }} src -j DROP -m comment --comment "jailtime:{{ .Jail }}"'
+        - 'ipset destroy jt_{{ .Jail }}'
+
+      on_match:
+        # Add IP with a per-entry expiry equal to jail_time; comment records the log line context
+        - 'ipset add jt_{{ .Jail }} {{ .IP }} timeout {{ .JailTime }} comment "banned {{ .Timestamp }}"'
+
+      on_restart: []

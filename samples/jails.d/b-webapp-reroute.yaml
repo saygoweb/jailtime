@@ -1,0 +1,67 @@
+# Sample B: Sophisticated reroute via sniproxy / virtualproxy
+#
+# Instead of hard-blocking suspicious IPs, this jail transparently
+# reroutes their HTTPS traffic (port 443) to a local honeypot/proxy
+# listening on port 8081 (e.g. sniproxy or a custom virtualproxy).
+#
+# On start:
+#   1. Create ipset jt_<jail> in hash:ip mode.
+#   2. Add a NAT PREROUTING rule: TCP 443 traffic from matched IPs is
+#      redirected to localhost:8081.
+#
+# On match:
+#   Add the offending IP to the ipset with a JailTime timeout.
+#
+# On stop:
+#   Remove the NAT rule and destroy the ipset.
+#
+# On restart:
+#   Nothing — ipset and rule survive, config is hot-reloaded.
+#
+# Prerequisites:
+#   - A service listening on 127.0.0.1:8081 (e.g. sniproxy, nginx
+#     serving a tarpit or a captive portal).
+#   - iptables nat table available (nf_nat kernel module loaded).
+
+jails:
+  - name: webapp
+    enabled: true
+
+    # Nginx or application error log showing repeated auth failures
+    files:
+      - /var/log/nginx/access.log
+      - /var/log/app/error.log
+
+    exclude_filters:
+      - '"(GET|HEAD) / HTTP'       # ignore plain healthchecks
+      - '" 2[0-9][0-9] '           # ignore successful responses
+
+    filters:
+      # Catch repeated POST failures to login/auth endpoints
+      - '^(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}) .* "POST /(?:login|auth|wp-login\.php|admin)'
+      # Catch scanner probes
+      - '^(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}) .* " 4[0-9][0-9] .* "(sqlmap|nikto|masscan|zgrab)'
+
+    hit_count: 5
+    find_time: 2m
+    jail_time: 4h
+    net_type: IP
+
+    # Pre-check: is this IP already in the ipset?
+    query: 'ipset test jt_{{ .Jail }} {{ .IP }} 2>/dev/null'
+
+    actions:
+      on_start:
+        # Create ipset with per-entry timeout support
+        - 'ipset create jt_{{ .Jail }} hash:ip timeout 0 comment'
+        # Reroute TCP 443 from matched IPs to the local proxy on 8081
+        - 'iptables -t nat -I PREROUTING -p tcp --dport 443 -m set --match-set jt_{{ .Jail }} src -j REDIRECT --to-port 8081 -m comment --comment "jailtime:{{ .Jail }}"'
+
+      on_stop:
+        - 'iptables -t nat -D PREROUTING -p tcp --dport 443 -m set --match-set jt_{{ .Jail }} src -j REDIRECT --to-port 8081 -m comment --comment "jailtime:{{ .Jail }}"'
+        - 'ipset destroy jt_{{ .Jail }}'
+
+      on_match:
+        - 'ipset add jt_{{ .Jail }} {{ .IP }} timeout {{ .JailTime }} comment "rerouted {{ .Timestamp }}"'
+
+      on_restart: []

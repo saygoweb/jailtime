@@ -1,0 +1,58 @@
+# Sample C: Idempotent iptables DROP via ipset (using wrapper scripts)
+#
+# Functionally identical to sample A, but all ipset/iptables operations
+# are wrapped in helper scripts from the tools/ directory that make each
+# step idempotent:
+#
+#   on_start  — create set if missing; insert rule if missing
+#   on_stop   — remove rule if present; FLUSH (not destroy) the ipset so
+#               it persists across jailtime restarts and survives reboot
+#               (useful when ipset-persistent / netfilter-persistent saves state)
+#   on_match  — add IP (idempotent via `ipset add ... -exist`)
+#   on_restart — nothing; existing set and rule remain untouched
+#
+# Install the tools once system-wide:
+#   cp samples/tools/*.sh /usr/local/lib/jailtime/
+#   chmod +x /usr/local/lib/jailtime/*.sh
+#
+# Then adjust TOOLS below to match the install path.
+
+jails:
+  - name: nginx-idempotent
+    enabled: true
+
+    files:
+      - /var/log/nginx/access.log
+
+    exclude_filters:
+      - '" [23][0-9][0-9] '
+
+    filters:
+      - '^(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}) .* " [45][0-9][0-9] '
+
+    hit_count: 10
+    find_time: 1m
+    jail_time: 1h
+    net_type: IP
+
+    query: 'ipset test jt_{{ .Jail }} {{ .IP }} 2>/dev/null'
+
+    actions:
+      on_start:
+        # Create the ipset only if it does not already exist
+        - '/usr/local/lib/jailtime/ipset-ensure.sh jt_{{ .Jail }} hash:ip timeout 0 comment'
+        # Insert the DROP rule only if it is not already present
+        - '/usr/local/lib/jailtime/iptables-ensure.sh -I INPUT -p tcp -m multiport --dports 80,443 -m set --match-set jt_{{ .Jail }} src -j DROP -m comment --comment "jailtime:{{ .Jail }}"'
+
+      on_stop:
+        # Remove the rule if it exists (no error if already gone)
+        - '/usr/local/lib/jailtime/iptables-remove.sh -D INPUT -p tcp -m multiport --dports 80,443 -m set --match-set jt_{{ .Jail }} src -j DROP -m comment --comment "jailtime:{{ .Jail }}"'
+        # Flush entries but keep the ipset so it can be saved by
+        # ipset-persistent / netfilter-persistent across reboots
+        - '/usr/local/lib/jailtime/ipset-flush.sh jt_{{ .Jail }}'
+
+      on_match:
+        # -exist makes the add idempotent (updates timeout if already present)
+        - 'ipset add -exist jt_{{ .Jail }} {{ .IP }} timeout {{ .JailTime }} comment "banned {{ .Timestamp }}"'
+
+      on_restart: []
