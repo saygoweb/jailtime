@@ -42,7 +42,12 @@ func (b *FsnotifyBackend) getSpecs() []WatchSpec {
 // Periodically rescans globs to pick up new matching files.
 // One FileTailer is maintained per unique file path (shared across jails);
 // each line is fanned out to every jail whose globs match that path.
-// On CREATE event for a watched path, the FileTailer is reopened.
+//
+// WRITE events are coalesced: instead of reading the file on every kernel
+// notification (which can be hundreds per second under high load), the path
+// is added to a dirty set and the set is drained on each batchInterval tick.
+// This bounds file I/O to at most len(watchedPaths)/batchInterval reads/sec
+// regardless of how rapidly the file is being written to.
 func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan<- Event) error {
 	b.UpdateSpecs(specs)
 
@@ -60,6 +65,8 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 	tailers := make(map[string]*FileTailer)
 	// pathToJails maps file path → list of jail names watching it.
 	pathToJails := make(map[string][]string)
+	// dirty holds paths that have received WRITE/CREATE events since last batch.
+	dirty := make(map[string]struct{})
 
 	rescan := func() {
 		currentSpecs := b.getSpecs()
@@ -82,7 +89,7 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 			}
 		}
 
-		// Open tailers for newly matched paths.
+		// Open tailers for newly matched paths; mark them dirty for initial read.
 		for p := range newPathToJails {
 			if _, ok := tailers[p]; !ok {
 				ft, err := NewFileTailer(p, pathReadFromEnd[p])
@@ -90,6 +97,7 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 					continue
 				}
 				tailers[p] = ft
+				dirty[p] = struct{}{}
 				// Ignore error if already watched.
 				_ = watcher.Add(p)
 			}
@@ -100,6 +108,7 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 			if _, ok := newPathToJails[p]; !ok {
 				ft.Close()
 				delete(tailers, p)
+				delete(dirty, p)
 				_ = watcher.Remove(p)
 			}
 		}
@@ -142,8 +151,15 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 	// Initial scan.
 	rescan()
 
-	ticker := time.NewTicker(b.pollInterval)
-	defer ticker.Stop()
+	// batchInterval controls how often dirty paths are read. Coalescing multiple
+	// rapid WRITE events into a single ReadLines call is the primary CPU reduction.
+	// 50 ms means at most 20 reads/sec/file regardless of write frequency.
+	const batchInterval = 50 * time.Millisecond
+	batchTicker := time.NewTicker(batchInterval)
+	defer batchTicker.Stop()
+
+	rescanTicker := time.NewTicker(b.pollInterval)
+	defer rescanTicker.Stop()
 
 	for {
 		select {
@@ -153,8 +169,15 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 			}
 			return ctx.Err()
 
-		case <-ticker.C:
+		case <-rescanTicker.C:
 			rescan()
+
+		case <-batchTicker.C:
+			// Drain the dirty set: read each path once, fan out to watching jails.
+			for p := range dirty {
+				readAndSend(p)
+				delete(dirty, p)
+			}
 
 		case event, ok := <-watcher.Events:
 			if !ok {
@@ -162,7 +185,8 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 			}
 			p := event.Name
 			if event.Has(fsnotify.Create) {
-				// File was recreated (rotation): reopen tailer from start.
+				// File was recreated (rotation): reopen tailer from start immediately
+				// so subsequent reads come from the new file, not the old fd.
 				if ft, ok := tailers[p]; ok {
 					ft.Close()
 				}
@@ -173,7 +197,8 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 				}
 				tailers[p] = ft
 			}
-			readAndSend(p)
+			// Mark dirty; the batch ticker will call readAndSend.
+			dirty[p] = struct{}{}
 
 		case _, ok := <-watcher.Errors:
 			if !ok {

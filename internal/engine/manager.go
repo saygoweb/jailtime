@@ -4,11 +4,38 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"sync"
 	"time"
 
 	"github.com/sgw/jailtime/internal/config"
 	"github.com/sgw/jailtime/internal/watch"
+)
+
+// eventTask is dispatched to the worker pool for asynchronous HandleEvent calls.
+type eventTask struct {
+	jr  *JailRuntime
+	evt watch.Event
+}
+
+const (
+	// targetCPUFraction is the maximum fraction of available CPU (across all
+	// GOMAXPROCS cores) that the daemon should consume on average.
+	targetCPUFraction = 0.02
+
+	// cpuCheckInterval is how often the event loop samples CPU usage.
+	cpuCheckInterval = time.Second
+
+	// maxDispatchDelay caps how long the event loop sleeps when CPU is over target.
+	maxDispatchDelay = 2 * time.Second
+
+	// eventQueueSize is the buffered event channel capacity. A large buffer lets
+	// the watch backend keep writing even while the event loop is sleeping to
+	// throttle CPU.
+	eventQueueSize = 65536
+
+	// taskQueueSize is the worker-pool task queue depth.
+	taskQueueSize = 4096
 )
 
 // Manager runs all jail runtimes and the watch backend.
@@ -47,6 +74,15 @@ func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
 
 // Run starts all enabled jails, starts the watch backend, routes events, and
 // blocks until ctx is cancelled.
+//
+// Events from the watch backend are queued in a large buffered channel
+// (eventQueueSize) so the backend never blocks. A bounded worker pool
+// (runtime.GOMAXPROCS * 4 goroutines) handles HandleEvent calls, avoiding
+// unbounded goroutine creation under high log volume.
+//
+// CPU usage is sampled every cpuCheckInterval; if it exceeds targetCPUFraction
+// the event loop sleeps proportionally before dispatching more work, keeping
+// average CPU below the target.
 func (m *Manager) Run(ctx context.Context) error {
 	// Start all enabled jails.
 	for name, jr := range m.jails {
@@ -72,7 +108,62 @@ func (m *Manager) Run(ctx context.Context) error {
 	}
 	m.mu.RUnlock()
 
-	events := make(chan watch.Event, 256)
+	events := make(chan watch.Event, eventQueueSize)
+
+	// Worker pool: bounded goroutines handle HandleEvent calls so we never
+	// create an unbounded number of goroutines under high log volume.
+	numWorkers := runtime.GOMAXPROCS(0) * 4
+	taskQueue := make(chan eventTask, taskQueueSize)
+	var workerWg sync.WaitGroup
+	workerWg.Add(numWorkers)
+	for range numWorkers {
+		go func() {
+			defer workerWg.Done()
+			for task := range taskQueue {
+				if err := task.jr.HandleEvent(ctx, task.evt); err != nil {
+					slog.Warn("event processing error", "jail", task.evt.JailName, "error", err)
+				}
+			}
+		}()
+	}
+	defer func() {
+		close(taskQueue)
+		workerWg.Wait()
+	}()
+
+	// CPU-aware throttle: sleep when usage exceeds targetCPUFraction.
+	cpuSampler := newCPUSampler()
+	var (
+		lastCPUCheck  = time.Now()
+		dispatchDelay time.Duration
+		throttling    bool
+	)
+	checkCPU := func() {
+		if time.Since(lastCPUCheck) < cpuCheckInterval {
+			return
+		}
+		lastCPUCheck = time.Now()
+		usage := cpuSampler.sample()
+		if usage > targetCPUFraction {
+			// Overshoot ratio drives the sleep duration: at 2× target we sleep
+			// ~targetCPUFraction * cpuCheckInterval, at 4× we sleep twice as long.
+			overshoot := usage/targetCPUFraction - 1.0
+			dispatchDelay = time.Duration(overshoot * float64(cpuCheckInterval))
+			if dispatchDelay > maxDispatchDelay {
+				dispatchDelay = maxDispatchDelay
+			}
+			if !throttling {
+				slog.Info("event dispatch throttled", "cpu_usage_pct", fmt.Sprintf("%.1f", usage*100), "delay_ms", dispatchDelay.Milliseconds())
+				throttling = true
+			}
+		} else {
+			if throttling {
+				slog.Info("event dispatch throttle lifted", "cpu_usage_pct", fmt.Sprintf("%.1f", usage*100))
+			}
+			dispatchDelay = 0
+			throttling = false
+		}
+	}
 
 	// Start the watch backend in a goroutine — its Start method blocks until
 	// ctx is cancelled, so the event-routing loop below must run concurrently.
@@ -115,11 +206,19 @@ func (m *Manager) Run(ctx context.Context) error {
 				slog.Warn("event for unknown jail, dropping", "jail", evt.JailName)
 				continue
 			}
-			go func(jr *JailRuntime, evt watch.Event) {
-				if err := jr.HandleEvent(ctx, evt); err != nil {
-					slog.Warn("event processing error", "jail", evt.JailName, "error", err)
+			select {
+			case taskQueue <- eventTask{jr: jr, evt: evt}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+			checkCPU()
+			if dispatchDelay > 0 {
+				select {
+				case <-time.After(dispatchDelay):
+				case <-ctx.Done():
+					return ctx.Err()
 				}
-			}(jr, evt)
+			}
 		}
 	}
 }

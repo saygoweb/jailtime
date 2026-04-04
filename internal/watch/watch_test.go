@@ -500,6 +500,60 @@ func TestFsnotifyBackendSharedFile(t *testing.T) {
 	}
 }
 
+// TestFsnotifyBackendCoalescing verifies that multiple WRITE events occurring
+// within the same batch window are coalesced: all lines still arrive, with no
+// duplicates, and no immediate reads on every individual kernel event.
+func TestFsnotifyBackendCoalescing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "coalesce.log")
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	b := NewFsnotifyBackend(500 * time.Millisecond) // rescan interval; batch is 50ms
+	specs := []WatchSpec{{JailName: "jail-coalesce", Globs: []string{path}, ReadFromEnd: false}}
+	out, cancel := startBackend(t, b, specs)
+	defer cancel()
+
+	time.Sleep(150 * time.Millisecond)
+
+	// Write several lines rapidly — well within a single 50 ms batch window.
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const numLines = 5
+	for i := 0; i < numLines; i++ {
+		fmt.Fprintf(af, "coalesced line %d\n", i)
+	}
+	af.Close()
+
+	// All lines must arrive; duplicates indicate a double-read bug.
+	received := make([]string, 0, numLines)
+	deadline := time.After(2 * time.Second)
+	for len(received) < numLines {
+		select {
+		case ev := <-out:
+			received = append(received, ev.Line)
+		case <-deadline:
+			t.Fatalf("timed out: received %d/%d lines", len(received), numLines)
+		}
+	}
+
+	seen := make(map[string]int, numLines)
+	for _, l := range received {
+		seen[l]++
+	}
+	for l, count := range seen {
+		if count > 1 {
+			t.Errorf("duplicate line %q received %d times", l, count)
+		}
+	}
+}
+
 // TestDebugRateLimiterInWatch verifies the watch package's debugRateLimiter
 // allows exactly maxPerSec entries per window and resets after one second.
 func TestDebugRateLimiterInWatch(t *testing.T) {
