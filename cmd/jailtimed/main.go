@@ -162,3 +162,11 @@ func (a *JailControllerAdapter) AllJailStatuses() map[string]string {
 	}
 	return out
 }
+
+func (a *JailControllerAdapter) ConfigFiles(name string, limit int, logFiles bool) ([]string, error) {
+	return a.m.ConfigFiles(name, limit, logFiles)
+}
+
+func (a *JailControllerAdapter) ConfigTest(name, filePath string, limit int, returnMatching bool) (int, int, []string, error) {
+	return a.m.ConfigTest(name, filePath, limit, returnMatching)
+}

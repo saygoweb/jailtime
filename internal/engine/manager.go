@@ -249,3 +249,28 @@ func (m *Manager) AllJailStatuses() map[string]JailStatus {
 	}
 	return out
 }
+
+// ConfigFiles returns the file paths matching the jail's configured globs,
+// capped at limit (0 = no limit). If logFiles is true each match is logged.
+func (m *Manager) ConfigFiles(name string, limit int, logFiles bool) ([]string, error) {
+	m.mu.RLock()
+	jr, ok := m.jails[name]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("jail %q not found", name)
+	}
+	return jr.ConfigFiles(limit, logFiles), nil
+}
+
+// ConfigTest runs the jail's filters against every line in filePath without
+// triggering any actions. Returns total lines, matching lines, and optionally
+// up to limit matching lines (0 = no limit).
+func (m *Manager) ConfigTest(name, filePath string, limit int, returnMatching bool) (totalLines, matchingLines int, matches []string, err error) {
+	m.mu.RLock()
+	jr, ok := m.jails[name]
+	m.mu.RUnlock()
+	if !ok {
+		return 0, 0, nil, fmt.Errorf("jail %q not found", name)
+	}
+	return jr.ConfigTest(filePath, limit, returnMatching)
+}

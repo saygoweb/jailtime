@@ -84,7 +84,153 @@ func TestHitTrackerWindowExpiry(t *testing.T) {
 	}
 }
 
-// TestJailRuntimeHandleEvent verifies that a matching event fires on_match actions.
+// TestJailRuntimeConfigFiles verifies that ConfigFiles expands globs and
+// returns matching file paths, respecting the limit.
+func TestJailRuntimeConfigFiles(t *testing.T) {
+	base := t.TempDir()
+
+	// Create two subdirs with access.log, plus one that doesn't match.
+	for _, sub := range []string{"site1", "site2"} {
+		dir := filepath.Join(base, sub)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "access.log"), nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A file that should NOT match the glob.
+	if err := os.WriteFile(filepath.Join(base, "other.log"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	pattern := filepath.Join(base, "*", "access.log")
+	cfg := &config.JailConfig{
+		Name:    "apache2",
+		Enabled: true,
+		Files:   []string{pattern},
+		Filters: []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
+	}
+	jr, err := NewJailRuntime(cfg)
+	if err != nil {
+		t.Fatalf("NewJailRuntime: %v", err)
+	}
+
+	files := jr.ConfigFiles(0, false)
+	if len(files) != 2 {
+		t.Fatalf("expected 2 files, got %d: %v", len(files), files)
+	}
+	for _, f := range files {
+		if filepath.Base(f) != "access.log" {
+			t.Errorf("unexpected file %q", f)
+		}
+	}
+
+	// Test limit.
+	limited := jr.ConfigFiles(1, false)
+	if len(limited) != 1 {
+		t.Fatalf("expected 1 file with limit=1, got %d", len(limited))
+	}
+}
+
+// TestJailRuntimeConfigFilesNewSubdir verifies that ConfigFiles picks up new
+// subdirectories created after the JailRuntime was initialised (glob is
+// re-expanded on each call).
+func TestJailRuntimeConfigFilesNewSubdir(t *testing.T) {
+	base := t.TempDir()
+	pattern := filepath.Join(base, "*", "access.log")
+	cfg := &config.JailConfig{
+		Name:    "apache2",
+		Enabled: true,
+		Files:   []string{pattern},
+		Filters: []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
+	}
+	jr, err := NewJailRuntime(cfg)
+	if err != nil {
+		t.Fatalf("NewJailRuntime: %v", err)
+	}
+
+	// No subdirs yet.
+	if got := jr.ConfigFiles(0, false); len(got) != 0 {
+		t.Fatalf("expected 0 files initially, got %d", len(got))
+	}
+
+	// Add a new subdir with a log file.
+	dir := filepath.Join(base, "vhost1")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "access.log"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	files := jr.ConfigFiles(0, false)
+	if len(files) != 1 {
+		t.Fatalf("expected 1 file after adding subdir, got %d: %v", len(files), files)
+	}
+}
+
+// TestJailRuntimeConfigTest verifies filter testing against a log file.
+func TestJailRuntimeConfigTest(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "auth.log")
+
+	lines := []string{
+		"Failed password from 1.2.3.4 port 22",   // matches
+		"Accepted password from 5.6.7.8 port 22", // matches
+		"system boot",                             // no IP, no match
+		"Connection from 9.9.9.9 whitelist",       // excluded
+	}
+	content := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(logFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.JailConfig{
+		Name:           "ssh",
+		Enabled:        true,
+		Filters:        []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
+		ExcludeFilters: []string{`whitelist`},
+	}
+	jr, err := NewJailRuntime(cfg)
+	if err != nil {
+		t.Fatalf("NewJailRuntime: %v", err)
+	}
+
+	total, matching, matches, err := jr.ConfigTest(logFile, 0, true)
+	if err != nil {
+		t.Fatalf("ConfigTest: %v", err)
+	}
+	if total != 4 {
+		t.Errorf("expected total=4, got %d", total)
+	}
+	if matching != 2 {
+		t.Errorf("expected matching=2, got %d", matching)
+	}
+	if len(matches) != 2 {
+		t.Errorf("expected 2 returned matches, got %d: %v", len(matches), matches)
+	}
+
+	// Test limit on returned matches — stats are still full.
+	_, _, limitedMatches, err := jr.ConfigTest(logFile, 1, true)
+	if err != nil {
+		t.Fatalf("ConfigTest (limited): %v", err)
+	}
+	if len(limitedMatches) != 1 {
+		t.Errorf("expected 1 returned match with limit=1, got %d", len(limitedMatches))
+	}
+
+	// Without --matching flag, matches slice should be empty.
+	_, _, noMatches, err := jr.ConfigTest(logFile, 0, false)
+	if err != nil {
+		t.Fatalf("ConfigTest (no matching): %v", err)
+	}
+	if len(noMatches) != 0 {
+		t.Errorf("expected no returned matches when returnMatching=false, got %d", len(noMatches))
+	}
+}
+
+
 func TestJailRuntimeHandleEvent(t *testing.T) {
 	dir := t.TempDir()
 	outFile := filepath.Join(dir, "output.txt")

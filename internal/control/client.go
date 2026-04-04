@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 )
 
 // Client sends requests to jailtimed over the Unix socket.
@@ -95,4 +97,33 @@ func (c *Client) StopJail(name string) error {
 // RestartJail calls POST /v1/jails/{name}/restart.
 func (c *Client) RestartJail(name string) error {
 	return c.post("/v1/jails/" + name + "/restart")
+}
+
+// ConfigFiles calls GET /v1/jails/{name}/config/files.
+func (c *Client) ConfigFiles(name string, limit int, logFiles bool) (*ConfigFilesResponse, error) {
+	q := url.Values{}
+	q.Set("limit", strconv.Itoa(limit))
+	if logFiles {
+		q.Set("log", "true")
+	}
+	var resp ConfigFilesResponse
+	if err := c.get("/v1/jails/"+name+"/config/files?"+q.Encode(), &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// ConfigTest calls GET /v1/jails/{name}/config/test.
+func (c *Client) ConfigTest(name, filePath string, limit int, returnMatching bool) (*ConfigTestResponse, error) {
+	q := url.Values{}
+	q.Set("file", filePath)
+	q.Set("limit", strconv.Itoa(limit))
+	if returnMatching {
+		q.Set("matching", "true")
+	}
+	var resp ConfigTestResponse
+	if err := c.get("/v1/jails/"+name+"/config/test?"+q.Encode(), &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }

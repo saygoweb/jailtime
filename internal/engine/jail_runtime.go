@@ -1,9 +1,13 @@
 package engine
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"log/slog"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -86,6 +90,63 @@ func (jr *JailRuntime) Status() JailStatus {
 	jr.mu.RLock()
 	defer jr.mu.RUnlock()
 	return jr.status
+}
+
+// ConfigFiles returns the file paths that currently match the jail's configured
+// globs, deduplicated, capped at limit (0 = no limit). If logFiles is true
+// each match is emitted via slog at Info level.
+func (jr *JailRuntime) ConfigFiles(limit int, logFiles bool) []string {
+	seen := make(map[string]bool)
+	var files []string
+	for _, pattern := range jr.cfg.Files {
+		paths, _ := filepath.Glob(pattern)
+		for _, p := range paths {
+			if seen[p] {
+				continue
+			}
+			seen[p] = true
+			if logFiles {
+				slog.Info("config files match", "jail", jr.cfg.Name, "file", p)
+			}
+			files = append(files, p)
+			if limit > 0 && len(files) >= limit {
+				return files
+			}
+		}
+	}
+	return files
+}
+
+// ConfigTest runs the jail's filters against every line in filePath without
+// triggering any actions. It returns the total number of lines processed, the
+// number that matched, and (when returnMatching is true) up to limit matching
+// lines (0 = no limit).
+func (jr *JailRuntime) ConfigTest(filePath string, limit int, returnMatching bool) (totalLines, matchingLines int, matches []string, err error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		totalLines++
+		result, matchErr := filter.Match(line, jr.includes, jr.excludes)
+		if matchErr != nil {
+			continue
+		}
+		if result != nil {
+			matchingLines++
+			if returnMatching && (limit <= 0 || len(matches) < limit) {
+				matches = append(matches, line)
+			}
+		}
+	}
+	if scanErr := scanner.Err(); scanErr != nil {
+		return totalLines, matchingLines, matches, scanErr
+	}
+	return totalLines, matchingLines, matches, nil
 }
 
 // HandleEvent processes a watch.Event through the filter/hit pipeline.

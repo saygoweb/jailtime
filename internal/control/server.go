@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -17,6 +18,8 @@ type JailController interface {
 	RestartJail(ctx context.Context, name string) error
 	JailStatus(name string) (string, error)
 	AllJailStatuses() map[string]string
+	ConfigFiles(name string, limit int, logFiles bool) ([]string, error)
+	ConfigTest(name, filePath string, limit int, returnMatching bool) (totalLines, matchingLines int, matches []string, err error)
 }
 
 // Server serves the control API over a Unix domain socket.
@@ -92,18 +95,23 @@ func (s *Server) handleJails(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// handleJailAction handles /v1/jails/{name}/status|start|stop|restart
+// handleJailAction handles /v1/jails/{name}/status|start|stop|restart|config/files|config/test
 func (s *Server) handleJailAction(w http.ResponseWriter, r *http.Request) {
 	slog.Info("control request", "method", r.Method, "path", r.URL.Path)
 
-	// Strip prefix "/v1/jails/" and split on "/"
+	// Strip prefix "/v1/jails/" and split on "/" (up to 3 parts).
 	trimmed := strings.TrimPrefix(r.URL.Path, "/v1/jails/")
-	parts := strings.SplitN(trimmed, "/", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	parts := strings.SplitN(trimmed, "/", 3)
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
 		writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "not found"})
 		return
 	}
-	name, action := parts[0], parts[1]
+	name := parts[0]
+	action := parts[1]
+	var subaction string
+	if len(parts) == 3 {
+		subaction = parts[2]
+	}
 
 	switch action {
 	case "status":
@@ -150,6 +158,60 @@ func (s *Server) handleJailAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, HealthResponse{Status: "ok"})
+
+	case "config":
+		s.handleJailConfig(w, r, name, subaction)
+
+	default:
+		writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "not found"})
+	}
+}
+
+// handleJailConfig handles /v1/jails/{name}/config/files and /v1/jails/{name}/config/test
+func (s *Server) handleJailConfig(w http.ResponseWriter, r *http.Request, name, subaction string) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		return
+	}
+
+	q := r.URL.Query()
+	limit := 10
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			limit = n
+		}
+	}
+
+	switch subaction {
+	case "files":
+		logFiles := q.Get("log") == "true"
+		files, err := s.controller.ConfigFiles(name, limit, logFiles)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: err.Error()})
+			return
+		}
+		if files == nil {
+			files = []string{}
+		}
+		writeJSON(w, http.StatusOK, ConfigFilesResponse{Files: files, Count: len(files)})
+
+	case "test":
+		filePath := q.Get("file")
+		if filePath == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "missing required query parameter: file"})
+			return
+		}
+		returnMatching := q.Get("matching") == "true"
+		total, matching, matches, err := s.controller.ConfigTest(name, filePath, limit, returnMatching)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, ConfigTestResponse{
+			TotalLines:    total,
+			MatchingLines: matching,
+			Matches:       matches,
+		})
 
 	default:
 		writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "not found"})
