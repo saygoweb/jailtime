@@ -11,6 +11,7 @@ import (
 type FileTailer struct {
 	path     string
 	file     *os.File
+	reader   *bufio.Reader // reused across ReadLines calls to avoid per-call allocation
 	offset   int64
 	inode    uint64
 	debugLog *debugRateLimiter
@@ -22,7 +23,7 @@ func NewFileTailer(path string, readFromEnd bool) (*FileTailer, error) {
 	if err != nil {
 		return nil, err
 	}
-	ft := &FileTailer{path: path, file: f, debugLog: newDebugRateLimiter(2)}
+	ft := &FileTailer{path: path, file: f, reader: bufio.NewReader(f), debugLog: newDebugRateLimiter(2)}
 
 	info, err := f.Stat()
 	if err != nil {
@@ -70,6 +71,7 @@ func (ft *FileTailer) ReadLines() ([]string, error) {
 		ft.file = f
 		ft.offset = 0
 		ft.inode = curInode
+		ft.reader.Reset(f)
 	}
 
 	_, err = ft.file.Seek(ft.offset, io.SeekStart)
@@ -77,10 +79,10 @@ func (ft *FileTailer) ReadLines() ([]string, error) {
 		return nil, err
 	}
 
-	reader := bufio.NewReader(ft.file)
+	ft.reader.Reset(ft.file)
 	var lines []string
 	for {
-		line, err := reader.ReadString('\n')
+		line, err := ft.reader.ReadString('\n')
 		if len(line) > 0 {
 			// Only emit complete lines (ending with newline).
 			if len(line) > 0 && line[len(line)-1] == '\n' {
