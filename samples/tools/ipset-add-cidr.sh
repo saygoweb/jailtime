@@ -26,9 +26,14 @@ if ! command -v iptocidr &>/dev/null; then
     exit 1
 fi
 
+# iptocidr may transiently fail when a concurrent invocation is writing the
+# WHOIS cache for the same IP.  Retry once after a short delay before giving up.
 CIDR=$(iptocidr "$IP" 2>/dev/null) || {
-    echo "ipset-add-cidr: iptocidr failed for IP '$IP'" >&2
-    exit 1
+    sleep 1
+    CIDR=$(iptocidr "$IP" 2>/dev/null) || {
+        echo "ipset-add-cidr: iptocidr failed for IP '$IP'" >&2
+        exit 1
+    }
 }
 
 # ── Validate output ───────────────────────────────────────────────────────────
