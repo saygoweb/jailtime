@@ -40,6 +40,8 @@ func (b *FsnotifyBackend) getSpecs() []WatchSpec {
 
 // Start watches files using fsnotify for WRITE/CREATE events.
 // Periodically rescans globs to pick up new matching files.
+// One FileTailer is maintained per unique file path (shared across jails);
+// each line is fanned out to every jail whose globs match that path.
 // On CREATE event for a watched path, the FileTailer is reopened.
 func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan<- Event) error {
 	b.UpdateSpecs(specs)
@@ -54,45 +56,59 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 	defer watcher.Close()
 	slog.Info("fsnotify backend started")
 
-	type tailerKey struct {
-		jailName string
-		path     string
-	}
-	tailers := make(map[tailerKey]*FileTailer)
-	// pathToKeys maps a watched path to the set of tailerKeys using it.
-	pathToKeys := make(map[string][]tailerKey)
-
-	addFile := func(spec WatchSpec, p string) {
-		k := tailerKey{spec.JailName, p}
-		if _, ok := tailers[k]; ok {
-			return
-		}
-		ft, err := NewFileTailer(p, spec.ReadFromEnd)
-		if err != nil {
-			return
-		}
-		tailers[k] = ft
-		pathToKeys[p] = append(pathToKeys[p], k)
-		// Ignore error if already watched.
-		_ = watcher.Add(p)
-	}
+	// tailers maps file path → FileTailer (one per unique path across all jails).
+	tailers := make(map[string]*FileTailer)
+	// pathToJails maps file path → list of jail names watching it.
+	pathToJails := make(map[string][]string)
 
 	rescan := func() {
-		for _, spec := range b.getSpecs() {
+		currentSpecs := b.getSpecs()
+
+		// Rebuild pathToJails from current specs to handle jail additions/removals.
+		newPathToJails := make(map[string][]string)
+		pathReadFromEnd := make(map[string]bool)
+		for _, spec := range currentSpecs {
 			for _, pattern := range spec.Globs {
 				paths, err := filepath.Glob(pattern)
 				if err != nil {
 					continue
 				}
 				for _, p := range paths {
-					addFile(spec, p)
+					newPathToJails[p] = append(newPathToJails[p], spec.JailName)
+					if _, set := pathReadFromEnd[p]; !set {
+						pathReadFromEnd[p] = spec.ReadFromEnd
+					}
 				}
 			}
 		}
+
+		// Open tailers for newly matched paths.
+		for p := range newPathToJails {
+			if _, ok := tailers[p]; !ok {
+				ft, err := NewFileTailer(p, pathReadFromEnd[p])
+				if err != nil {
+					continue
+				}
+				tailers[p] = ft
+				// Ignore error if already watched.
+				_ = watcher.Add(p)
+			}
+		}
+
+		// Close tailers for paths no longer matched by any spec.
+		for p, ft := range tailers {
+			if _, ok := newPathToJails[p]; !ok {
+				ft.Close()
+				delete(tailers, p)
+				_ = watcher.Remove(p)
+			}
+		}
+
+		pathToJails = newPathToJails
 	}
 
-	readAndSend := func(k tailerKey) {
-		ft, ok := tailers[k]
+	readAndSend := func(p string) {
+		ft, ok := tailers[p]
 		if !ok {
 			return
 		}
@@ -101,22 +117,24 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 			return
 		}
 		for _, line := range lines {
-			if slog.Default().Enabled(ctx, slog.LevelDebug) && ft.debugLog.Allow() {
-				slog.DebugContext(ctx, "line notified",
-					"jail", k.jailName,
-					"file", k.path,
-					"line", line,
-				)
-			}
-			select {
-			case out <- Event{
-				JailName: k.jailName,
-				FilePath: k.path,
-				Offset:   ft.offset,
-				Line:     line,
-				Time:     time.Now(),
-			}:
-			case <-ctx.Done():
+			for _, jailName := range pathToJails[p] {
+				if slog.Default().Enabled(ctx, slog.LevelDebug) && ft.debugLog.Allow() {
+					slog.DebugContext(ctx, "line notified",
+						"jail", jailName,
+						"file", p,
+						"line", line,
+					)
+				}
+				select {
+				case out <- Event{
+					JailName: jailName,
+					FilePath: p,
+					Offset:   ft.offset,
+					Line:     line,
+					Time:     time.Now(),
+				}:
+				case <-ctx.Done():
+				}
 			}
 		}
 	}
@@ -142,22 +160,20 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 			if !ok {
 				return nil
 			}
-			keys := pathToKeys[event.Name]
-			for _, k := range keys {
-				if event.Has(fsnotify.Create) {
-					// File was recreated (rotation): reopen tailer from start.
-					if ft, ok := tailers[k]; ok {
-						ft.Close()
-					}
-					ft, err := NewFileTailer(k.path, false)
-					if err != nil {
-						delete(tailers, k)
-						continue
-					}
-					tailers[k] = ft
+			p := event.Name
+			if event.Has(fsnotify.Create) {
+				// File was recreated (rotation): reopen tailer from start.
+				if ft, ok := tailers[p]; ok {
+					ft.Close()
 				}
-				readAndSend(k)
+				ft, err := NewFileTailer(p, false)
+				if err != nil {
+					delete(tailers, p)
+					continue
+				}
+				tailers[p] = ft
 			}
+			readAndSend(p)
 
 		case _, ok := <-watcher.Errors:
 			if !ok {
