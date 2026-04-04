@@ -1,0 +1,82 @@
+# Sample E: Apache / WordPress brute-force jail
+#
+# Targets two common WordPress attack vectors seen in Apache combined logs:
+#
+#   1. POST /wp-login.php → 200
+#      A 200 response means the password was wrong and WordPress re-rendered
+#      the login page.  A *successful* login redirects to wp-admin (302), so
+#      we explicitly exclude 302 responses.
+#
+#   2. GET /xmlrpc.php (any response code)
+#      xmlrpc.php is exploited for password brute-forcing (system.multicall)
+#      and as a DDoS reflection vector.  Legitimate WordPress installations
+#      rarely need it exposed; any access from an unknown IP is suspicious.
+#
+# Apache combined log examples this jail matches:
+#
+#   MATCH   – failed wp-login (200):
+#     1.2.3.4 - - [04/Apr/2026:03:10:01 +0000] "POST /wp-login.php HTTP/1.1" 200 4823 "https://example.com/wp-login.php" "Mozilla/5.0"
+#
+#   NO MATCH – successful wp-login (302 redirect → wp-admin):
+#     1.2.3.4 - - [04/Apr/2026:03:10:05 +0000] "POST /wp-login.php HTTP/1.1" 302 342 "-" "Mozilla/5.0"
+#
+#   MATCH   – xmlrpc probe:
+#     1.2.3.4 - - [04/Apr/2026:03:10:07 +0000] "GET /xmlrpc.php HTTP/1.1" 200 674 "-" "python-requests/2.28"
+#
+#   MATCH   – xmlrpc multicall attack (POST, any status):
+#     1.2.3.4 - - [04/Apr/2026:03:10:08 +0000] "POST /xmlrpc.php HTTP/1.1" 200 431 "-" "Go-http-client/1.1"
+#
+# Actions use the CIDR-mode idempotent pattern (sample D): on_match resolves
+# the attacking IP to its /24 (or whatever block iptocidr returns) and bans
+# the whole range for JailTime seconds via a hash:net ipset.
+#
+# Prerequisites:
+#   - iptocidr on PATH
+#   - Wrapper scripts at /usr/local/lib/jailtime/ (see deploy/setup.sh)
+
+jails:
+  - name: apache-wordpress
+    enabled: true
+
+    files:
+      - /var/log/apache2/access.log
+      - /var/log/apache2/other_vhosts_access.log  # catches all virtual hosts
+
+    # ── Exclude ─────────────────────────────────────────────────────────────
+    # A 302 after POST /wp-login.php means the password was accepted and the
+    # browser is being redirected to wp-admin.  Do not count this as a hit.
+    exclude_filters:
+      - '"POST /wp-login\.php[^"]*" 302 '
+
+    # ── Include (any one match increments the hit counter) ──────────────────
+    filters:
+      # Failed WordPress login: POST to wp-login.php returning 200.
+      # Apache combined log format:  IP - USER [DATE] "METHOD PATH PROTO" STATUS BYTES ...
+      - '^(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}) \S+ \S+ \[[^\]]+\] "POST /wp-login\.php[^"]*" 200 '
+
+      # xmlrpc.php access — any HTTP method, any status code.
+      # Both GET probes and POST multicall attacks are captured.
+      - '^(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}) \S+ \S+ \[[^\]]+\] "(?:GET|POST|HEAD) /xmlrpc\.php'
+
+    hit_count: 5
+    find_time: 2m
+    jail_time: 1h
+    net_type: IP   # filters extract a plain IP; CIDR conversion is done in action scripts
+
+    # Pre-check: skip on_match if the IP's CIDR block is already in the set.
+    query: '/usr/local/lib/jailtime/ipset-test-cidr.sh jt_{{ .Jail }} {{ .IP }}'
+
+    actions:
+      on_start:
+        - '/usr/local/lib/jailtime/ipset-ensure.sh jt_{{ .Jail }} hash:net timeout 0 comment'
+        - '/usr/local/lib/jailtime/iptables-ensure.sh -I INPUT -m set --match-set jt_{{ .Jail }} src -j DROP -m comment --comment "jailtime:{{ .Jail }}"'
+
+      on_stop:
+        - '/usr/local/lib/jailtime/iptables-remove.sh -D INPUT -m set --match-set jt_{{ .Jail }} src -j DROP -m comment --comment "jailtime:{{ .Jail }}"'
+        - '/usr/local/lib/jailtime/ipset-flush.sh jt_{{ .Jail }}'
+
+      on_match:
+        # Resolve IP → CIDR and add the whole block to the ipset.
+        - '/usr/local/lib/jailtime/ipset-add-cidr.sh jt_{{ .Jail }} {{ .IP }} {{ .JailTime }}'
+
+      on_restart: []
