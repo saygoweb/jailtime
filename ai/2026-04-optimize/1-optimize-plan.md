@@ -102,15 +102,15 @@ The timer is **reactive and adaptive** — it continuously adjusts its interval 
                     │                                                  │
                     │  computeTarget logic:                            │
                     │    if queueDepth == 0:                           │
-                    │      target = interval * 1.5   (back off)       │
+                    │      target = interval * 1.5   (back off)        │
                     │    elif measuredLatency > max * 0.8:             │
-                    │      target = interval * 0.5   (speed up)       │
+                    │      target = interval * 0.5   (speed up)        │
                     │    elif measuredLatency < min * 0.5:             │
-                    │      target = interval * 1.25  (relax)          │
+                    │      target = interval * 1.25  (relax)           │
                     │    else:                                         │
-                    │      target = interval         (hold steady)    │
+                    │      target = interval         (hold steady)     │
                     │                                                  │
-                    │  Always clamped to [min_latency, max_latency]   │
+                    │  Always clamped to [min_latency, max_latency]    │
                     └──────────────────────────────────────────────────┘
 ```
 
