@@ -20,6 +20,7 @@ type JailController interface {
 	AllJailStatuses() map[string]string
 	ConfigFiles(name string, limit int, logFiles bool) ([]string, error)
 	ConfigTest(name, filePath string, limit int, returnMatching bool) (totalLines, matchingLines int, matches []string, err error)
+	PerfStats() PerfResponse
 }
 
 // Server serves the control API over a Unix domain socket.
@@ -48,6 +49,7 @@ func (s *Server) Serve(ctx context.Context) error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", s.handleHealth)
+	mux.HandleFunc("/v1/perf", s.handlePerf)
 	mux.HandleFunc("/v1/jails", s.handleJails)
 	mux.HandleFunc("/v1/jails/", s.handleJailAction)
 
@@ -70,6 +72,15 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func (s *Server) handlePerf(w http.ResponseWriter, r *http.Request) {
+	slog.Info("control request", "method", r.Method, "path", r.URL.Path)
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.controller.PerfStats())
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

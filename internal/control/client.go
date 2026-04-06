@@ -57,6 +57,15 @@ func (c *Client) post(path string) error {
 	return nil
 }
 
+// Perf calls GET /v1/perf.
+func (c *Client) Perf() (*PerfResponse, error) {
+	var resp PerfResponse
+	if err := c.get("/v1/perf", &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // Health calls GET /v1/health.
 func (c *Client) Health() (*HealthResponse, error) {
 	var resp HealthResponse

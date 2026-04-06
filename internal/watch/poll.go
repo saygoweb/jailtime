@@ -37,8 +37,8 @@ func (b *PollBackend) getSpecs() []WatchSpec {
 
 // Start begins polling. Every interval it expands globs across all WatchSpecs,
 // maintains one FileTailer per unique file path (shared across jails), reads
-// each file once, and fans out new lines as Events to every jail watching it.
-func (b *PollBackend) Start(ctx context.Context, specs []WatchSpec, out chan<- Event) error {
+// each file once, and emits one RawLine per line with all interested jails.
+func (b *PollBackend) Start(ctx context.Context, specs []WatchSpec, out chan<- RawLine) error {
 	b.UpdateSpecs(specs)
 
 	type pathInfo struct {
@@ -60,15 +60,27 @@ func (b *PollBackend) Start(ctx context.Context, specs []WatchSpec, out chan<- E
 			}
 			return ctx.Err()
 		case <-ticker.C:
-			// Expand all globs for all specs: path → {jails watching it, readFromEnd}.
-			pathInfos := make(map[string]*pathInfo)
-			for _, spec := range b.getSpecs() {
+			currentSpecs := b.getSpecs()
+
+			// Step 1: expand each unique glob pattern once.
+			globCache := make(map[string][]string)
+			for _, spec := range currentSpecs {
 				for _, pattern := range spec.Globs {
-					paths, err := filepath.Glob(pattern)
-					if err != nil {
-						continue
+					if _, seen := globCache[pattern]; !seen {
+						paths, err := filepath.Glob(pattern)
+						if err != nil || paths == nil {
+							paths = []string{}
+						}
+						globCache[pattern] = paths
 					}
-					for _, p := range paths {
+				}
+			}
+
+			// Step 2: build path → {jails, readFromEnd} using cached glob results.
+			pathInfos := make(map[string]*pathInfo)
+			for _, spec := range currentSpecs {
+				for _, pattern := range spec.Globs {
+					for _, p := range globCache[pattern] {
 						pi, ok := pathInfos[p]
 						if !ok {
 							pi = &pathInfo{readFromEnd: spec.ReadFromEnd}
@@ -90,7 +102,7 @@ func (b *PollBackend) Start(ctx context.Context, specs []WatchSpec, out chan<- E
 				}
 			}
 
-			// Read each file once; fan out lines to every jail watching it.
+			// Read each file once; emit one RawLine per line with all watching jails.
 			for p, ft := range tailers {
 				pi, matched := pathInfos[p]
 				if !matched {
@@ -103,25 +115,22 @@ func (b *PollBackend) Start(ctx context.Context, specs []WatchSpec, out chan<- E
 					continue
 				}
 				for _, line := range lines {
-					for _, jailName := range pi.jails {
-						if slog.Default().Enabled(ctx, slog.LevelDebug) && ft.debugLog.Allow() {
-							slog.DebugContext(ctx, "line notified",
-								"jail", jailName,
-								"file", p,
-								"line", line,
-							)
-						}
-						select {
-						case out <- Event{
-							JailName: jailName,
-							FilePath: p,
-							Offset:   ft.offset,
-							Line:     line,
-							Time:     time.Now(),
-						}:
-						case <-ctx.Done():
-							return ctx.Err()
-						}
+					if slog.Default().Enabled(ctx, slog.LevelDebug) && ft.debugLog.Allow() {
+						slog.DebugContext(ctx, "line notified",
+							"jails", pi.jails,
+							"file", p,
+							"line", line,
+						)
+					}
+					select {
+					case out <- RawLine{
+						FilePath:  p,
+						Line:      line,
+						Jails:     pi.jails,
+						EnqueueAt: time.Now(),
+					}:
+					case <-ctx.Done():
+						return ctx.Err()
 					}
 				}
 			}

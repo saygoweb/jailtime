@@ -171,3 +171,14 @@ func (a *JailControllerAdapter) ConfigFiles(name string, limit int, logFiles boo
 func (a *JailControllerAdapter) ConfigTest(name, filePath string, limit int, returnMatching bool) (int, int, []string, error) {
 	return a.m.ConfigTest(name, filePath, limit, returnMatching)
 }
+
+func (a *JailControllerAdapter) PerfStats() control.PerfResponse {
+	snap := a.m.PerfStats()
+	return control.PerfResponse{
+		CurrentLatencyMs: snap.CurrentLatencyMs,
+		CurrentDelayMs:   snap.CurrentDelayMs,
+		AvgExecTimeMs:    snap.AvgExecTimeMs,
+		AvgCPUPercent:    snap.AvgCPUPercent,
+		WindowSize:       snap.WindowSize,
+	}
+}

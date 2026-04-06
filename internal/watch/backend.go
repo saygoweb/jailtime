@@ -16,6 +16,16 @@ type Event struct {
 	Time     time.Time
 }
 
+// RawLine is a single log line read from a file, annotated with all
+// jail names that have an interest in this file. It is the unit emitted
+// by backends to the engine.
+type RawLine struct {
+	FilePath  string
+	Line      string
+	Jails     []string
+	EnqueueAt time.Time
+}
+
 // WatchSpec defines what a jail wants to watch.
 type WatchSpec struct {
 	JailName    string
@@ -26,7 +36,9 @@ type WatchSpec struct {
 // Backend is the abstraction for file watching implementations.
 type Backend interface {
 	Name() string
-	Start(ctx context.Context, specs []WatchSpec, out chan<- Event) error
+	// Start begins watching. It blocks until ctx is cancelled or an error occurs.
+	// It emits RawLine values (one per file-line, with all interested jails) to out.
+	Start(ctx context.Context, specs []WatchSpec, out chan<- RawLine) error
 	// UpdateSpecs replaces the set of watch specs. New jails are picked up on
 	// the next rescan/poll cycle; removed jails stop generating events.
 	UpdateSpecs(specs []WatchSpec)
