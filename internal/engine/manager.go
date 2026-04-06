@@ -14,8 +14,7 @@ import (
 const emaAlpha = 0.3
 
 type pendingItem struct {
-	line      watch.RawLine
-	enqueueAt time.Time
+	line watch.RawLine
 }
 
 type batchQueue struct {
@@ -25,7 +24,7 @@ type batchQueue struct {
 
 func (q *batchQueue) Enqueue(line watch.RawLine) {
 	q.mu.Lock()
-	q.items = append(q.items, pendingItem{line: line, enqueueAt: time.Now()})
+	q.items = append(q.items, pendingItem{line: line})
 	q.mu.Unlock()
 }
 
@@ -126,6 +125,7 @@ func (m *Manager) Run(ctx context.Context) error {
 		if err := m.backend.Start(ctx, specs, rawLines); err != nil && err != context.Canceled {
 			backendErr <- err
 		}
+		close(rawLines)   // signal enqueue goroutine to stop
 		close(backendErr)
 	}()
 
@@ -173,7 +173,7 @@ func (m *Manager) Run(ctx context.Context) error {
 
 			var measuredLatency time.Duration
 			if len(batch) > 0 {
-				measuredLatency = drainStart.Sub(batch[0].enqueueAt)
+				measuredLatency = drainStart.Sub(batch[0].line.EnqueueAt)
 			}
 
 			m.processBatch(ctx, batch)
@@ -187,12 +187,28 @@ func (m *Manager) Run(ctx context.Context) error {
 }
 
 func (m *Manager) processBatch(ctx context.Context, batch []pendingItem) {
+	// Collect jail names needed for this batch.
+	needed := make(map[string]struct{})
+	for _, item := range batch {
+		for _, name := range item.line.Jails {
+			needed[name] = struct{}{}
+		}
+	}
+
+	// Snapshot jail runtime pointers under RLock, then release before running
+	// HandleEvent (which may execute slow shell actions).
 	m.mu.RLock()
-	defer m.mu.RUnlock()
+	snapshot := make(map[string]*JailRuntime, len(needed))
+	for name := range needed {
+		if jr, exists := m.jails[name]; exists {
+			snapshot[name] = jr
+		}
+	}
+	m.mu.RUnlock()
 
 	for _, item := range batch {
 		for _, jailName := range item.line.Jails {
-			jr, exists := m.jails[jailName]
+			jr, exists := snapshot[jailName]
 			if !exists || jr.Status() != StatusStarted {
 				continue
 			}

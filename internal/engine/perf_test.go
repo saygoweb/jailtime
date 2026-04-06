@@ -29,10 +29,7 @@ func TestPerfMetrics_SnapshotAverages(t *testing.T) {
 		t.Errorf("AvgExecTimeMs = %v, want %v", snap.AvgExecTimeMs, wantAvgExec)
 	}
 
-	wantCurrentLatency := 10.0 // latencies[1] = 15ms... wait, last latency pushed was 15ms
-	_ = wantCurrentLatency
-	// currentLatency is updated only when batchSize>0; last such call used latencies[1]=15ms
-	wantCurrent := 15.0
+	wantCurrent := 15.0 // currentLatency is updated only when batchSize > 0; the last such call used latencies[1] = 15ms.
 	if snap.CurrentLatencyMs != wantCurrent {
 		t.Errorf("CurrentLatencyMs = %v, want %v", snap.CurrentLatencyMs, wantCurrent)
 	}

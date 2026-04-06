@@ -39,6 +39,9 @@ type PerfMetrics struct {
 }
 
 func NewPerfMetrics(windowSize int, serviceName string) *PerfMetrics {
+	if windowSize <= 0 {
+		windowSize = 1
+	}
 	return &PerfMetrics{
 		windowSize: windowSize,
 		latencies:  make([]time.Duration, windowSize),
