@@ -49,7 +49,7 @@ fail2ban is the reference implementation for log-based intrusion prevention. Key
 | **Backend** | pyinotify (event-driven) or poll | fsnotify or poll | Same, but with shared glob dedup |
 | **Regex** | Compiled once, cached on Filter object | Compiled once per JailRuntime ✓ | Add cross-jail regex dedup |
 | **Thread model** | One filter thread + one action thread per jail | Shared worker pool (GOMAXPROCS*4) | Reduce workers; timer-paced execution |
-| **CPU control** | Implicit (Python GIL + sleep between polls) | Reactive CPU throttle | Proactive: configurable min/max latency timer |
+| **CPU control** | Implicit (Python GIL + sleep between polls) | Reactive CPU throttle | Reactive & adaptive: smooth latency-driven timer within configurable min/max bounds |
 | **Memory** | `__slots__` on Ticket classes | Standard Go structs | Pool Event structs; minimize allocs |
 
 **Key takeaway from fail2ban:** The ticket/queue model naturally decouples detection from processing. fail2ban's efficiency comes from: (a) compiled regex reuse, (b) IP deduplication in FailManager, (c) event-driven inotify with no wasted polls, and (d) minimal CPU through sleep-based pacing. jailtime already has (a) and partial (c). The optimization plan adds (b) improvements and (d) through the timer-based architecture.
@@ -84,24 +84,37 @@ Watch Backend (fsnotify / poll)
 
 ### Adaptive Timer Design
 
+The timer is **reactive and adaptive** — it continuously adjusts its interval based on measured latency and queue pressure. The transitions are smooth (exponential moving average) rather than jumpy:
+
 ```
-                    ┌─────────────────────────────────┐
-                    │     Timer Interval Adapter       │
-                    │                                  │
-                    │  if queue_empty for N cycles:    │
-                    │    interval = min(interval*2,    │
-                    │                   max_latency)   │
-                    │                                  │
-                    │  if queue_non_empty:             │
-                    │    interval = min_latency        │
-                    │                                  │
-                    │  measure: execution_time of      │
-                    │    last batch drain              │
-                    │  if exec_time > interval * 0.5:  │
-                    │    interval = min(interval*1.5,  │
-                    │                   max_latency)   │
-                    └─────────────────────────────────┘
+                    ┌──────────────────────────────────────────────────┐
+                    │        Smooth Reactive Timer Adapter             │
+                    │                                                  │
+                    │  Inputs:                                         │
+                    │    measuredLatency = drainStart - oldest.enqueue │
+                    │    queueDepth      = len(batch)                  │
+                    │    execTime        = duration of batch drain     │
+                    │                                                  │
+                    │  Smooth transition (EMA, α = 0.3):               │
+                    │    target = computeTarget(inputs)                │
+                    │    interval = interval*(1-α) + target*α          │
+                    │    interval = clamp(interval, min, max)          │
+                    │                                                  │
+                    │  computeTarget logic:                            │
+                    │    if queueDepth == 0:                           │
+                    │      target = interval * 1.5   (back off)       │
+                    │    elif measuredLatency > max * 0.8:             │
+                    │      target = interval * 0.5   (speed up)       │
+                    │    elif measuredLatency < min * 0.5:             │
+                    │      target = interval * 1.25  (relax)          │
+                    │    else:                                         │
+                    │      target = interval         (hold steady)    │
+                    │                                                  │
+                    │  Always clamped to [min_latency, max_latency]   │
+                    └──────────────────────────────────────────────────┘
 ```
+
+**Key design principle:** The timer is **reactive** — it measures actual latency (enqueue time vs drain time) and adapts. When latency is well below the minimum, the interval increases (saves CPU). When the queue is growing and latency rising toward max, the interval decreases (faster processing). The exponential moving average (α = 0.3) ensures smooth transitions — no oscillation or "jumpiness" between states.
 
 **Configuration:**
 ```yaml
@@ -233,12 +246,19 @@ func (m *Manager) runDrainLoop(ctx context.Context) {
             return
         case <-timer.C:
             batch := m.queue.Drain()
-            start := time.Now()
+            drainStart := time.Now()
+
+            // Measure latency from oldest enqueued item
+            var measuredLatency time.Duration
+            if len(batch) > 0 {
+                measuredLatency = drainStart.Sub(batch[0].enqueueAt)
+            }
+
             m.processBatch(ctx, batch)
-            execTime := time.Since(start)
+            execTime := time.Since(drainStart)
             
-            m.perf.RecordExecution(execTime, batch, start)
-            nextInterval := m.adaptInterval(execTime, len(batch))
+            m.perf.RecordExecution(execTime, measuredLatency, len(batch), m.currentInterval)
+            nextInterval := m.adaptInterval(execTime, len(batch), measuredLatency)
             timer.Reset(nextInterval)
         }
     }
@@ -247,27 +267,63 @@ func (m *Manager) runDrainLoop(ctx context.Context) {
 
 **Files changed:** `internal/engine/manager.go` (major refactor of `Run`)
 
-#### 2.2 — Adaptive Interval Logic
+#### 2.2 — Smooth Reactive Adaptive Interval
+
+The adaptive interval uses an exponential moving average (EMA) for smooth transitions, driven by measured latency and queue depth:
 
 ```go
-func (m *Manager) adaptInterval(execTime time.Duration, batchSize int) time.Duration {
-    if batchSize == 0 {
-        // No work — back off toward max_latency
-        m.currentInterval = min(m.currentInterval*2, m.maxLatency)
-    } else {
-        // Work done — use min_latency
-        m.currentInterval = m.minLatency
-        // But if execution took > 50% of interval, stretch it
-        if execTime > m.currentInterval/2 {
-            m.currentInterval = min(
-                time.Duration(float64(execTime)*1.5),
-                m.maxLatency,
-            )
+const emaAlpha = 0.3 // Smoothing factor: 0.3 = moderate responsiveness
+
+func (m *Manager) adaptInterval(execTime time.Duration, batchSize int, measuredLatency time.Duration) time.Duration {
+    var target time.Duration
+
+    switch {
+    case batchSize == 0:
+        // No work in queue — relax toward max_latency (save CPU)
+        target = time.Duration(float64(m.currentInterval) * 1.5)
+    case measuredLatency > time.Duration(float64(m.maxLatency) * 0.8):
+        // Latency approaching max — speed up (shrink interval)
+        target = time.Duration(float64(m.currentInterval) * 0.5)
+    case measuredLatency < time.Duration(float64(m.minLatency) * 0.5):
+        // Latency well below min — relax slightly (save CPU)
+        target = time.Duration(float64(m.currentInterval) * 1.25)
+    default:
+        // Latency in acceptable range — hold steady
+        target = m.currentInterval
+    }
+
+    // Additionally, if execution time is consuming too much of the interval,
+    // stretch the interval to allow breathing room.
+    if batchSize > 0 && execTime > m.currentInterval/2 {
+        stretched := time.Duration(float64(execTime) * 2.0)
+        if stretched > target {
+            target = stretched
         }
     }
-    return m.currentInterval
+
+    // Smooth transition using EMA
+    next := time.Duration(
+        float64(m.currentInterval)*(1-emaAlpha) + float64(target)*emaAlpha,
+    )
+
+    // Clamp to [min, max]
+    if next < m.minLatency {
+        next = m.minLatency
+    }
+    if next > m.maxLatency {
+        next = m.maxLatency
+    }
+
+    m.currentInterval = next
+    return next
 }
 ```
+
+**Behavior examples:**
+- Idle system: interval smoothly grows from 2s → 3s → 4.5s → ... → 10s (max)
+- Burst arrives: interval drops smoothly from 10s → 7s → 5s → 3.5s → 2.5s → 2s (min)
+- Steady load: interval holds near min_latency
+- Load subsides: interval smoothly relaxes back toward max_latency
 
 #### 2.3 — Batch Processing with Cross-Jail Fan-Out
 
@@ -400,17 +456,12 @@ Parse once in `NewJailRuntime()` and `Reconfigure()`. Execute with `tpl.Execute(
 
 **Files changed:** `internal/action/template.go`, `internal/engine/jail_runtime.go`
 
-#### 4.2 — HitTracker Lock Reduction
+#### 4.2 — HitTracker Sharded Map
 
 **Current:** Single `sync.Mutex` protects entire `map[string]*HitWindow`.
 
-**Options (in order of complexity):**
+**Solution:** Sharded map with 16 shards — partition by IP hash, each shard has its own mutex. Reduces contention by factor of 16. Simple, effective, no API change:
 
-1. **sync.Map** — lock-free reads, good for read-heavy workloads. But `Record()` is always a write.
-2. **Sharded map** — partition by IP hash into N buckets, each with its own mutex. Reduces contention by factor of N.
-3. **Per-IP atomic counters** — more complex, but eliminates mutex entirely.
-
-**Recommended:** Option 2 (sharded map with 16 shards). Simple, effective, no API change:
 ```go
 type HitTracker struct {
     shards [16]hitShard
@@ -732,3 +783,962 @@ Phases 1 and 2 are the core architectural changes. Phases 3-4 are incremental op
 | `internal/watch/watch_test.go` | Modified: update for RawLine | 1.2 |
 | `internal/engine/engine_test.go` | Modified: update for timer architecture | 2 |
 | `internal/engine/integration_test.go` | Modified: update for timer architecture | 2 |
+
+---
+
+## Detailed AI Implementation Plan
+
+This section provides step-by-step implementation instructions organized into independent work units suitable for AI sub-agents. Each unit describes the exact files to modify, the changes to make, how to verify, and dependencies on other units.
+
+### Prerequisites
+
+- Working directory: `/home/cambell/src/sgw/jailtime`
+- Branch: `feat/optimize`
+- Go module: `github.com/sgw/jailtime`
+- Build: `go build ./cmd/jailtimed && go build ./cmd/jailtime`
+- Test: `go test ./...`
+- All existing tests must pass after each unit.
+
+---
+
+### Unit 1: Config — Add min_latency, max_latency, perf_window
+
+**Goal:** Add three new engine configuration fields with defaults and validation.
+
+**Files to modify:**
+
+1. **`internal/config/types.go`** — Add fields to `EngineConfig`:
+   ```go
+   EngineConfig struct {
+       WatcherMode  string   `yaml:"watcher_mode"`
+       PollInterval Duration `yaml:"poll_interval"`
+       ReadFromEnd  bool     `yaml:"read_from_end"`
+       MinLatency   Duration `yaml:"min_latency"`   // NEW
+       MaxLatency   Duration `yaml:"max_latency"`   // NEW
+       PerfWindow   int      `yaml:"perf_window"`   // NEW
+   }
+   ```
+   Add constants:
+   ```go
+   const (
+       defaultSocketPath   = "/run/jailtime/jailtimed.sock"
+       defaultPollInterval = 2 * time.Second
+       defaultMinLatency   = 2 * time.Second    // NEW
+       defaultMaxLatency   = 10 * time.Second   // NEW
+       defaultPerfWindow   = 3                   // NEW
+   )
+   ```
+
+2. **`internal/config/load.go`** — Add to `rawEngineConfig`:
+   ```go
+   rawEngineConfig struct {
+       WatcherMode  string   `yaml:"watcher_mode"`
+       PollInterval Duration `yaml:"poll_interval"`
+       ReadFromEnd  *bool    `yaml:"read_from_end"`
+       MinLatency   Duration `yaml:"min_latency"`   // NEW
+       MaxLatency   Duration `yaml:"max_latency"`   // NEW
+       PerfWindow   *int     `yaml:"perf_window"`   // NEW (pointer for default detection)
+   }
+   ```
+   In `applyDefaults()`, add:
+   ```go
+   if c.Engine.MinLatency.Duration == 0 {
+       c.Engine.MinLatency.Duration = defaultMinLatency
+   }
+   if c.Engine.MaxLatency.Duration == 0 {
+       c.Engine.MaxLatency.Duration = defaultMaxLatency
+   }
+   if c.Engine.PerfWindow == 0 {
+       c.Engine.PerfWindow = defaultPerfWindow
+   }
+   ```
+
+3. **`internal/config/validate.go`** — Add validation in `Validate()`:
+   ```go
+   if c.Engine.MinLatency.Duration <= 0 {
+       return fmt.Errorf("engine: min_latency must be > 0")
+   }
+   if c.Engine.MaxLatency.Duration <= 0 {
+       return fmt.Errorf("engine: max_latency must be > 0")
+   }
+   if c.Engine.MaxLatency.Duration < c.Engine.MinLatency.Duration {
+       return fmt.Errorf("engine: max_latency must be >= min_latency")
+   }
+   if c.Engine.PerfWindow < 1 {
+       return fmt.Errorf("engine: perf_window must be >= 1")
+   }
+   ```
+
+4. **`internal/config/config_test.go`** — Add test(s) verifying defaults are applied and validation catches invalid values (max < min, perf_window < 1).
+
+**Verification:** `go test ./internal/config/... && go build ./cmd/jailtimed && go build ./cmd/jailtime`
+
+**Dependencies:** None — this is a leaf change.
+
+---
+
+### Unit 2: HitTracker — Sharded Map
+
+**Goal:** Replace single-mutex HitTracker with 16-shard design.
+
+**Files to modify:**
+
+1. **`internal/engine/hits.go`** — Replace entire implementation:
+   - Current `HitTracker` has `mu sync.Mutex` + `windows map[string]*HitWindow`
+   - New design:
+     ```go
+     const numShards = 16
+
+     type HitTracker struct {
+         shards [numShards]hitShard
+     }
+
+     type hitShard struct {
+         mu      sync.Mutex
+         windows map[string]*HitWindow
+     }
+
+     type HitWindow struct {
+         Count        int
+         WindowExpiry time.Time
+     }
+
+     func NewHitTracker() *HitTracker {
+         var ht HitTracker
+         for i := range ht.shards {
+             ht.shards[i].windows = make(map[string]*HitWindow)
+         }
+         return &ht
+     }
+
+     func (ht *HitTracker) shard(key string) *hitShard {
+         h := uint32(2166136261) // FNV-1a offset basis
+         for i := 0; i < len(key); i++ {
+             h ^= uint32(key[i])
+             h *= 16777619
+         }
+         return &ht.shards[h%numShards]
+     }
+
+     func (ht *HitTracker) Record(ip string, t time.Time, findTime time.Duration, threshold int) (count int, triggered bool) {
+         s := ht.shard(ip)
+         s.mu.Lock()
+         defer s.mu.Unlock()
+
+         w, ok := s.windows[ip]
+         if !ok {
+             w = &HitWindow{}
+             s.windows[ip] = w
+         }
+         if t.After(w.WindowExpiry) {
+             w.Count = 0
+         }
+         w.Count++
+         w.WindowExpiry = t.Add(findTime)
+
+         if w.Count >= threshold {
+             count = w.Count
+             w.Count = 0
+             return count, true
+         }
+         return w.Count, false
+     }
+     ```
+   - Keep the `NewHitTracker()` function signature compatible with callers.
+
+2. **`internal/engine/engine_test.go`** — Existing HitTracker tests should still pass. Add a concurrent benchmark:
+   ```go
+   func BenchmarkHitTrackerConcurrent(b *testing.B) {
+       ht := NewHitTracker()
+       b.RunParallel(func(pb *testing.PB) {
+           i := 0
+           for pb.Next() {
+               ip := fmt.Sprintf("10.0.0.%d", i%256)
+               ht.Record(ip, time.Now(), time.Minute, 5)
+               i++
+           }
+       })
+   }
+   ```
+
+**Verification:** `go test ./internal/engine/... -run TestHit && go test -bench BenchmarkHitTracker ./internal/engine/...`
+
+**Dependencies:** None — the `Record()` signature is unchanged.
+
+---
+
+### Unit 3: Cgroup CPU Sampling
+
+**Goal:** Create a cgroup v2 CPU sampler that reads from `/sys/fs/cgroup/system.slice/jailtimed.service/cpu.stat`, with graceful fallback to Go runtime metrics.
+
+**Files to create/modify:**
+
+1. **`internal/engine/cpu_cgroup.go`** — New file:
+   ```go
+   package engine
+
+   import (
+       "bufio"
+       "fmt"
+       "os"
+       "runtime/metrics"
+       "strconv"
+       "strings"
+       "time"
+   )
+
+   // cgroupCPUSampler reads CPU usage from cgroup v2 cpu.stat.
+   // Falls back to Go runtime metrics if cgroup is unavailable.
+   type cgroupCPUSampler struct {
+       cgroupPath string
+       lastUsage  int64     // microseconds
+       lastTime   time.Time
+       useCgroup  bool
+
+       // Fallback: Go runtime sampler
+       fallback *cpuSampler
+   }
+
+   func newCgroupCPUSampler(serviceName string) *cgroupCPUSampler {
+       path := fmt.Sprintf("/sys/fs/cgroup/system.slice/%s/cpu.stat", serviceName)
+       s := &cgroupCPUSampler{cgroupPath: path}
+
+       // Test if cgroup path is readable
+       if usage, err := s.readUsageUsec(); err == nil {
+           s.useCgroup = true
+           s.lastUsage = usage
+           s.lastTime = time.Now()
+       } else {
+           s.useCgroup = false
+           s.fallback = newCPUSampler()
+       }
+       return s
+   }
+
+   func (s *cgroupCPUSampler) readUsageUsec() (int64, error) {
+       f, err := os.Open(s.cgroupPath)
+       if err != nil {
+           return 0, err
+       }
+       defer f.Close()
+
+       scanner := bufio.NewScanner(f)
+       for scanner.Scan() {
+           line := scanner.Text()
+           if strings.HasPrefix(line, "usage_usec ") {
+               val, err := strconv.ParseInt(strings.TrimPrefix(line, "usage_usec "), 10, 64)
+               return val, err
+           }
+       }
+       return 0, fmt.Errorf("usage_usec not found in %s", s.cgroupPath)
+   }
+
+   // Sample returns CPU usage as a percentage (0-100+) since last call.
+   // For cgroup: percentage of total CPU time consumed.
+   // For fallback: fraction of GOMAXPROCS cores.
+   func (s *cgroupCPUSampler) Sample() float64 {
+       if !s.useCgroup {
+           return s.fallback.sample() * 100.0 // Convert fraction to percentage
+       }
+
+       usage, err := s.readUsageUsec()
+       if err != nil {
+           return 0
+       }
+       now := time.Now()
+       elapsed := now.Sub(s.lastTime).Microseconds()
+       if elapsed <= 0 {
+           return 0
+       }
+
+       delta := usage - s.lastUsage
+       pct := float64(delta) / float64(elapsed) * 100.0
+
+       s.lastUsage = usage
+       s.lastTime = now
+       return pct
+   }
+   ```
+   Note: The percentage is of one CPU core. On a 2-core machine, 100% means one full core.
+
+2. **`internal/engine/cpu_cgroup_test.go`** — New file with tests:
+   - Test `readUsageUsec` with a temp file containing mock cpu.stat content
+   - Test `Sample()` returns 0 when cgroup unavailable (fallback works)
+   - Test that `newCgroupCPUSampler` with a non-existent service falls back gracefully
+
+**Verification:** `go test ./internal/engine/... -run TestCgroup`
+
+**Dependencies:** None — uses existing `cpuSampler` as fallback.
+
+---
+
+### Unit 4: PerfMetrics Collector
+
+**Goal:** Create the performance metrics collector that tracks latency, execution time, delay, and CPU usage in circular buffers.
+
+**Files to create:**
+
+1. **`internal/engine/perf.go`** — New file:
+   ```go
+   package engine
+
+   import (
+       "sync"
+       "time"
+   )
+
+   // PerfSnapshot is a point-in-time view of performance metrics.
+   type PerfSnapshot struct {
+       CurrentLatencyMs float64 `json:"current_latency_ms"`
+       CurrentDelayMs   float64 `json:"current_delay_ms"`
+       AvgExecTimeMs    float64 `json:"avg_exec_time_ms"`
+       AvgCPUPercent    float64 `json:"avg_cpu_percent"`
+       WindowSize       int     `json:"window_size"`
+   }
+
+   // PerfMetrics collects performance metrics in circular buffers.
+   type PerfMetrics struct {
+       mu sync.RWMutex
+
+       windowSize int
+
+       latencies    []time.Duration // circular buffer
+       latencyIdx   int
+       latencyCount int
+
+       execTimes    []time.Duration // circular buffer
+       execIdx      int
+       execCount    int
+
+       cpuSamples  []float64 // circular buffer
+       cpuIdx      int
+       cpuCount    int
+
+       currentDelay   time.Duration
+       currentLatency time.Duration
+
+       cpuSampler *cgroupCPUSampler
+   }
+
+   func NewPerfMetrics(windowSize int, serviceName string) *PerfMetrics {
+       return &PerfMetrics{
+           windowSize: windowSize,
+           latencies:  make([]time.Duration, windowSize),
+           execTimes:  make([]time.Duration, windowSize),
+           cpuSamples: make([]float64, windowSize),
+           cpuSampler: newCgroupCPUSampler(serviceName),
+       }
+   }
+
+   // RecordExecution is called after each batch drain.
+   func (p *PerfMetrics) RecordExecution(execTime, measuredLatency time.Duration, batchSize int, currentDelay time.Duration) {
+       cpuPct := p.cpuSampler.Sample()
+
+       p.mu.Lock()
+       defer p.mu.Unlock()
+
+       p.currentDelay = currentDelay
+       if batchSize > 0 {
+           p.currentLatency = measuredLatency
+       }
+
+       // Push exec time
+       p.execTimes[p.execIdx%p.windowSize] = execTime
+       p.execIdx++
+       if p.execCount < p.windowSize {
+           p.execCount++
+       }
+
+       // Push latency (only when batch had items)
+       if batchSize > 0 {
+           p.latencies[p.latencyIdx%p.windowSize] = measuredLatency
+           p.latencyIdx++
+           if p.latencyCount < p.windowSize {
+               p.latencyCount++
+           }
+       }
+
+       // Push CPU
+       p.cpuSamples[p.cpuIdx%p.windowSize] = cpuPct
+       p.cpuIdx++
+       if p.cpuCount < p.windowSize {
+           p.cpuCount++
+       }
+   }
+
+   // Snapshot returns a point-in-time view of performance metrics.
+   func (p *PerfMetrics) Snapshot() PerfSnapshot {
+       p.mu.RLock()
+       defer p.mu.RUnlock()
+
+       return PerfSnapshot{
+           CurrentLatencyMs: float64(p.currentLatency.Microseconds()) / 1000.0,
+           CurrentDelayMs:   float64(p.currentDelay.Microseconds()) / 1000.0,
+           AvgExecTimeMs:    avgDurationMs(p.execTimes, p.execCount),
+           AvgCPUPercent:    avgFloat(p.cpuSamples, p.cpuCount),
+           WindowSize:       p.windowSize,
+       }
+   }
+
+   func avgDurationMs(buf []time.Duration, count int) float64 {
+       if count == 0 {
+           return 0
+       }
+       var sum time.Duration
+       for i := 0; i < count; i++ {
+           sum += buf[i]
+       }
+       return float64(sum.Microseconds()) / 1000.0 / float64(count)
+   }
+
+   func avgFloat(buf []float64, count int) float64 {
+       if count == 0 {
+           return 0
+       }
+       var sum float64
+       for i := 0; i < count; i++ {
+           sum += buf[i]
+       }
+       return sum / float64(count)
+   }
+   ```
+
+2. **`internal/engine/perf_test.go`** — New file:
+   - Test circular buffer wrapping (push N+1 items into window of N)
+   - Test `Snapshot()` returns correct averages
+   - Test `RecordExecution` with batchSize == 0 doesn't push latency
+   - Test `NewPerfMetrics` with unavailable cgroup path still works
+
+**Verification:** `go test ./internal/engine/... -run TestPerf`
+
+**Dependencies:** Unit 3 (cgroup sampler).
+
+---
+
+### Unit 5: Watch Backend — Glob Dedup & RawLine
+
+**Goal:** Deduplicate glob expansion across jails, and change the backend output channel from `Event` per jail to `RawLine` per file-line (carrying all interested jail names).
+
+**Files to modify:**
+
+1. **`internal/watch/backend.go`**:
+   - Keep existing `Event` type (still used internally by engine after fan-out)
+   - Add new `RawLine` type:
+     ```go
+     type RawLine struct {
+         FilePath  string
+         Line      string
+         Jails     []string
+         EnqueueAt time.Time
+     }
+     ```
+   - Change `Backend` interface:
+     ```go
+     type Backend interface {
+         Name() string
+         Start(ctx context.Context, specs []WatchSpec, out chan<- RawLine) error
+         UpdateSpecs(specs []WatchSpec)
+     }
+     ```
+
+2. **`internal/watch/poll.go`** — Modify the poll loop:
+   - In the glob expansion phase, deduplicate: collect unique glob patterns first, expand each once, then map results to jails
+   - Change event emission: instead of sending one `Event` per jail, send one `RawLine` with `Jails: []string{all watching jails}`
+   - Update `Start()` signature to use `chan<- RawLine`
+
+3. **`internal/watch/fsnotify.go`** — Same dedup and RawLine changes:
+   - Deduplicate globs in `rescan()`
+   - Change `readAndSend()` to emit `RawLine` instead of per-jail `Event`
+   - Update `Start()` signature
+
+4. **`internal/watch/watch_test.go`** — Update tests to receive `RawLine` instead of `Event`. Verify that:
+   - A line from a file watched by 2 jails produces 1 `RawLine` with both jail names
+   - Glob dedup: same pattern in 2 specs only expands once
+
+**Verification:** `go test ./internal/watch/...`
+
+**Dependencies:** None for the watch package itself. Unit 6 depends on this.
+
+---
+
+### Unit 6: Timer-Based Engine — Manager Refactor
+
+**Goal:** Replace the worker-pool event loop in `Manager.Run` with a timer-based batch queue and smooth reactive adaptive interval.
+
+This is the largest and most critical unit. It refactors `internal/engine/manager.go`.
+
+**Files to modify:**
+
+1. **`internal/engine/manager.go`** — Major refactor:
+
+   **Remove:**
+   - `eventTask` struct
+   - Constants: `targetCPUFraction`, `cpuCheckInterval`, `maxDispatchDelay`, `eventQueueSize`, `taskQueueSize`
+   - Worker pool goroutines in `Run()`
+   - `checkCPU()` closure
+   - Import of `runtime` (unless needed elsewhere)
+
+   **Add to Manager struct:**
+   ```go
+   type Manager struct {
+       cfg            *config.Config
+       configPath     string
+       jails          map[string]*JailRuntime
+       backend        watch.Backend
+       mu             sync.RWMutex
+       perf           *PerfMetrics        // NEW
+       queue          batchQueue           // NEW
+       minLatency     time.Duration        // NEW
+       maxLatency     time.Duration        // NEW
+       currentInterval time.Duration       // NEW
+   }
+   ```
+
+   **Add batch queue:**
+   ```go
+   type pendingItem struct {
+       line      watch.RawLine
+       enqueueAt time.Time
+   }
+
+   type batchQueue struct {
+       mu    sync.Mutex
+       items []pendingItem
+   }
+
+   func (q *batchQueue) Enqueue(line watch.RawLine) {
+       q.mu.Lock()
+       q.items = append(q.items, pendingItem{line: line, enqueueAt: time.Now()})
+       q.mu.Unlock()
+   }
+
+   func (q *batchQueue) Drain() []pendingItem {
+       q.mu.Lock()
+       batch := q.items
+       q.items = make([]pendingItem, 0, cap(batch)) // fresh slice, old backing array released with batch
+       q.mu.Unlock()
+       return batch
+   }
+   ```
+
+   **Update `NewManager()`:**
+   ```go
+   func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
+       // ... existing jail creation ...
+       // ... existing backend creation ...
+
+       minLatency := cfg.Engine.MinLatency.Duration
+       maxLatency := cfg.Engine.MaxLatency.Duration
+
+       return &Manager{
+           cfg:             cfg,
+           configPath:      configPath,
+           jails:           jails,
+           backend:         backend,
+           perf:            NewPerfMetrics(cfg.Engine.PerfWindow, "jailtimed.service"),
+           minLatency:      minLatency,
+           maxLatency:      maxLatency,
+           currentInterval: minLatency,
+       }, nil
+   }
+   ```
+
+   **Replace `Run()` with three goroutines:**
+   ```go
+   func (m *Manager) Run(ctx context.Context) error {
+       // 1. Start all enabled jails (same as before)
+       // 2. Build watch specs (same as before)
+
+       // 3. Start the enqueue loop: reads RawLines from backend, enqueues
+       rawLines := make(chan watch.RawLine, 4096)
+       backendErr := make(chan error, 1)
+       go func() {
+           if err := m.backend.Start(ctx, specs, rawLines); err != nil && err != context.Canceled {
+               backendErr <- err
+           }
+           close(backendErr)
+       }()
+
+       // 4. Enqueue goroutine: reads from rawLines channel, pushes to batch queue
+       go func() {
+           for {
+               select {
+               case <-ctx.Done():
+                   return
+               case line, ok := <-rawLines:
+                   if !ok {
+                       return
+                   }
+                   m.queue.Enqueue(line)
+               }
+           }
+       }()
+
+       // 5. Drain loop: timer-based batch processing
+       timer := time.NewTimer(m.minLatency)
+       defer timer.Stop()
+
+       for {
+           select {
+           case err := <-backendErr:
+               if err != nil {
+                   return fmt.Errorf("watch backend: %w", err)
+               }
+               return nil
+
+           case <-ctx.Done():
+               // Stop all jails
+               stopCtx := context.Background()
+               m.mu.RLock()
+               for _, jr := range m.jails {
+                   if jr.Status() == StatusStarted {
+                       _ = jr.Stop(stopCtx)
+                   }
+               }
+               m.mu.RUnlock()
+               return ctx.Err()
+
+           case <-timer.C:
+               batch := m.queue.Drain()
+               drainStart := time.Now()
+
+               var measuredLatency time.Duration
+               if len(batch) > 0 {
+                   measuredLatency = drainStart.Sub(batch[0].enqueueAt)
+               }
+
+               m.processBatch(ctx, batch)
+               execTime := time.Since(drainStart)
+
+               m.perf.RecordExecution(execTime, measuredLatency, len(batch), m.currentInterval)
+               nextInterval := m.adaptInterval(execTime, len(batch), measuredLatency)
+               timer.Reset(nextInterval)
+           }
+       }
+   }
+   ```
+
+   **Add `processBatch()`:**
+   ```go
+   func (m *Manager) processBatch(ctx context.Context, batch []pendingItem) {
+       m.mu.RLock()
+       defer m.mu.RUnlock()
+
+       for _, item := range batch {
+           for _, jailName := range item.line.Jails {
+               jr, exists := m.jails[jailName]
+               if !exists || jr.Status() != StatusStarted {
+                   continue
+               }
+               evt := watch.Event{
+                   JailName: jailName,
+                   FilePath: item.line.FilePath,
+                   Line:     item.line.Line,
+                   Time:     item.line.EnqueueAt,
+               }
+               if err := jr.HandleEvent(ctx, evt); err != nil {
+                   slog.Warn("event processing error", "jail", jailName, "error", err)
+               }
+           }
+       }
+   }
+   ```
+
+   **Add `adaptInterval()` — smooth reactive EMA:**
+   ```go
+   const emaAlpha = 0.3
+
+   func (m *Manager) adaptInterval(execTime time.Duration, batchSize int, measuredLatency time.Duration) time.Duration {
+       var target time.Duration
+
+       switch {
+       case batchSize == 0:
+           target = time.Duration(float64(m.currentInterval) * 1.5)
+       case measuredLatency > time.Duration(float64(m.maxLatency)*0.8):
+           target = time.Duration(float64(m.currentInterval) * 0.5)
+       case measuredLatency < time.Duration(float64(m.minLatency)*0.5):
+           target = time.Duration(float64(m.currentInterval) * 1.25)
+       default:
+           target = m.currentInterval
+       }
+
+       if batchSize > 0 && execTime > m.currentInterval/2 {
+           stretched := time.Duration(float64(execTime) * 2.0)
+           if stretched > target {
+               target = stretched
+           }
+       }
+
+       next := time.Duration(
+           float64(m.currentInterval)*(1-emaAlpha) + float64(target)*emaAlpha,
+       )
+       if next < m.minLatency {
+           next = m.minLatency
+       }
+       if next > m.maxLatency {
+           next = m.maxLatency
+       }
+       m.currentInterval = next
+       return next
+   }
+   ```
+
+   **Add `PerfStats()` method:**
+   ```go
+   func (m *Manager) PerfStats() PerfSnapshot {
+       return m.perf.Snapshot()
+   }
+   ```
+
+2. **`internal/engine/engine_test.go`** — Update tests:
+   - Tests that create `JailRuntime` directly and call `HandleEvent` should still work unchanged
+   - Tests that exercise `Manager.Run` need to account for timer-based execution (events are processed on timer ticks, not immediately)
+   - Add test for `adaptInterval()`:
+     - Empty batch → interval grows toward max
+     - Non-empty batch with high latency → interval shrinks toward min
+     - Smooth transitions (no jumps > emaAlpha * delta)
+
+3. **`internal/engine/integration_test.go`** — Update:
+   - Events now arrive via `RawLine` and are processed on timer ticks
+   - Tests may need slightly longer timeouts (min_latency = 2s default, but tests can set smaller values like 100ms)
+   - Manager initialization needs the new config fields set
+
+**Verification:** `go test ./internal/engine/... && go build ./cmd/jailtimed`
+
+**Dependencies:** Units 1 (config), 4 (PerfMetrics), 5 (watch RawLine).
+
+---
+
+### Unit 7: Performance API Endpoint
+
+**Goal:** Add `/v1/perf` endpoint and `jailtime perf` CLI command.
+
+**Files to modify:**
+
+1. **`internal/control/api.go`** — Add response type:
+   ```go
+   type PerfResponse struct {
+       CurrentLatencyMs float64 `json:"current_latency_ms"`
+       CurrentDelayMs   float64 `json:"current_delay_ms"`
+       AvgExecTimeMs    float64 `json:"avg_exec_time_ms"`
+       AvgCPUPercent    float64 `json:"avg_cpu_percent"`
+       WindowSize       int     `json:"window_size"`
+   }
+   ```
+
+2. **`internal/control/server.go`** — Add to `JailController` interface:
+   ```go
+   type JailController interface {
+       StartJail(ctx context.Context, name string) error
+       StopJail(ctx context.Context, name string) error
+       RestartJail(ctx context.Context, name string) error
+       JailStatus(name string) (string, error)
+       AllJailStatuses() map[string]string
+       ConfigFiles(name string, limit int, logFiles bool) ([]string, error)
+       ConfigTest(name, filePath string, limit int, returnMatching bool) (totalLines, matchingLines int, matches []string, err error)
+       PerfStats() PerfResponse  // NEW
+   }
+   ```
+   Add handler method to `Server`:
+   ```go
+   func (s *Server) handlePerf(w http.ResponseWriter, r *http.Request) {
+       if r.Method != http.MethodGet {
+           http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+           return
+       }
+       stats := s.controller.PerfStats()
+       writeJSON(w, http.StatusOK, stats)
+   }
+   ```
+   Register in `Serve()`:
+   ```go
+   mux.HandleFunc("/v1/perf", s.handlePerf)
+   ```
+
+3. **`internal/control/client.go`** — Add client method:
+   ```go
+   // Perf calls GET /v1/perf.
+   func (c *Client) Perf() (*PerfResponse, error) {
+       var resp PerfResponse
+       if err := c.get("/v1/perf", &resp); err != nil {
+           return nil, err
+       }
+       return &resp, nil
+   }
+   ```
+
+4. **`cmd/jailtimed/main.go`** — Add to `JailControllerAdapter`:
+   ```go
+   func (a *JailControllerAdapter) PerfStats() control.PerfResponse {
+       snap := a.m.PerfStats()
+       return control.PerfResponse{
+           CurrentLatencyMs: snap.CurrentLatencyMs,
+           CurrentDelayMs:   snap.CurrentDelayMs,
+           AvgExecTimeMs:    snap.AvgExecTimeMs,
+           AvgCPUPercent:    snap.AvgCPUPercent,
+           WindowSize:       snap.WindowSize,
+       }
+   }
+   ```
+
+5. **`cmd/jailtime/main.go`** — Add `perf` cobra command:
+   ```go
+   perfCmd := &cobra.Command{
+       Use:   "perf",
+       Short: "Show daemon performance metrics",
+       Long:  "Display current latency, execution delay, average execution time, and CPU usage.",
+       Args:  cobra.NoArgs,
+       RunE: func(cmd *cobra.Command, args []string) error {
+           c := client()
+           resp, err := c.Perf()
+           if err != nil {
+               return err
+           }
+           fmt.Printf("Performance Metrics (window=%d):\n", resp.WindowSize)
+           fmt.Printf("  Current latency:     %.0fms\n", resp.CurrentLatencyMs)
+           fmt.Printf("  Current delay:       %.0fms\n", resp.CurrentDelayMs)
+           fmt.Printf("  Avg execution time:  %.1fms\n", resp.AvgExecTimeMs)
+           fmt.Printf("  Avg CPU usage:       %.1f%%\n", resp.AvgCPUPercent)
+           return nil
+       },
+   }
+   root.AddCommand(perfCmd)
+   ```
+
+**Verification:** `go build ./cmd/jailtimed && go build ./cmd/jailtime && go test ./internal/control/...`
+
+**Dependencies:** Units 4 (PerfMetrics/PerfSnapshot types), 6 (Manager.PerfStats method).
+
+---
+
+### Unit 8: Template Pre-Compilation
+
+**Goal:** Pre-compile action templates at JailRuntime init time instead of parsing on every execution.
+
+**Files to modify:**
+
+1. **`internal/action/template.go`** — Add pre-compilation:
+   ```go
+   // CompileTemplate parses a template string once for reuse.
+   func CompileTemplate(name, tmpl string) (*template.Template, error) {
+       return template.New(name).Parse(tmpl)
+   }
+
+   // RenderCompiled executes a pre-compiled template with the given context.
+   func RenderCompiled(t *template.Template, ctx Context) (string, error) {
+       var buf bytes.Buffer
+       if err := t.Execute(&buf, ctx); err != nil {
+           return "", err
+       }
+       return buf.String(), nil
+   }
+   ```
+   Keep existing `Render()` for backward compatibility.
+
+   Add `RunCompiled` and `RunAllCompiled` variants that accept pre-compiled templates:
+   ```go
+   func RunCompiled(ctx context.Context, tmpl *template.Template, actCtx Context, timeout time.Duration) (Result, error) {
+       // Same as Run but uses RenderCompiled instead of Render
+   }
+
+   func RunAllCompiled(ctx context.Context, templates []*template.Template, actCtx Context, timeout time.Duration) ([]Result, error) {
+       // Same as RunAll but uses RunCompiled
+   }
+   ```
+
+2. **`internal/engine/jail_runtime.go`** — Add pre-compiled templates to JailRuntime:
+   ```go
+   type JailRuntime struct {
+       cfg              *config.JailConfig
+       includes         []*filter.CompiledFilter
+       excludes         []*filter.CompiledFilter
+       hits             *HitTracker
+       mu               sync.RWMutex
+       status           JailStatus
+       debugLog         *debugRateLimiter
+       inflight         sync.Map
+       onMatchTemplates []*template.Template  // NEW: pre-compiled
+       queryTemplate    *template.Template     // NEW: pre-compiled (nil if no query)
+   }
+   ```
+   Compile templates in `NewJailRuntime()` and `Reconfigure()`. Use `action.RunAllCompiled()` in `HandleEvent()`.
+
+3. **`internal/action/action_test.go`** — Add tests for `CompileTemplate`, `RenderCompiled`, `RunCompiled`.
+
+**Verification:** `go test ./internal/action/... && go test ./internal/engine/...`
+
+**Dependencies:** None — additive change.
+
+---
+
+### Unit 9: Cleanup — Remove Old CPU Throttle
+
+**Goal:** Remove the old Go-runtime-based CPU throttle from the manager since the timer-based architecture replaces it.
+
+**Files to modify:**
+
+1. **`internal/engine/cpu.go`** — Keep this file (it's still used as fallback by cgroupCPUSampler). No changes needed since `cpuSampler` is referenced by the fallback path in `cpu_cgroup.go`.
+
+2. **`internal/engine/manager.go`** — Should already be clean from Unit 6 (worker pool and checkCPU removed). Verify no remaining references to:
+   - `targetCPUFraction`
+   - `cpuCheckInterval`
+   - `maxDispatchDelay`
+   - `eventQueueSize` (should now be the rawLines channel size, e.g. 4096)
+   - `taskQueueSize`
+   - `eventTask` struct
+   - `cpuSampler` (moved to fallback in cpu_cgroup.go)
+
+**Verification:** `go build ./cmd/jailtimed && go test ./internal/engine/...`
+
+**Dependencies:** Unit 6 (manager refactor).
+
+---
+
+### Implementation Order & Dependency Graph
+
+```
+Unit 1: Config fields           ─────────────────────────────────┐
+Unit 2: HitTracker shards       ─── (independent) ───────────────┤
+Unit 3: Cgroup CPU sampler      ─────────────┐                   │
+Unit 8: Template pre-compilation ─── (indep) ─┤                   │
+                                              │                   │
+Unit 4: PerfMetrics collector  ←─── Unit 3 ───┘                   │
+Unit 5: Watch backend RawLine  ─── (independent) ─┐               │
+                                                   │               │
+Unit 6: Manager refactor       ←── Units 1,4,5 ───┼───────────────┘
+                                                   │
+Unit 7: Performance API        ←── Units 4,6 ──────┘
+Unit 9: Cleanup                ←── Unit 6
+```
+
+**Parallelizable groups:**
+- **Group A (independent):** Units 1, 2, 3, 5, 8 — can all be implemented in parallel
+- **Group B (depends on A):** Unit 4 (needs 3), Unit 6 (needs 1, 4, 5)
+- **Group C (depends on B):** Unit 7 (needs 4, 6), Unit 9 (needs 6)
+
+**Recommended serial execution order:**
+1. Units 1, 2, 3, 5, 8 (parallel)
+2. Unit 4
+3. Unit 6
+4. Units 7, 9 (parallel)
+
+---
+
+### Sub-Agent Assignment Guide
+
+Each unit above is sized for a single AI sub-agent. The agent should:
+
+1. Read the plan section for its unit
+2. Read the specific source files listed (use Serena symbolic tools for targeted reading)
+3. Make the changes described
+4. Run the verification command
+5. Fix any compilation or test failures
+6. Commit with a descriptive message
+
+**Critical rules for sub-agents:**
+- Do NOT modify files outside the listed scope for your unit
+- Do NOT change function signatures that other units depend on without coordinating
+- All existing tests must pass after your changes
+- Use `go vet ./...` before committing
+- Follow existing code style (see code conventions in project memories)
+- Use the existing test patterns: `t.TempDir()` for fixtures, table-driven tests where appropriate
