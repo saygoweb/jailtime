@@ -58,6 +58,9 @@ type JailConfig struct {
 	// on_match is always executed on a threshold hit.  When true, the query is
 	// run first; an exit code of 0 suppresses on_match (IP already handled).
 	QueryBeforeMatch bool `yaml:"query_before_match"`
+	// ActionTimeout is the maximum time allowed for each individual action
+	// command (on_match, query).  Defaults to defaultActionTimeout.
+	ActionTimeout Duration `yaml:"action_timeout"`
 }
 
 // JailActions holds the shell command templates run at various lifecycle points.
@@ -84,3 +87,6 @@ const defaultSocketPath = "/run/jailtime/jailtimed.sock"
 
 // defaultPollInterval is the default engine poll interval.
 const defaultPollInterval = 2 * time.Second
+
+// defaultActionTimeout is the per-command timeout for on_match and query actions.
+const defaultActionTimeout = 30 * time.Second

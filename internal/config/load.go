@@ -30,6 +30,7 @@ type rawJailConfig struct {
 	NetType          string      `yaml:"net_type"`
 	Query            string      `yaml:"query"`
 	QueryBeforeMatch *bool       `yaml:"query_before_match"`
+	ActionTimeout    Duration    `yaml:"action_timeout"`
 }
 
 // rawConfig mirrors Config but uses raw sub-types to allow default detection.
@@ -107,6 +108,7 @@ func Load(path string) (*Config, error) {
 			JailTime:       rj.JailTime,
 			NetType:        rj.NetType,
 			Query:          rj.Query,
+			ActionTimeout:  rj.ActionTimeout,
 		}
 		if rj.Enabled == nil {
 			jc.Enabled = true
@@ -161,6 +163,9 @@ func applyDefaults(c *Config, readFromEnd *bool) {
 	for i := range c.Jails {
 		if c.Jails[i].NetType == "" {
 			c.Jails[i].NetType = "IP"
+		}
+		if c.Jails[i].ActionTimeout.Duration == 0 {
+			c.Jails[i].ActionTimeout.Duration = defaultActionTimeout
 		}
 	}
 }

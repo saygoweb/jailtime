@@ -341,7 +341,7 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 	// Query pre-check: only run when query_before_match is true.
 	// Exit 0 means the IP is already blocked — skip on_match.
 	if cfg.QueryBeforeMatch && cfg.Query != "" {
-		res, _ := action.Run(ctx, cfg.Query, actCtx, 10*time.Second)
+		res, _ := action.Run(ctx, cfg.Query, actCtx, cfg.ActionTimeout.Duration)
 		if res.ExitCode == 0 && res.Error == nil {
 			slog.Info("query pre-check suppressed on_match",
 				"jail", cfg.Name,
@@ -352,6 +352,6 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		}
 	}
 
-	_, err = action.RunAll(ctx, cfg.Actions.OnMatch, actCtx, 0)
+	_, err = action.RunAll(ctx, cfg.Actions.OnMatch, actCtx, cfg.ActionTimeout.Duration)
 	return err
 }
