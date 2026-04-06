@@ -33,3 +33,12 @@ type ConfigTestResponse struct {
 	MatchingLines int      `json:"matching_lines"`
 	Matches       []string `json:"matches,omitempty"`
 }
+
+// PerfResponse is returned by GET /v1/perf.
+type PerfResponse struct {
+	CurrentLatencyMs float64 `json:"current_latency_ms"`
+	CurrentDelayMs   float64 `json:"current_delay_ms"`
+	AvgExecTimeMs    float64 `json:"avg_exec_time_ms"`
+	AvgCPUPercent    float64 `json:"avg_cpu_percent"`
+	WindowSize       int     `json:"window_size"`
+}

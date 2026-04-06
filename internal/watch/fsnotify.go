@@ -41,14 +41,14 @@ func (b *FsnotifyBackend) getSpecs() []WatchSpec {
 // Start watches files using fsnotify for WRITE/CREATE events.
 // Periodically rescans globs to pick up new matching files.
 // One FileTailer is maintained per unique file path (shared across jails);
-// each line is fanned out to every jail whose globs match that path.
+// each line is emitted as a single RawLine with all interested jails.
 //
 // WRITE events are coalesced: instead of reading the file on every kernel
 // notification (which can be hundreds per second under high load), the path
 // is added to a dirty set and the set is drained on each batchInterval tick.
 // This bounds file I/O to at most len(watchedPaths)/batchInterval reads/sec
 // regardless of how rapidly the file is being written to.
-func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan<- Event) error {
+func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan<- RawLine) error {
 	b.UpdateSpecs(specs)
 
 	watcher, err := fsnotify.NewWatcher()
@@ -71,16 +71,26 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 	rescan := func() {
 		currentSpecs := b.getSpecs()
 
-		// Rebuild pathToJails from current specs to handle jail additions/removals.
+		// Step 1: expand each unique glob pattern once.
+		globCache := make(map[string][]string)
+		for _, spec := range currentSpecs {
+			for _, pattern := range spec.Globs {
+				if _, seen := globCache[pattern]; !seen {
+					paths, err := filepath.Glob(pattern)
+					if err != nil || paths == nil {
+						paths = []string{}
+					}
+					globCache[pattern] = paths
+				}
+			}
+		}
+
+		// Step 2: rebuild pathToJails using cached glob results.
 		newPathToJails := make(map[string][]string)
 		pathReadFromEnd := make(map[string]bool)
 		for _, spec := range currentSpecs {
 			for _, pattern := range spec.Globs {
-				paths, err := filepath.Glob(pattern)
-				if err != nil {
-					continue
-				}
-				for _, p := range paths {
+				for _, p := range globCache[pattern] {
 					newPathToJails[p] = append(newPathToJails[p], spec.JailName)
 					if _, set := pathReadFromEnd[p]; !set {
 						pathReadFromEnd[p] = spec.ReadFromEnd
@@ -125,25 +135,23 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
 		if err != nil {
 			return
 		}
+		jails := pathToJails[p]
 		for _, line := range lines {
-			for _, jailName := range pathToJails[p] {
-				if slog.Default().Enabled(ctx, slog.LevelDebug) && ft.debugLog.Allow() {
-					slog.DebugContext(ctx, "line notified",
-						"jail", jailName,
-						"file", p,
-						"line", line,
-					)
-				}
-				select {
-				case out <- Event{
-					JailName: jailName,
-					FilePath: p,
-					Offset:   ft.offset,
-					Line:     line,
-					Time:     time.Now(),
-				}:
-				case <-ctx.Done():
-				}
+			if slog.Default().Enabled(ctx, slog.LevelDebug) && ft.debugLog.Allow() {
+				slog.DebugContext(ctx, "line notified",
+					"jails", jails,
+					"file", p,
+					"line", line,
+				)
+			}
+			select {
+			case out <- RawLine{
+				FilePath:  p,
+				Line:      line,
+				Jails:     jails,
+				EnqueueAt: time.Now(),
+			}:
+			case <-ctx.Done():
 			}
 		}
 	}

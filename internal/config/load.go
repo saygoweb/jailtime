@@ -14,6 +14,9 @@ type rawEngineConfig struct {
 	WatcherMode  string   `yaml:"watcher_mode"`
 	PollInterval Duration `yaml:"poll_interval"`
 	ReadFromEnd  *bool    `yaml:"read_from_end"`
+	MinLatency   Duration `yaml:"min_latency"`
+	MaxLatency   Duration `yaml:"max_latency"`
+	PerfWindow   *int     `yaml:"perf_window"`
 }
 
 // rawJailConfig mirrors JailConfig with pointer booleans to detect unset fields.
@@ -93,6 +96,8 @@ func Load(path string) (*Config, error) {
 		Engine: EngineConfig{
 			WatcherMode:  raw.Engine.WatcherMode,
 			PollInterval: raw.Engine.PollInterval,
+			MinLatency:   raw.Engine.MinLatency,
+			MaxLatency:   raw.Engine.MaxLatency,
 		},
 	}
 
@@ -122,7 +127,7 @@ func Load(path string) (*Config, error) {
 		c.Jails = append(c.Jails, jc)
 	}
 
-	applyDefaults(c, raw.Engine.ReadFromEnd)
+	applyDefaults(c, raw.Engine.ReadFromEnd, raw.Engine.PerfWindow)
 
 	if err := Validate(c); err != nil {
 		return nil, err
@@ -145,7 +150,7 @@ func loadJailsFile(path string) ([]rawJailConfig, error) {
 	return f.Jails, nil
 }
 
-func applyDefaults(c *Config, readFromEnd *bool) {
+func applyDefaults(c *Config, readFromEnd *bool, perfWindow *int) {
 	if c.Control.Socket == "" {
 		c.Control.Socket = defaultSocketPath
 	}
@@ -159,6 +164,17 @@ func applyDefaults(c *Config, readFromEnd *bool) {
 		c.Engine.ReadFromEnd = true
 	} else {
 		c.Engine.ReadFromEnd = *readFromEnd
+	}
+	if c.Engine.MinLatency.Duration == 0 {
+		c.Engine.MinLatency.Duration = defaultMinLatency
+	}
+	if c.Engine.MaxLatency.Duration == 0 {
+		c.Engine.MaxLatency.Duration = defaultMaxLatency
+	}
+	if perfWindow == nil {
+		c.Engine.PerfWindow = defaultPerfWindow
+	} else {
+		c.Engine.PerfWindow = *perfWindow
 	}
 	for i := range c.Jails {
 		if c.Jails[i].NetType == "" {

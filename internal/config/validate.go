@@ -11,6 +11,19 @@ func Validate(c *Config) error {
 		return fmt.Errorf("unsupported config version %d (must be 1)", c.Version)
 	}
 
+	if c.Engine.MinLatency.Duration <= 0 {
+		return fmt.Errorf("engine: min_latency must be > 0")
+	}
+	if c.Engine.MaxLatency.Duration <= 0 {
+		return fmt.Errorf("engine: max_latency must be > 0")
+	}
+	if c.Engine.MaxLatency.Duration < c.Engine.MinLatency.Duration {
+		return fmt.Errorf("engine: max_latency must be >= min_latency")
+	}
+	if c.Engine.PerfWindow < 1 {
+		return fmt.Errorf("engine: perf_window must be >= 1")
+	}
+
 	names := make(map[string]struct{}, len(c.Jails))
 	for i, j := range c.Jails {
 		if j.Name == "" {

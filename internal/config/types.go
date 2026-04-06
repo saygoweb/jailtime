@@ -37,6 +37,9 @@ type EngineConfig struct {
 	WatcherMode  string   `yaml:"watcher_mode"`
 	PollInterval Duration `yaml:"poll_interval"`
 	ReadFromEnd  bool     `yaml:"read_from_end"`
+	MinLatency   Duration `yaml:"min_latency"`
+	MaxLatency   Duration `yaml:"max_latency"`
+	PerfWindow   int      `yaml:"perf_window"`
 }
 
 // JailConfig defines a single jail rule.
@@ -78,6 +81,9 @@ func (e EngineConfig) LogValue() slog.Value {
 		slog.String("watcher_mode", e.WatcherMode),
 		slog.Duration("poll_interval", e.PollInterval.Duration),
 		slog.Bool("read_from_end", e.ReadFromEnd),
+		slog.Duration("min_latency", e.MinLatency.Duration),
+		slog.Duration("max_latency", e.MaxLatency.Duration),
+		slog.Int("perf_window", e.PerfWindow),
 	)
 }
 
@@ -90,3 +96,7 @@ const defaultPollInterval = 2 * time.Second
 
 // defaultActionTimeout is the per-command timeout for on_match and query actions.
 const defaultActionTimeout = 30 * time.Second
+
+const defaultMinLatency = 2 * time.Second
+const defaultMaxLatency = 10 * time.Second
+const defaultPerfWindow = 3

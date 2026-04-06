@@ -30,3 +30,18 @@ func Render(tmpl string, ctx Context) (string, error) {
 	}
 	return buf.String(), nil
 }
+
+// CompileTemplate parses a template string once for reuse.
+// The name parameter is used for error messages.
+func CompileTemplate(name, tmpl string) (*template.Template, error) {
+	return template.New(name).Parse(tmpl)
+}
+
+// RenderCompiled executes a pre-compiled template with the given context.
+func RenderCompiled(t *template.Template, ctx Context) (string, error) {
+	var buf bytes.Buffer
+	if err := t.Execute(&buf, ctx); err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}

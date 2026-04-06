@@ -299,6 +299,68 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadEngineLatencyPerfWindowDefaults(t *testing.T) {
+	path := writeTemp(t, minimalValidYAML)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if c.Engine.MinLatency.Duration != defaultMinLatency {
+		t.Errorf("MinLatency = %v, want %v", c.Engine.MinLatency.Duration, defaultMinLatency)
+	}
+	if c.Engine.MaxLatency.Duration != defaultMaxLatency {
+		t.Errorf("MaxLatency = %v, want %v", c.Engine.MaxLatency.Duration, defaultMaxLatency)
+	}
+	if c.Engine.PerfWindow != defaultPerfWindow {
+		t.Errorf("PerfWindow = %d, want %d", c.Engine.PerfWindow, defaultPerfWindow)
+	}
+}
+
+func TestLoadEngineLatencyPerfWindowExplicit(t *testing.T) {
+	y := minimalValidYAML + `engine:
+  min_latency: 500ms
+  max_latency: 30s
+  perf_window: 5
+`
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if c.Engine.MinLatency.Duration != 500*time.Millisecond {
+		t.Errorf("MinLatency = %v, want 500ms", c.Engine.MinLatency.Duration)
+	}
+	if c.Engine.MaxLatency.Duration != 30*time.Second {
+		t.Errorf("MaxLatency = %v, want 30s", c.Engine.MaxLatency.Duration)
+	}
+	if c.Engine.PerfWindow != 5 {
+		t.Errorf("PerfWindow = %d, want 5", c.Engine.PerfWindow)
+	}
+}
+
+func TestValidateMaxLatencyLessThanMinLatency(t *testing.T) {
+	y := minimalValidYAML + `engine:
+  min_latency: 10s
+  max_latency: 1s
+`
+	path := writeTemp(t, y)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for max_latency < min_latency, got nil")
+	}
+}
+
+func TestValidatePerfWindowLessThanOne(t *testing.T) {
+	y := minimalValidYAML + `engine:
+  perf_window: 0
+`
+	path := writeTemp(t, y)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for perf_window < 1, got nil")
+	}
+}
+
 func TestEngineConfigLogValue(t *testing.T) {
 cfg := EngineConfig{
 WatcherMode:  "fsnotify",

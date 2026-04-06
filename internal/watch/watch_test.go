@@ -9,9 +9,9 @@ import (
 	"context"
 )
 
-func startBackend(t *testing.T, b Backend, specs []WatchSpec) (chan Event, context.CancelFunc) {
+func startBackend(t *testing.T, b Backend, specs []WatchSpec) (chan RawLine, context.CancelFunc) {
 	t.Helper()
-	out := make(chan Event, 16)
+	out := make(chan RawLine, 16)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		_ = b.Start(ctx, specs, out)
@@ -19,13 +19,22 @@ func startBackend(t *testing.T, b Backend, specs []WatchSpec) (chan Event, conte
 	return out, cancel
 }
 
-func waitEvent(out chan Event, timeout time.Duration) (Event, bool) {
+func waitEvent(out chan RawLine, timeout time.Duration) (RawLine, bool) {
 	select {
 	case ev := <-out:
 		return ev, true
 	case <-time.After(timeout):
-		return Event{}, false
+		return RawLine{}, false
 	}
+}
+
+func containsJail(jails []string, name string) bool {
+	for _, j := range jails {
+		if j == name {
+			return true
+		}
+	}
+	return false
 }
 
 // TestPollBackendBasic creates a temp file, starts poll backend, appends a line,
@@ -62,8 +71,8 @@ func TestPollBackendBasic(t *testing.T) {
 	if ev.Line != "hello world" {
 		t.Errorf("expected line %q, got %q", "hello world", ev.Line)
 	}
-	if ev.JailName != "jail1" {
-		t.Errorf("expected JailName %q, got %q", "jail1", ev.JailName)
+	if !containsJail(ev.Jails, "jail1") {
+		t.Errorf("expected Jails to contain %q, got %v", "jail1", ev.Jails)
 	}
 	if ev.FilePath != path {
 		t.Errorf("expected FilePath %q, got %q", path, ev.FilePath)
@@ -197,8 +206,8 @@ func TestPollBackendSubdirGlob(t *testing.T) {
 	if ev.FilePath != logPath {
 		t.Errorf("expected FilePath %q, got %q", logPath, ev.FilePath)
 	}
-	if ev.JailName != "apache" {
-		t.Errorf("expected JailName %q, got %q", "apache", ev.JailName)
+	if !containsJail(ev.Jails, "apache") {
+		t.Errorf("expected Jails to contain %q, got %v", "apache", ev.Jails)
 	}
 }
 
@@ -284,8 +293,8 @@ func TestFsnotifyBackendSubdirGlob(t *testing.T) {
 	if ev.FilePath != logPath {
 		t.Errorf("expected FilePath %q, got %q", logPath, ev.FilePath)
 	}
-	if ev.JailName != "apache" {
-		t.Errorf("expected JailName %q, got %q", "apache", ev.JailName)
+	if !containsJail(ev.Jails, "apache") {
+		t.Errorf("expected Jails to contain %q, got %v", "apache", ev.Jails)
 	}
 }
 
@@ -321,8 +330,8 @@ func TestFsnotifyBackendBasic(t *testing.T) {
 	if ev.Line != "fsnotify hello" {
 		t.Errorf("expected %q, got %q", "fsnotify hello", ev.Line)
 	}
-	if ev.JailName != "jail4" {
-		t.Errorf("expected JailName %q, got %q", "jail4", ev.JailName)
+	if !containsJail(ev.Jails, "jail4") {
+		t.Errorf("expected Jails to contain %q, got %v", "jail4", ev.Jails)
 	}
 	if ev.FilePath != path {
 		t.Errorf("expected FilePath %q, got %q", path, ev.FilePath)
@@ -362,8 +371,8 @@ t.Fatal("timed out waiting for inotify event")
 if ev.Line != "inotify test line" {
 t.Errorf("expected line %q, got %q", "inotify test line", ev.Line)
 }
-if ev.JailName != "jail-inotify" {
-t.Errorf("expected JailName %q, got %q", "jail-inotify", ev.JailName)
+if !containsJail(ev.Jails, "jail-inotify") {
+t.Errorf("expected Jails to contain %q, got %v", "jail-inotify", ev.Jails)
 }
 if ev.FilePath != path {
 t.Errorf("expected FilePath %q, got %q", path, ev.FilePath)
@@ -403,8 +412,8 @@ t.Fatal("timed out waiting for os-mode event")
 if ev.Line != "os mode test line" {
 t.Errorf("expected line %q, got %q", "os mode test line", ev.Line)
 }
-if ev.JailName != "jail-os" {
-t.Errorf("expected JailName %q, got %q", "jail-os", ev.JailName)
+if !containsJail(ev.Jails, "jail-os") {
+t.Errorf("expected Jails to contain %q, got %v", "jail-os", ev.Jails)
 }
 if ev.FilePath != path {
 t.Errorf("expected FilePath %q, got %q", path, ev.FilePath)
@@ -441,18 +450,18 @@ func TestPollBackendSharedFile(t *testing.T) {
 	af.Close()
 
 	seen := make(map[string]bool)
-	for i := 0; i < 2; i++ {
-		ev, ok := waitEvent(out, 2*time.Second)
-		if !ok {
-			t.Fatalf("timed out waiting for event %d/2 (got jails: %v)", i+1, seen)
-		}
-		if ev.Line != "shared line" {
-			t.Errorf("expected line %q, got %q", "shared line", ev.Line)
-		}
-		seen[ev.JailName] = true
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for RawLine event")
+	}
+	if ev.Line != "shared line" {
+		t.Errorf("expected line %q, got %q", "shared line", ev.Line)
+	}
+	for _, j := range ev.Jails {
+		seen[j] = true
 	}
 	if !seen["jail-a"] || !seen["jail-b"] {
-		t.Errorf("expected events for both jails, got: %v", seen)
+		t.Errorf("expected RawLine.Jails to contain both jails, got: %v", ev.Jails)
 	}
 }
 
@@ -485,18 +494,18 @@ func TestFsnotifyBackendSharedFile(t *testing.T) {
 	af.Close()
 
 	seen := make(map[string]bool)
-	for i := 0; i < 2; i++ {
-		ev, ok := waitEvent(out, 2*time.Second)
-		if !ok {
-			t.Fatalf("timed out waiting for event %d/2 (got jails: %v)", i+1, seen)
-		}
-		if ev.Line != "shared fsnotify line" {
-			t.Errorf("expected line %q, got %q", "shared fsnotify line", ev.Line)
-		}
-		seen[ev.JailName] = true
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for RawLine event")
+	}
+	if ev.Line != "shared fsnotify line" {
+		t.Errorf("expected line %q, got %q", "shared fsnotify line", ev.Line)
+	}
+	for _, j := range ev.Jails {
+		seen[j] = true
 	}
 	if !seen["jail-c"] || !seen["jail-d"] {
-		t.Errorf("expected events for both jails, got: %v", seen)
+		t.Errorf("expected RawLine.Jails to contain both jails, got: %v", ev.Jails)
 	}
 }
 

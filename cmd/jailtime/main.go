@@ -171,8 +171,29 @@ matched. No hit counts are modified and no actions are executed.`,
 	testCmd.Flags().IntVar(&testLimit, "limit", 10, "maximum matching lines to return with --matching (0 = no limit)")
 	testCmd.Flags().BoolVar(&testMatching, "matching", false, "print the lines that matched")
 
+	// ── perf ─────────────────────────────────────────────────────────────────
+	perfCmd := &cobra.Command{
+		Use:   "perf",
+		Short: "Show daemon performance metrics",
+		Long:  "Display current latency, execution delay, average execution time, and CPU usage.",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c := client()
+			resp, err := c.Perf()
+			if err != nil {
+				return err
+			}
+			fmt.Printf("Performance Metrics (window=%d):\n", resp.WindowSize)
+			fmt.Printf("  Current latency:     %.0fms\n", resp.CurrentLatencyMs)
+			fmt.Printf("  Current delay:       %.0fms\n", resp.CurrentDelayMs)
+			fmt.Printf("  Avg execution time:  %.1fms\n", resp.AvgExecTimeMs)
+			fmt.Printf("  Avg CPU usage:       %.1f%%\n", resp.AvgCPUPercent)
+			return nil
+		},
+	}
+
 	configCmd.AddCommand(filesCmd, testCmd)
-	root.AddCommand(statusCmd, startCmd, stopCmd, restartCmd, versionCmd, configCmd)
+	root.AddCommand(statusCmd, startCmd, stopCmd, restartCmd, versionCmd, configCmd, perfCmd)
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

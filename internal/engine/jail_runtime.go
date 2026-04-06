@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"text/template"
 	"time"
 
 	"github.com/sgw/jailtime/internal/action"
@@ -69,6 +70,9 @@ type JailRuntime struct {
 	// Only one on_match execution per IP is allowed at a time; concurrent
 	// threshold triggers for an in-flight IP are silently skipped.
 	inflight sync.Map
+	// Pre-compiled action templates (populated by compileTemplates)
+	onMatchTmpls []*template.Template
+	queryTmpl    *template.Template // nil if no query configured
 }
 
 func NewJailRuntime(cfg *config.JailConfig) (*JailRuntime, error) {
@@ -80,14 +84,41 @@ func NewJailRuntime(cfg *config.JailConfig) (*JailRuntime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("compiling exclude filters for jail %q: %w", cfg.Name, err)
 	}
-	return &JailRuntime{
+	jr := &JailRuntime{
 		cfg:      cfg,
 		includes: includes,
 		excludes: excludes,
 		hits:     NewHitTracker(),
 		status:   StatusStopped,
 		debugLog: newDebugRateLimiter(2),
-	}, nil
+	}
+	if err := jr.compileTemplates(cfg); err != nil {
+		return nil, err
+	}
+	return jr, nil
+}
+
+func (jr *JailRuntime) compileTemplates(cfg *config.JailConfig) error {
+	tmpls := make([]*template.Template, 0, len(cfg.Actions.OnMatch))
+	for i, tmplStr := range cfg.Actions.OnMatch {
+		t, err := action.CompileTemplate(fmt.Sprintf("on_match[%d]", i), tmplStr)
+		if err != nil {
+			return fmt.Errorf("compiling on_match[%d]: %w", i, err)
+		}
+		tmpls = append(tmpls, t)
+	}
+	jr.onMatchTmpls = tmpls
+
+	if cfg.Query != "" {
+		t, err := action.CompileTemplate("query", cfg.Query)
+		if err != nil {
+			return fmt.Errorf("compiling query: %w", err)
+		}
+		jr.queryTmpl = t
+	} else {
+		jr.queryTmpl = nil
+	}
+	return nil
 }
 
 func (jr *JailRuntime) lifecycleCtx() action.Context {
@@ -109,11 +140,28 @@ func (jr *JailRuntime) Reconfigure(cfg *config.JailConfig) error {
 	if err != nil {
 		return fmt.Errorf("compiling exclude filters: %w", err)
 	}
+	tmpls := make([]*template.Template, 0, len(cfg.Actions.OnMatch))
+	for i, tmplStr := range cfg.Actions.OnMatch {
+		t, err := action.CompileTemplate(fmt.Sprintf("on_match[%d]", i), tmplStr)
+		if err != nil {
+			return fmt.Errorf("compiling on_match[%d]: %w", i, err)
+		}
+		tmpls = append(tmpls, t)
+	}
+	var queryTmpl *template.Template
+	if cfg.Query != "" {
+		queryTmpl, err = action.CompileTemplate("query", cfg.Query)
+		if err != nil {
+			return fmt.Errorf("compiling query: %w", err)
+		}
+	}
 	jr.mu.Lock()
 	jr.cfg = cfg
 	jr.includes = includes
 	jr.excludes = excludes
 	jr.hits = NewHitTracker()
+	jr.onMatchTmpls = tmpls
+	jr.queryTmpl = queryTmpl
 	jr.mu.Unlock()
 	return nil
 }
@@ -231,6 +279,8 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 	includes := jr.includes
 	excludes := jr.excludes
 	hits := jr.hits
+	onMatchTmpls := jr.onMatchTmpls
+	queryTmpl := jr.queryTmpl
 	jr.mu.RUnlock()
 
 	result, err := filter.Match(evt.Line, includes, excludes)
@@ -340,8 +390,8 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 
 	// Query pre-check: only run when query_before_match is true.
 	// Exit 0 means the IP is already blocked — skip on_match.
-	if cfg.QueryBeforeMatch && cfg.Query != "" {
-		res, _ := action.Run(ctx, cfg.Query, actCtx, cfg.ActionTimeout.Duration)
+	if cfg.QueryBeforeMatch && queryTmpl != nil {
+		res, _ := action.RunCompiled(ctx, queryTmpl, actCtx, cfg.ActionTimeout.Duration)
 		if res.ExitCode == 0 && res.Error == nil {
 			slog.Info("query pre-check suppressed on_match",
 				"jail", cfg.Name,
@@ -352,6 +402,6 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		}
 	}
 
-	_, err = action.RunAll(ctx, cfg.Actions.OnMatch, actCtx, cfg.ActionTimeout.Duration)
+	_, err = action.RunAllCompiled(ctx, onMatchTmpls, actCtx, cfg.ActionTimeout.Duration)
 	return err
 }
