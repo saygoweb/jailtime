@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"runtime"
 	"sync"
 	"time"
 
@@ -12,39 +11,44 @@ import (
 	"github.com/sgw/jailtime/internal/watch"
 )
 
-// eventTask is dispatched to the worker pool for asynchronous HandleEvent calls.
-type eventTask struct {
-	jr  *JailRuntime
-	evt watch.Event
+const emaAlpha = 0.3
+
+type pendingItem struct {
+	line      watch.RawLine
+	enqueueAt time.Time
 }
 
-const (
-	// targetCPUFraction is the maximum fraction of available CPU (across all
-	// GOMAXPROCS cores) that the daemon should consume on average.
-	targetCPUFraction = 0.02
+type batchQueue struct {
+	mu    sync.Mutex
+	items []pendingItem
+}
 
-	// cpuCheckInterval is how often the event loop samples CPU usage.
-	cpuCheckInterval = time.Second
+func (q *batchQueue) Enqueue(line watch.RawLine) {
+	q.mu.Lock()
+	q.items = append(q.items, pendingItem{line: line, enqueueAt: time.Now()})
+	q.mu.Unlock()
+}
 
-	// maxDispatchDelay caps how long the event loop sleeps when CPU is over target.
-	maxDispatchDelay = 2 * time.Second
-
-	// eventQueueSize is the buffered event channel capacity. A large buffer lets
-	// the watch backend keep writing even while the event loop is sleeping to
-	// throttle CPU.
-	eventQueueSize = 65536
-
-	// taskQueueSize is the worker-pool task queue depth.
-	taskQueueSize = 4096
-)
+func (q *batchQueue) Drain() []pendingItem {
+	q.mu.Lock()
+	batch := q.items
+	q.items = make([]pendingItem, 0, cap(batch))
+	q.mu.Unlock()
+	return batch
+}
 
 // Manager runs all jail runtimes and the watch backend.
 type Manager struct {
-	cfg        *config.Config
-	configPath string
-	jails      map[string]*JailRuntime
-	backend    watch.Backend
-	mu         sync.RWMutex
+	cfg             *config.Config
+	configPath      string
+	jails           map[string]*JailRuntime
+	backend         watch.Backend
+	mu              sync.RWMutex
+	perf            *PerfMetrics
+	queue           batchQueue
+	minLatency      time.Duration
+	maxLatency      time.Duration
+	currentInterval time.Duration
 }
 
 func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
@@ -64,25 +68,33 @@ func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
 	}
 	backend := watch.NewAuto(cfg.Engine.WatcherMode, pollInterval)
 
+	minLatency := cfg.Engine.MinLatency.Duration
+	if minLatency == 0 {
+		minLatency = 2 * time.Second
+	}
+	maxLatency := cfg.Engine.MaxLatency.Duration
+	if maxLatency == 0 {
+		maxLatency = 10 * time.Second
+	}
+	perfWindow := cfg.Engine.PerfWindow
+	if perfWindow == 0 {
+		perfWindow = 3
+	}
+
 	return &Manager{
-		cfg:        cfg,
-		configPath: configPath,
-		jails:      jails,
-		backend:    backend,
+		cfg:             cfg,
+		configPath:      configPath,
+		jails:           jails,
+		backend:         backend,
+		perf:            NewPerfMetrics(perfWindow, "jailtimed.service"),
+		minLatency:      minLatency,
+		maxLatency:      maxLatency,
+		currentInterval: minLatency,
 	}, nil
 }
 
-// Run starts all enabled jails, starts the watch backend, routes events, and
-// blocks until ctx is cancelled.
-//
-// Events from the watch backend are queued in a large buffered channel
-// (eventQueueSize) so the backend never blocks. A bounded worker pool
-// (runtime.GOMAXPROCS * 4 goroutines) handles HandleEvent calls, avoiding
-// unbounded goroutine creation under high log volume.
-//
-// CPU usage is sampled every cpuCheckInterval; if it exceeds targetCPUFraction
-// the event loop sleeps proportionally before dispatching more work, keeping
-// average CPU below the target.
+// Run starts all enabled jails, starts the watch backend, and routes events
+// via a timer-based batch queue with EMA-based adaptive interval.
 func (m *Manager) Run(ctx context.Context) error {
 	// Start all enabled jails.
 	for name, jr := range m.jails {
@@ -108,72 +120,33 @@ func (m *Manager) Run(ctx context.Context) error {
 	}
 	m.mu.RUnlock()
 
-	events := make(chan watch.Event, eventQueueSize)
-
-	// Worker pool: bounded goroutines handle HandleEvent calls so we never
-	// create an unbounded number of goroutines under high log volume.
-	numWorkers := runtime.GOMAXPROCS(0) * 4
-	taskQueue := make(chan eventTask, taskQueueSize)
-	var workerWg sync.WaitGroup
-	workerWg.Add(numWorkers)
-	for range numWorkers {
-		go func() {
-			defer workerWg.Done()
-			for task := range taskQueue {
-				if err := task.jr.HandleEvent(ctx, task.evt); err != nil {
-					slog.Warn("event processing error", "jail", task.evt.JailName, "error", err)
-				}
-			}
-		}()
-	}
-	defer func() {
-		close(taskQueue)
-		workerWg.Wait()
-	}()
-
-	// CPU-aware throttle: sleep when usage exceeds targetCPUFraction.
-	cpuSampler := newCPUSampler()
-	var (
-		lastCPUCheck  = time.Now()
-		dispatchDelay time.Duration
-		throttling    bool
-	)
-	checkCPU := func() {
-		if time.Since(lastCPUCheck) < cpuCheckInterval {
-			return
-		}
-		lastCPUCheck = time.Now()
-		usage := cpuSampler.sample()
-		if usage > targetCPUFraction {
-			// Overshoot ratio drives the sleep duration: at 2× target we sleep
-			// ~targetCPUFraction * cpuCheckInterval, at 4× we sleep twice as long.
-			overshoot := usage/targetCPUFraction - 1.0
-			dispatchDelay = time.Duration(overshoot * float64(cpuCheckInterval))
-			if dispatchDelay > maxDispatchDelay {
-				dispatchDelay = maxDispatchDelay
-			}
-			if !throttling {
-				slog.Info("event dispatch throttled", "cpu_usage_pct", fmt.Sprintf("%.1f", usage*100), "delay_ms", dispatchDelay.Milliseconds())
-				throttling = true
-			}
-		} else {
-			if throttling {
-				slog.Info("event dispatch throttle lifted", "cpu_usage_pct", fmt.Sprintf("%.1f", usage*100))
-			}
-			dispatchDelay = 0
-			throttling = false
-		}
-	}
-
-	// Start the watch backend in a goroutine — its Start method blocks until
-	// ctx is cancelled, so the event-routing loop below must run concurrently.
+	rawLines := make(chan watch.RawLine, 4096)
 	backendErr := make(chan error, 1)
 	go func() {
-		if err := m.backend.Start(ctx, specs, events); err != nil && err != context.Canceled {
+		if err := m.backend.Start(ctx, specs, rawLines); err != nil && err != context.Canceled {
 			backendErr <- err
 		}
 		close(backendErr)
 	}()
+
+	// Enqueue goroutine: reads from rawLines channel, pushes to batch queue.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case line, ok := <-rawLines:
+				if !ok {
+					return
+				}
+				m.queue.Enqueue(line)
+			}
+		}
+	}()
+
+	// Drain loop: timer-based batch processing.
+	timer := time.NewTimer(m.currentInterval)
+	defer timer.Stop()
 
 	for {
 		select {
@@ -186,41 +159,93 @@ func (m *Manager) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			stopCtx := context.Background()
 			m.mu.RLock()
-			for name, jr := range m.jails {
+			for _, jr := range m.jails {
 				if jr.Status() == StatusStarted {
 					_ = jr.Stop(stopCtx)
-					_ = name
 				}
 			}
 			m.mu.RUnlock()
 			return ctx.Err()
 
-		case evt, ok := <-events:
-			if !ok {
-				return nil
+		case <-timer.C:
+			batch := m.queue.Drain()
+			drainStart := time.Now()
+
+			var measuredLatency time.Duration
+			if len(batch) > 0 {
+				measuredLatency = drainStart.Sub(batch[0].enqueueAt)
 			}
-			m.mu.RLock()
-			jr, exists := m.jails[evt.JailName]
-			m.mu.RUnlock()
-			if !exists {
-				slog.Warn("event for unknown jail, dropping", "jail", evt.JailName)
+
+			m.processBatch(ctx, batch)
+			execTime := time.Since(drainStart)
+
+			m.perf.RecordExecution(execTime, measuredLatency, len(batch), m.currentInterval)
+			nextInterval := m.adaptInterval(execTime, len(batch), measuredLatency)
+			timer.Reset(nextInterval)
+		}
+	}
+}
+
+func (m *Manager) processBatch(ctx context.Context, batch []pendingItem) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, item := range batch {
+		for _, jailName := range item.line.Jails {
+			jr, exists := m.jails[jailName]
+			if !exists || jr.Status() != StatusStarted {
 				continue
 			}
-			select {
-			case taskQueue <- eventTask{jr: jr, evt: evt}:
-			case <-ctx.Done():
-				return ctx.Err()
+			evt := watch.Event{
+				JailName: jailName,
+				FilePath: item.line.FilePath,
+				Line:     item.line.Line,
+				Time:     item.line.EnqueueAt,
 			}
-			checkCPU()
-			if dispatchDelay > 0 {
-				select {
-				case <-time.After(dispatchDelay):
-				case <-ctx.Done():
-					return ctx.Err()
-				}
+			if err := jr.HandleEvent(ctx, evt); err != nil {
+				slog.Warn("event processing error", "jail", jailName, "error", err)
 			}
 		}
 	}
+}
+
+func (m *Manager) adaptInterval(execTime time.Duration, batchSize int, measuredLatency time.Duration) time.Duration {
+	var target time.Duration
+
+	switch {
+	case batchSize == 0:
+		target = time.Duration(float64(m.currentInterval) * 1.5)
+	case measuredLatency > time.Duration(float64(m.maxLatency)*0.8):
+		target = time.Duration(float64(m.currentInterval) * 0.5)
+	case measuredLatency < time.Duration(float64(m.minLatency)*0.5):
+		target = time.Duration(float64(m.currentInterval) * 1.25)
+	default:
+		target = m.currentInterval
+	}
+
+	if batchSize > 0 && execTime > m.currentInterval/2 {
+		stretched := time.Duration(float64(execTime) * 2.0)
+		if stretched > target {
+			target = stretched
+		}
+	}
+
+	next := time.Duration(
+		float64(m.currentInterval)*(1-emaAlpha) + float64(target)*emaAlpha,
+	)
+	if next < m.minLatency {
+		next = m.minLatency
+	}
+	if next > m.maxLatency {
+		next = m.maxLatency
+	}
+	m.currentInterval = next
+	return next
+}
+
+// PerfStats returns a snapshot of current performance metrics.
+func (m *Manager) PerfStats() PerfSnapshot {
+	return m.perf.Snapshot()
 }
 
 // StartJail starts a specific jail by name.

@@ -68,7 +68,7 @@ func startIntegrationPipeline(t *testing.T, jr *JailRuntime, logGlob string) con
 		ReadFromEnd: false,
 	}}
 
-	events := make(chan watch.Event, 64)
+	events := make(chan watch.RawLine, 64)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	go func() { _ = b.Start(ctx, specs, events) }()
@@ -78,11 +78,19 @@ func startIntegrationPipeline(t *testing.T, jr *JailRuntime, logGlob string) con
 			select {
 			case <-ctx.Done():
 				return
-			case evt, ok := <-events:
+			case rawLine, ok := <-events:
 				if !ok {
 					return
 				}
-				_ = jr.HandleEvent(ctx, evt)
+				for _, jailName := range rawLine.Jails {
+					evt := watch.Event{
+						JailName: jailName,
+						FilePath: rawLine.FilePath,
+						Line:     rawLine.Line,
+						Time:     rawLine.EnqueueAt,
+					}
+					_ = jr.HandleEvent(ctx, evt)
+				}
 			}
 		}
 	}()
@@ -267,6 +275,9 @@ func TestManagerRunRoutesEvents(t *testing.T) {
 		},
 		Engine: config.EngineConfig{
 			PollInterval: config.Duration{Duration: 50 * time.Millisecond},
+			MinLatency:   config.Duration{Duration: 100 * time.Millisecond},
+			MaxLatency:   config.Duration{Duration: 500 * time.Millisecond},
+			PerfWindow:   3,
 			ReadFromEnd:  false,
 		},
 	}
