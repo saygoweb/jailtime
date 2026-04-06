@@ -262,6 +262,7 @@ func TestJailRuntimeHandleEvent(t *testing.T) {
 	if err := jr.HandleEvent(ctx, evt); err != nil {
 		t.Fatalf("HandleEvent: %v", err)
 	}
+	jr.WaitForInflight()
 
 	data, err := os.ReadFile(outFile)
 	if err != nil {
@@ -417,6 +418,7 @@ ctx := context.Background()
 if err := jr.HandleEvent(ctx, evt); err != nil {
 t.Fatalf("HandleEvent: %v", err)
 }
+jr.WaitForInflight() // ensure goroutine ran and query suppressed on_match
 
 if _, err := os.Stat(outFile); err == nil {
 t.Fatal("on_match should have been suppressed by query exit 0, but output file exists")
@@ -459,6 +461,7 @@ ctx := context.Background()
 if err := jr.HandleEvent(ctx, evt); err != nil {
 t.Fatalf("HandleEvent: %v", err)
 }
+jr.WaitForInflight()
 
 data, err := os.ReadFile(outFile)
 if err != nil {
@@ -508,6 +511,7 @@ ctx := context.Background()
 if err := jr.HandleEvent(ctx, evt); err != nil {
 t.Fatalf("HandleEvent: %v", err)
 }
+jr.WaitForInflight()
 
 data, err := os.ReadFile(outFile)
 if err != nil {
@@ -607,7 +611,7 @@ t.Errorf("HandleEvent[%d] unexpected error: %v", i, err)
 }
 
 // Wait for the in-flight action to finish.
-time.Sleep(400 * time.Millisecond)
+jr.WaitForInflight()
 
 data, err := os.ReadFile(countFile)
 if err != nil {
@@ -617,6 +621,74 @@ lines := strings.Count(strings.TrimSpace(string(data)), "hit")
 if lines != 1 {
 t.Fatalf("expected exactly 1 on_match execution, got %d (countFile: %q)", lines, string(data))
 }
+}
+
+// TestHandleEventInflightPreventsBatchRetrigger verifies that sequential
+// HandleEvent calls — as occur in timer-based processBatch — cannot re-trigger
+// on_match for the same IP while the first action goroutine is still running.
+//
+// This is the production failure mode: processBatch processes events serially;
+// with a synchronous action the old code cleared inflight before the next event
+// was reached, allowing immediate re-triggers on transient failures.
+func TestHandleEventInflightPreventsBatchRetrigger(t *testing.T) {
+	dir := t.TempDir()
+	countFile := filepath.Join(dir, "count.txt")
+
+	// Slow action (200ms) so the goroutine is definitely still in flight when
+	// the second sequential HandleEvent call is made.
+	cfg := &config.JailConfig{
+		Name:     "batch-retrigger-jail",
+		Enabled:  true,
+		Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
+		HitCount: 1,
+		FindTime: config.Duration{Duration: time.Minute},
+		Actions: config.JailActions{
+			OnMatch: []string{"sleep 0.2 && echo hit >> " + countFile},
+		},
+	}
+
+	jr, err := NewJailRuntime(cfg)
+	if err != nil {
+		t.Fatalf("NewJailRuntime: %v", err)
+	}
+
+	ctx := context.Background()
+	now := time.Now()
+
+	// Event 1: triggers threshold (count 0→1, threshold=1), action starts.
+	evt1 := watch.Event{
+		JailName: cfg.Name,
+		FilePath: "/var/log/auth.log",
+		Line:     "Failed password from 7.7.7.7",
+		Time:     now,
+	}
+	if err := jr.HandleEvent(ctx, evt1); err != nil {
+		t.Fatalf("HandleEvent 1: %v", err)
+	}
+
+	// Event 2: same IP, called immediately after (simulating the next item in
+	// the same processBatch loop). With async actions, the goroutine from
+	// event 1 is still running; inflight must block this trigger.
+	evt2 := watch.Event{
+		JailName: cfg.Name,
+		FilePath: "/var/log/auth.log",
+		Line:     "Failed password from 7.7.7.7",
+		Time:     now.Add(time.Millisecond),
+	}
+	if err := jr.HandleEvent(ctx, evt2); err != nil {
+		t.Fatalf("HandleEvent 2: %v", err)
+	}
+
+	jr.WaitForInflight()
+
+	data, err := os.ReadFile(countFile)
+	if err != nil {
+		t.Fatalf("countFile not created — no on_match ran: %v", err)
+	}
+	hits := strings.Count(strings.TrimSpace(string(data)), "hit")
+	if hits != 1 {
+		t.Fatalf("expected exactly 1 on_match execution, got %d (countFile: %q)", hits, string(data))
+	}
 }
 
 // TestHandleEventInflightDifferentIPs verifies that concurrent on_match actions
@@ -661,6 +733,7 @@ t.Errorf("HandleEvent error: %v", err)
 }
 
 time.Sleep(300 * time.Millisecond)
+jr.WaitForInflight()
 
 data, err := os.ReadFile(filepath.Join(dir, "out.txt"))
 if err != nil {

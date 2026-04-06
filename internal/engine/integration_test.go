@@ -366,6 +366,7 @@ func TestRestartJailReloadsConfig(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("HandleEvent (before restart): %v", err)
 	}
+	jr.WaitForInflight()
 
 	data, err := os.ReadFile(outFile)
 	if err != nil {
@@ -392,6 +393,7 @@ func TestRestartJailReloadsConfig(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("HandleEvent (after restart): %v", err)
 	}
+	jr.WaitForInflight()
 
 	data, err = os.ReadFile(outFile)
 	if err != nil {

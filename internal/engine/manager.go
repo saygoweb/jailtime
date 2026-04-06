@@ -230,18 +230,38 @@ func (m *Manager) adaptInterval(execTime time.Duration, batchSize int, measuredL
 
 	switch {
 	case batchSize == 0:
-		target = time.Duration(float64(m.currentInterval) * 1.5)
-	case measuredLatency > time.Duration(float64(m.maxLatency)*0.8):
-		target = time.Duration(float64(m.currentInterval) * 0.5)
+		// No items to process: grow interval slightly to reduce unnecessary work,
+		// but cap at 2× minLatency so we remain responsive when items arrive.
+		target = time.Duration(float64(m.currentInterval) * 1.1)
+		if idleCap := time.Duration(float64(m.minLatency) * 2.0); target > idleCap {
+			target = idleCap
+		}
+	case measuredLatency > m.minLatency:
+		// Latency is above the desired minimum. When significantly elevated,
+		// bypass EMA to recover within one cycle rather than many.
+		if measuredLatency > time.Duration(float64(m.minLatency)*1.5) {
+			next := m.minLatency
+			if execTime > next/2 {
+				if stretched := time.Duration(float64(execTime) * 2.0); stretched > next {
+					next = stretched
+				}
+			}
+			if next > m.maxLatency {
+				next = m.maxLatency
+			}
+			m.currentInterval = next
+			return next
+		}
+		target = m.minLatency
 	case measuredLatency < time.Duration(float64(m.minLatency)*0.5):
+		// Latency well below target: items are processed very fast; grow slightly.
 		target = time.Duration(float64(m.currentInterval) * 1.25)
 	default:
 		target = m.currentInterval
 	}
 
 	if batchSize > 0 && execTime > m.currentInterval/2 {
-		stretched := time.Duration(float64(execTime) * 2.0)
-		if stretched > target {
+		if stretched := time.Duration(float64(execTime) * 2.0); stretched > target {
 			target = stretched
 		}
 	}
