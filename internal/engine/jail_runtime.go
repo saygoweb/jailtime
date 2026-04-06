@@ -69,7 +69,8 @@ type JailRuntime struct {
 	// inflight tracks IPs that currently have an on_match action running.
 	// Only one on_match execution per IP is allowed at a time; concurrent
 	// threshold triggers for an in-flight IP are silently skipped.
-	inflight sync.Map
+	inflight   sync.Map
+	inflightWg sync.WaitGroup // counts all in-flight on_match goroutines
 	// Pre-compiled action templates (populated by compileTemplates)
 	onMatchTmpls []*template.Template
 	queryTmpl    *template.Template // nil if no query configured
@@ -186,6 +187,12 @@ func (jr *JailRuntime) Stop(ctx context.Context) error {
 
 	_, err := action.RunAll(ctx, cfg.Actions.OnStop, jr.lifecycleCtx(), 0)
 	return err
+}
+
+// WaitForInflight blocks until all in-flight on_match goroutines have
+// completed.  Useful in tests and for graceful shutdown.
+func (jr *JailRuntime) WaitForInflight() {
+	jr.inflightWg.Wait()
 }
 
 // Restart runs on_restart actions; status remains started.
@@ -375,7 +382,6 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		)
 		return nil
 	}
-	defer jr.inflight.Delete(result.IP)
 
 	actCtx := action.Context{
 		IP:        result.IP,
@@ -388,20 +394,34 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		Timestamp: t.UTC().Format(time.RFC3339),
 	}
 
-	// Query pre-check: only run when query_before_match is true.
-	// Exit 0 means the IP is already blocked — skip on_match.
-	if cfg.QueryBeforeMatch && queryTmpl != nil {
-		res, _ := action.RunCompiled(ctx, queryTmpl, actCtx, cfg.ActionTimeout.Duration)
-		if res.ExitCode == 0 && res.Error == nil {
-			slog.Info("query pre-check suppressed on_match",
-				"jail", cfg.Name,
-				"ip", result.IP,
-				"query_exit_code", res.ExitCode,
-			)
-			return nil
-		}
-	}
+	// Run query pre-check and on_match in a goroutine so the event loop is
+	// never blocked by slow shell actions.  The inflight entry is held for
+	// the full goroutine lifetime, which prevents duplicate triggers while
+	// an action is in progress — including across sequential processBatch
+	// calls when the action outlasts the timer interval.
+	jr.inflightWg.Add(1)
+	go func() {
+		defer jr.inflightWg.Done()
+		defer jr.inflight.Delete(result.IP)
 
-	_, err = action.RunAllCompiled(ctx, onMatchTmpls, actCtx, cfg.ActionTimeout.Duration)
-	return err
+		// Query pre-check: only run when query_before_match is true.
+		// Exit 0 means the IP is already blocked — skip on_match.
+		if cfg.QueryBeforeMatch && queryTmpl != nil {
+			res, _ := action.RunCompiled(ctx, queryTmpl, actCtx, cfg.ActionTimeout.Duration)
+			if res.ExitCode == 0 && res.Error == nil {
+				slog.Info("query pre-check suppressed on_match",
+					"jail", cfg.Name,
+					"ip", result.IP,
+					"query_exit_code", res.ExitCode,
+				)
+				return
+			}
+		}
+
+		if _, err := action.RunAllCompiled(ctx, onMatchTmpls, actCtx, cfg.ActionTimeout.Duration); err != nil {
+			slog.Warn("on_match action failed", "jail", cfg.Name, "ip", result.IP, "error", err)
+		}
+	}()
+
+	return nil
 }
