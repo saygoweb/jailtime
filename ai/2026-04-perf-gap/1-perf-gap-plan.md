@@ -16,17 +16,24 @@ Profiling and review identified six root causes, all fixable without changing th
 
 The `batchTicker` fires every 50 ms regardless of whether any files have changed. With the current production config (150 watched files, 12 jails), this creates **72,000 goroutine wakeups per hour** doing zero useful work. Even when completely idle the scheduler is busy.
 
-**Fix:** Replace the constant ticker with a **one-shot lazy drain timer** (the nil-channel pattern). The timer is armed only when the first WRITE event marks a file dirty. It fires once after `minLatency` (default 2 s), drains all dirty files, then goes nil again. When idle, the select loop sleeps with no timer running.
+**Fix:** Replace the constant ticker with a **one-shot lazy drain timer** (the nil-channel pattern). The timer is armed only when the first WRITE event marks a file dirty. It fires once after `targetLatency - lastDrainTime` (so that total latency from WRITE to line-processed ≈ `targetLatency`), drains all dirty files, records the drain duration, then goes nil again. When idle, the select loop sleeps with no timer running.
+
+`lastDrainTime` is initialised to zero; on the first WRITE after startup (or after a long idle), the timer is set to the full `targetLatency`. After each drain the measured drain duration is stored so subsequent arm operations stay on target.
 
 ```
 state: drainTimerC = nil (not running)
+       lastDrainTime = 0
 
 WRITE event → dirty[p] = true
               if drainTimerC == nil:
-                  t := time.NewTimer(drainInterval)
+                  wait = max(targetLatency - lastDrainTime, 1ms)
+                  t := time.NewTimer(wait)
                   drainTimerC = t.C
+                  drainArmedAt = time.Now()
 
-<drainTimerC fires> → drain all dirty files → drainTimerC = nil
+<drainTimerC fires> → drainStart = time.Now()
+                       drain all dirty files → drainTimerC = nil
+                       lastDrainTime = time.Since(drainStart)
                        (returns to blocking select; no rescheduling)
 ```
 
@@ -34,11 +41,11 @@ A nil channel in a Go `select` case blocks forever — this is idiomatic Go and 
 
 ---
 
-### RC-2 — `rescanTicker` fires every 2 s calling `filepath.Glob` (HIGH)
+### RC-2 — `rescanTicker` fires every 2000 ms calling `filepath.Glob` (HIGH)
 
 **File:** `internal/watch/fsnotify.go`
 
-A second ticker calls `rescan()` every 2 s, which runs `filepath.Glob` for every pattern. For `/var/log/apache2/*/access.log` across 150 vhosts, each glob run calls `os.Lstat` for ~151 directory entries. At 30 rescans/minute that is **~4,500 unnecessary syscalls per minute** in steady state when no new vhosts are being added.
+A second ticker calls `rescan()` every 2000 ms, which runs `filepath.Glob` for every pattern. For `/var/log/apache2/*/access.log` across 150 vhosts, each glob run calls `os.Lstat` for ~151 directory entries. At 30 rescans/minute that is **~4,500 unnecessary syscalls per minute** in steady state when no new vhosts are being added.
 
 **Fix:** Replace the periodic rescan with **CREATE-event-driven file discovery**:
 1. At startup, watch each glob's "parent directory" (everything before the first wildcard character) with fsnotify in addition to individual files.
@@ -115,9 +122,9 @@ With a 50 ms timer this is **20 open/close/alloc operations per second**. On cgr
 
 The current architecture has two timer layers:
 - Backend: 50 ms `batchTicker` (collects WRITE events into dirty set)
-- Manager: 2–10 s adaptive EMA timer (drains `batchQueue` → calls `processBatch`)
+- Manager: adaptive EMA timer (drains `batchQueue` → calls `processBatch`)
 
-With the backend's lazy one-shot drain timer (RC-1 fix), the backend now fires at `minLatency` (2 s). The manager's separate timer is redundant. The `batchQueue` mutex + enqueue goroutine adds latency and CPU overhead.
+With the backend's lazy one-shot drain timer (RC-1 fix), the backend now fires at `targetLatency` (default 2000 ms). The manager's separate timer is redundant. The `batchQueue` mutex + enqueue goroutine adds latency and CPU overhead.
 
 **Fix:** Remove the `batchQueue`, the enqueue goroutine, and the manager's timer. The manager's `Run()` loop simply reads from `rawLines` using a **channel drain** pattern:
 
@@ -141,7 +148,7 @@ This is correct because the backend sends all lines from a drain cycle before th
 
 **About `adaptInterval`:** With async on_match goroutines (from the fix/multi-trigger change), `processBatch` returns in microseconds — it only dispatches goroutines. The EMA interval adaptation was designed to avoid processing taking longer than the interval. Since `processBatch` is now non-blocking, the EMA is no longer necessary for correctness. However, the `adaptInterval` function and its tests are preserved as-is since they represent valid algorithmic work that may be useful if synchronous processing is ever needed.
 
-`currentInterval` is retained as a field for perf API reporting; it is set to `minLatency` at construction and remains unchanged.
+`currentInterval` is retained as a field for perf API reporting; it is set to `targetLatency` at construction and remains unchanged.
 
 ---
 
@@ -173,12 +180,15 @@ FsnotifyBackend.Start() — single goroutine:
       if WRITE:
         → dirty[event.Name] = true
         → if drainTimerC == nil:
-              t = time.NewTimer(drainInterval)  // minLatency, default 2s
+              wait = max(targetLatency - lastDrainTime, 1ms)
+              t = time.NewTimer(wait)
               drainTimerC = t.C
     case <-drainTimerC:
+      → drainStart = time.Now()
       → drainTimerC = nil     // disarm; will re-arm on next WRITE
       → for p in dirty: ft.ReadLines() → send to rawLines channel
       → clear dirty set
+      → lastDrainTime = time.Since(drainStart)
 
 Manager.Run() — single goroutine:
 
@@ -285,12 +295,12 @@ Each unit below is self-contained and can be implemented independently by a sub-
 
 **Prerequisite:** Unit 1 (new `Reopen()` and `ReadLines` without stat/seek)
 
-**Goal:** Replace 50 ms batchTicker + 2 s rescanTicker with a single one-shot drain timer; replace periodic glob rescan with CREATE-event-driven discovery.
+**Goal:** Replace 50 ms batchTicker + 2000 ms rescanTicker with a single one-shot drain timer; replace periodic glob rescan with CREATE-event-driven discovery.
 
 **New fields in `FsnotifyBackend`:**
 ```go
 type FsnotifyBackend struct {
-    drainInterval time.Duration  // renamed from pollInterval; = minLatency
+    drainInterval time.Duration  // renamed from pollInterval; = targetLatency
     mu            sync.RWMutex
     specs         []WatchSpec
 }
@@ -320,6 +330,7 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
     parentDirs := make(map[string][]string)
 
     var drainTimerC <-chan time.Time  // nil = not running
+    var lastDrainTime time.Duration  // duration of the previous drain; used to hit targetLatency
 
     // initialScan: run filepath.Glob for all patterns, open tailers,
     // watch files AND parent directories.
@@ -482,18 +493,24 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
                 if _, known := pathToJails[event.Name]; known {
                     dirty[event.Name] = struct{}{}
                     if drainTimerC == nil {
-                        t := time.NewTimer(b.drainInterval)
+                        wait := b.drainInterval - lastDrainTime
+                        if wait < time.Millisecond {
+                            wait = time.Millisecond
+                        }
+                        t := time.NewTimer(wait)
                         drainTimerC = t.C
                     }
                 }
             }
 
         case <-drainTimerC:
+            drainStart := time.Now()
             drainTimerC = nil  // disarm — will re-arm on next WRITE event
             for p := range dirty {
                 readAndSend(p)
                 delete(dirty, p)
             }
+            lastDrainTime = time.Since(drainStart)
 
         case _, ok := <-watcher.Errors:
             if !ok {
@@ -529,16 +546,16 @@ func appendUniq(slice []string, s string) []string {
 
 **Changes to `backend.go` / `NewAuto`:**
 ```go
-// NewAuto now takes drainInterval for the fsnotify backend (= minLatency).
+// NewAuto now takes drainInterval for the fsnotify backend (= targetLatency).
 func NewAuto(mode string, interval time.Duration) Backend
 ```
 Both `NewFsnotifyBackend` and `NewPollBackend` receive the same `interval` parameter; for poll it is the poll interval, for fsnotify it is the drain timer interval.
 
 **Test changes:**
 
-- `TestFsnotifyBackendBasic`: verify line is received within `minLatency + tolerance`.
+- `TestFsnotifyBackendBasic`: verify line is received within `targetLatency + tolerance`.
 - `TestFsnotifyBackendCoalescing`: WRITE many times in a burst, verify only one drain cycle fires (currently may over-read; new design drains once).
-- New: `TestFsnotifyBackendIdleNoTimer`: start backend with a file, write nothing, verify no events emitted and no CPU wakeup occurs for at least 2× minLatency. (Indirect: verify that if we write after a long idle, the line arrives within minLatency.)
+- New: `TestFsnotifyBackendIdleNoTimer`: start backend with a file, write nothing, verify no events emitted and no CPU wakeup occurs for at least 2× targetLatency. (Indirect: verify that if we write after a long idle, the line arrives within targetLatency.)
 - `TestFsnotifyBackendSubdirGlob`: verify a new file created in a watched subdirectory is picked up without full rescan. Existing test should pass unchanged.
 - Rotation test: write to file, verify lines received; truncate + rewrite file; verify new lines received.
 
@@ -675,11 +692,11 @@ Both `NewFsnotifyBackend` and `NewPollBackend` receive the same `interval` param
 
 6. **`NewAuto` call in `NewManager`:**
    ```go
-   backend := watch.NewAuto(cfg.Engine.WatcherMode, minLatency)
+   backend := watch.NewAuto(cfg.Engine.WatcherMode, targetLatency)
    ```
-   (Passes `minLatency` instead of `pollInterval` — both backends use this as their interval.)
+   (Passes `targetLatency` instead of `pollInterval` — both backends use this as their interval.)
 
-7. **`adaptInterval` is retained** (it has its own unit tests). It is no longer called from `Run()`, but `currentInterval` is set to `minLatency` in `NewManager` and not modified. The perf API reports `currentInterval` as the current drain interval.
+7. **`adaptInterval` is retained** (it has its own unit tests). It is no longer called from `Run()`, but `currentInterval` is set to `targetLatency` in `NewManager` and not modified. The perf API reports `currentInterval` as the current drain interval.
 
 8. **Wire `perf.Close()`** into the `ctx.Done()` shutdown path.
 
@@ -719,7 +736,7 @@ Both `NewFsnotifyBackend` and `NewPollBackend` receive the same `interval` param
    }
    ```
 
-2. No other changes needed. The poll backend's ticker continues to run at `b.interval` (now passed as `minLatency` from `NewAuto`).
+2. No other changes needed. The poll backend's ticker continues to run at `b.interval` (now passed as `targetLatency` from `NewAuto`).
 
 **Test changes:**
 
@@ -732,13 +749,13 @@ Both `NewFsnotifyBackend` and `NewPollBackend` receive the same `interval` param
 
 **File:** `internal/watch/backend.go`, `internal/engine/manager.go`
 
-**Goal:** Ensure `minLatency` flows correctly to both backends.
+**Goal:** Ensure `targetLatency` flows correctly to both backends.
 
 **Changes to `internal/watch/backend.go`:**
 ```go
 // NewAuto creates a Backend according to mode.
 // interval is used as the poll interval for PollBackend and the drain timer
-// interval for FsnotifyBackend (both default to minLatency = 2s).
+// interval for FsnotifyBackend (both default to targetLatency = 2000ms).
 func NewAuto(mode string, interval time.Duration) Backend {
     switch strings.ToLower(mode) {
     case "poll":
@@ -753,13 +770,23 @@ func NewAuto(mode string, interval time.Duration) Backend {
 
 **Changes to `internal/engine/manager.go` (`NewManager`):**
 ```go
-minLatency := cfg.Engine.MinLatency.Duration
-if minLatency == 0 {
-    minLatency = 2 * time.Second
+targetLatency := cfg.Engine.TargetLatency.Duration
+if targetLatency == 0 {
+    targetLatency = 2000 * time.Millisecond
 }
-backend := watch.NewAuto(cfg.Engine.WatcherMode, minLatency)
+backend := watch.NewAuto(cfg.Engine.WatcherMode, targetLatency)
 ```
-(Remove the separate `pollInterval` extraction — it is superseded by `minLatency`.)
+(Remove the separate `pollInterval` extraction — it is superseded by `targetLatency`.)
+
+**Changes to `internal/config/types.go`:**
+- Rename `MinLatency Duration` → `TargetLatency Duration` (units: milliseconds in YAML, e.g. `"2000ms"`)
+- Remove `MaxLatency Duration`
+- Update `defaultMinLatency` → `defaultTargetLatency = 2000 * time.Millisecond`
+- Remove `defaultMaxLatency`
+- Update `EngineConfig.LogValue()` to use `target_latency`
+
+**Changes to `internal/config/config_test.go`:**
+- Update any test using `MinLatency`/`MaxLatency` fields to use `TargetLatency`
 
 ---
 
@@ -780,7 +807,7 @@ backend := watch.NewAuto(cfg.Engine.WatcherMode, minLatency)
 |------|----------|-----------------|
 | `TestFileTailerNoSeekBetweenReads` | `watch_test.go` | ReadLines called twice without seek; correct lines returned |
 | `TestFileTailerReopen` | `watch_test.go` | Reopen resets reader; subsequent ReadLines starts from position 0 |
-| `TestFsnotifyBackendIdleNoDrain` | `watch_test.go` | With a file and no writes, no lines emitted for 2× minLatency |
+| `TestFsnotifyBackendIdleNoDrain` | `watch_test.go` | With a file and no writes, no lines emitted for 2× targetLatency |
 | `TestCgroupCPUSamplerNoAlloc` | `engine` | AllocsPerRun(10, sampler.Sample) == 0 (or 1 for string conversion) |
 
 ### Regression test
@@ -804,5 +831,5 @@ After these changes:
   - ~4–5 drain cycles/minute (most are idle, no-ops)
   - Each drain cycle reads only dirty files (typically 1–3 at a time)
   - Zero stat/seek/alloc per file per cycle
-- **Latency:** ≤ `minLatency` (default 2 s) from file write to `HandleEvent` call
+- **Latency:** ≈ `targetLatency` (default 2000 ms) from file write to `HandleEvent` call; timer is set to `targetLatency - lastDrainTime` so the drain overhead is subtracted, keeping end-to-end latency on target
 - **Memory:** no change to heap footprint (pre-allocated buffers replace per-call allocs)
