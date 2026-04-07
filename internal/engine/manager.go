@@ -11,31 +11,6 @@ import (
 	"github.com/sgw/jailtime/internal/watch"
 )
 
-const emaAlpha = 0.3
-
-type pendingItem struct {
-	line watch.RawLine
-}
-
-type batchQueue struct {
-	mu    sync.Mutex
-	items []pendingItem
-}
-
-func (q *batchQueue) Enqueue(line watch.RawLine) {
-	q.mu.Lock()
-	q.items = append(q.items, pendingItem{line: line})
-	q.mu.Unlock()
-}
-
-func (q *batchQueue) Drain() []pendingItem {
-	q.mu.Lock()
-	batch := q.items
-	q.items = make([]pendingItem, 0, cap(batch))
-	q.mu.Unlock()
-	return batch
-}
-
 // Manager runs all jail runtimes and the watch backend.
 type Manager struct {
 	cfg             *config.Config
@@ -44,10 +19,8 @@ type Manager struct {
 	backend         watch.Backend
 	mu              sync.RWMutex
 	perf            *PerfMetrics
-	queue           batchQueue
-	minLatency      time.Duration
-	maxLatency      time.Duration
 	currentInterval time.Duration
+	lastDrainAt     time.Time
 }
 
 func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
@@ -65,16 +38,12 @@ func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
 	if pollInterval == 0 {
 		pollInterval = 2 * time.Second
 	}
-	backend := watch.NewAuto(cfg.Engine.WatcherMode, pollInterval)
+	targetLatency := cfg.Engine.TargetLatency.Duration
+	if targetLatency == 0 {
+		targetLatency = 2000 * time.Millisecond
+	}
+	backend := watch.NewAuto(cfg.Engine.WatcherMode, targetLatency)
 
-	minLatency := cfg.Engine.MinLatency.Duration
-	if minLatency == 0 {
-		minLatency = 2 * time.Second
-	}
-	maxLatency := cfg.Engine.MaxLatency.Duration
-	if maxLatency == 0 {
-		maxLatency = 10 * time.Second
-	}
 	perfWindow := cfg.Engine.PerfWindow
 	if perfWindow == 0 {
 		perfWindow = 3
@@ -86,16 +55,13 @@ func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
 		jails:           jails,
 		backend:         backend,
 		perf:            NewPerfMetrics(perfWindow, "jailtimed.service"),
-		minLatency:      minLatency,
-		maxLatency:      maxLatency,
-		currentInterval: minLatency,
+		currentInterval: targetLatency,
 	}, nil
 }
 
 // Run starts all enabled jails, starts the watch backend, and routes events
-// via a timer-based batch queue with EMA-based adaptive interval.
+// via the DrainFunc callback.
 func (m *Manager) Run(ctx context.Context) error {
-	// Start all enabled jails.
 	for name, jr := range m.jails {
 		if !jr.cfg.Enabled {
 			continue
@@ -104,93 +70,46 @@ func (m *Manager) Run(ctx context.Context) error {
 			return fmt.Errorf("starting jail %q: %w", name, err)
 		}
 	}
-
-	// Build watch specs for enabled jails.
 	m.mu.RLock()
-	specs := make([]watch.WatchSpec, 0, len(m.jails))
+	specs := buildSpecs(m.jails, m.cfg.Engine.ReadFromEnd)
+	m.mu.RUnlock()
+
+	err := m.backend.Start(ctx, specs, m.processDrain)
+
+	stopCtx := context.Background()
+	m.mu.RLock()
 	for _, jr := range m.jails {
-		if jr.cfg.Enabled {
-			specs = append(specs, watch.WatchSpec{
-				JailName:    jr.cfg.Name,
-				Globs:       jr.cfg.Files,
-				ReadFromEnd: m.cfg.Engine.ReadFromEnd,
-			})
+		if jr.Status() == StatusStarted {
+			_ = jr.Stop(stopCtx)
 		}
 	}
 	m.mu.RUnlock()
+	m.perf.Close()
 
-	rawLines := make(chan watch.RawLine, 4096)
-	backendErr := make(chan error, 1)
-	go func() {
-		if err := m.backend.Start(ctx, specs, rawLines); err != nil && err != context.Canceled {
-			backendErr <- err
-		}
-		close(rawLines)   // signal enqueue goroutine to stop
-		close(backendErr)
-	}()
-
-	// Enqueue goroutine: reads from rawLines channel, pushes to batch queue.
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case line, ok := <-rawLines:
-				if !ok {
-					return
-				}
-				m.queue.Enqueue(line)
-			}
-		}
-	}()
-
-	// Drain loop: timer-based batch processing.
-	timer := time.NewTimer(m.currentInterval)
-	defer timer.Stop()
-
-	for {
-		select {
-		case err := <-backendErr:
-			if err != nil {
-				return fmt.Errorf("watch backend: %w", err)
-			}
-			return nil
-
-		case <-ctx.Done():
-			stopCtx := context.Background()
-			m.mu.RLock()
-			for _, jr := range m.jails {
-				if jr.Status() == StatusStarted {
-					_ = jr.Stop(stopCtx)
-				}
-			}
-			m.mu.RUnlock()
-			return ctx.Err()
-
-		case <-timer.C:
-			batch := m.queue.Drain()
-			drainStart := time.Now()
-
-			var measuredLatency time.Duration
-			if len(batch) > 0 {
-				measuredLatency = drainStart.Sub(batch[0].line.EnqueueAt)
-			}
-
-			m.processBatch(ctx, batch)
-			execTime := time.Since(drainStart)
-
-			m.perf.RecordExecution(execTime, measuredLatency, len(batch), m.currentInterval)
-			nextInterval := m.adaptInterval(execTime, len(batch), measuredLatency)
-			timer.Reset(nextInterval)
-		}
+	if err != nil && err != context.Canceled {
+		return fmt.Errorf("watch backend: %w", err)
 	}
+	return nil
 }
 
-func (m *Manager) processBatch(ctx context.Context, batch []pendingItem) {
+func (m *Manager) processDrain(ctx context.Context, lines []watch.RawLine) {
+	drainStart := time.Now()
+	if !m.lastDrainAt.IsZero() {
+		m.currentInterval = drainStart.Sub(m.lastDrainAt)
+	}
+	m.lastDrainAt = drainStart
+
+	m.processBatch(ctx, lines)
+
+	execTime := time.Since(drainStart)
+	m.perf.RecordExecution(execTime, m.currentInterval, len(lines))
+}
+
+func (m *Manager) processBatch(ctx context.Context, lines []watch.RawLine) {
 	// Collect jail names needed for this batch.
 	needed := make(map[string]struct{})
-	for _, item := range batch {
-		for _, name := range item.line.Jails {
+	for _, line := range lines {
+		for _, name := range line.Jails {
 			needed[name] = struct{}{}
 		}
 	}
@@ -206,77 +125,23 @@ func (m *Manager) processBatch(ctx context.Context, batch []pendingItem) {
 	}
 	m.mu.RUnlock()
 
-	for _, item := range batch {
-		for _, jailName := range item.line.Jails {
+	for _, line := range lines {
+		for _, jailName := range line.Jails {
 			jr, exists := snapshot[jailName]
 			if !exists || jr.Status() != StatusStarted {
 				continue
 			}
 			evt := watch.Event{
 				JailName: jailName,
-				FilePath: item.line.FilePath,
-				Line:     item.line.Line,
-				Time:     item.line.EnqueueAt,
+				FilePath: line.FilePath,
+				Line:     line.Line,
+				Time:     line.EnqueueAt,
 			}
 			if err := jr.HandleEvent(ctx, evt); err != nil {
 				slog.Warn("event processing error", "jail", jailName, "error", err)
 			}
 		}
 	}
-}
-
-func (m *Manager) adaptInterval(execTime time.Duration, batchSize int, measuredLatency time.Duration) time.Duration {
-	var target time.Duration
-
-	switch {
-	case batchSize == 0:
-		// No items to process: grow interval slightly to reduce unnecessary work,
-		// but cap at 2× minLatency so we remain responsive when items arrive.
-		target = time.Duration(float64(m.currentInterval) * 1.1)
-		if idleCap := time.Duration(float64(m.minLatency) * 2.0); target > idleCap {
-			target = idleCap
-		}
-	case measuredLatency > m.minLatency:
-		// Latency is above the desired minimum. When significantly elevated,
-		// bypass EMA to recover within one cycle rather than many.
-		if measuredLatency > time.Duration(float64(m.minLatency)*1.5) {
-			next := m.minLatency
-			if execTime > next/2 {
-				if stretched := time.Duration(float64(execTime) * 2.0); stretched > next {
-					next = stretched
-				}
-			}
-			if next > m.maxLatency {
-				next = m.maxLatency
-			}
-			m.currentInterval = next
-			return next
-		}
-		target = m.minLatency
-	case measuredLatency < time.Duration(float64(m.minLatency)*0.5):
-		// Latency well below target: items are processed very fast; grow slightly.
-		target = time.Duration(float64(m.currentInterval) * 1.25)
-	default:
-		target = m.currentInterval
-	}
-
-	if batchSize > 0 && execTime > m.currentInterval/2 {
-		if stretched := time.Duration(float64(execTime) * 2.0); stretched > target {
-			target = stretched
-		}
-	}
-
-	next := time.Duration(
-		float64(m.currentInterval)*(1-emaAlpha) + float64(target)*emaAlpha,
-	)
-	if next < m.minLatency {
-		next = m.minLatency
-	}
-	if next > m.maxLatency {
-		next = m.maxLatency
-	}
-	m.currentInterval = next
-	return next
 }
 
 // PerfStats returns a snapshot of current performance metrics.

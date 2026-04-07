@@ -1,217 +1,255 @@
 package watch
 
 import (
-	"context"
-	"log/slog"
-	"path/filepath"
-	"sync"
-	"time"
+"context"
+"log/slog"
+"path/filepath"
+"sync"
+"time"
 
-	"github.com/fsnotify/fsnotify"
+"github.com/fsnotify/fsnotify"
 )
 
-// FsnotifyBackend implements Backend using fsnotify for event-driven watching,
-// with periodic glob rescanning to pick up new matching files.
+// FsnotifyBackend implements Backend using fsnotify for event-driven watching.
+// It uses a lazy one-shot drain timer: the timer is only armed when a dirty
+// path is detected, so the goroutine is truly idle when no files change.
 type FsnotifyBackend struct {
-	pollInterval time.Duration
-	mu           sync.RWMutex
-	specs        []WatchSpec
+drainInterval time.Duration
+mu            sync.RWMutex
+specs         []WatchSpec
 }
 
-func NewFsnotifyBackend(pollInterval time.Duration) *FsnotifyBackend {
-	return &FsnotifyBackend{pollInterval: pollInterval}
+func NewFsnotifyBackend(drainInterval time.Duration) *FsnotifyBackend {
+return &FsnotifyBackend{drainInterval: drainInterval}
 }
 
 func (b *FsnotifyBackend) Name() string { return "fsnotify" }
 
 // UpdateSpecs replaces the current watch specs. The change takes effect on
-// the next rescan tick.
+// the next rescan.
 func (b *FsnotifyBackend) UpdateSpecs(specs []WatchSpec) {
-	b.mu.Lock()
-	b.specs = specs
-	b.mu.Unlock()
+b.mu.Lock()
+b.specs = specs
+b.mu.Unlock()
 }
 
 func (b *FsnotifyBackend) getSpecs() []WatchSpec {
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-	return b.specs
+b.mu.RLock()
+defer b.mu.RUnlock()
+return b.specs
 }
 
-// Start watches files using fsnotify for WRITE/CREATE events.
-// Periodically rescans globs to pick up new matching files.
-// One FileTailer is maintained per unique file path (shared across jails);
-// each line is emitted as a single RawLine with all interested jails.
-//
-// WRITE events are coalesced: instead of reading the file on every kernel
-// notification (which can be hundreds per second under high load), the path
-// is added to a dirty set and the set is drained on each batchInterval tick.
-// This bounds file I/O to at most len(watchedPaths)/batchInterval reads/sec
-// regardless of how rapidly the file is being written to.
-func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan<- RawLine) error {
-	b.UpdateSpecs(specs)
+func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain DrainFunc) error {
+b.UpdateSpecs(specs)
 
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		slog.Info("fsnotify watcher unavailable, falling back to poll backend", "error", err)
-		// Fall back to poll backend.
-		pb := NewPollBackend(b.pollInterval)
-		return pb.Start(ctx, b.getSpecs(), out)
-	}
-	defer watcher.Close()
-	slog.Info("fsnotify backend started")
+watcher, err := fsnotify.NewWatcher()
+if err != nil {
+slog.Info("fsnotify unavailable, falling back to poll", "error", err)
+return NewPollBackend(b.drainInterval).Start(ctx, b.getSpecs(), drain)
+}
+defer watcher.Close()
+slog.Info("fsnotify backend started")
 
-	// tailers maps file path → FileTailer (one per unique path across all jails).
-	tailers := make(map[string]*FileTailer)
-	// pathToJails maps file path → list of jail names watching it.
-	pathToJails := make(map[string][]string)
-	// dirty holds paths that have received WRITE/CREATE events since last batch.
-	dirty := make(map[string]struct{})
+tailers := make(map[string]*FileTailer)
+pathToJails := make(map[string][]string)
+dirty := make(map[string]struct{})
+parentDirs := make(map[string][]string) // parent dir → []glob patterns
 
-	rescan := func() {
-		currentSpecs := b.getSpecs()
+var drainTimerC <-chan time.Time // nil = idle
+var lastDrainTime time.Duration // previous drain wall time
 
-		// Step 1: expand each unique glob pattern once.
-		globCache := make(map[string][]string)
-		for _, spec := range currentSpecs {
-			for _, pattern := range spec.Globs {
-				if _, seen := globCache[pattern]; !seen {
-					paths, err := filepath.Glob(pattern)
-					if err != nil || paths == nil {
-						paths = []string{}
-					}
-					globCache[pattern] = paths
-				}
-			}
-		}
+readLines := func(p string) []RawLine {
+ft, ok := tailers[p]
+if !ok {
+return nil
+}
+lines, err := ft.ReadLines()
+if err != nil {
+return nil
+}
+jails := pathToJails[p]
+now := time.Now()
+var result []RawLine
+for _, line := range lines {
+if slog.Default().Enabled(ctx, slog.LevelDebug) && ft.debugLog.Allow() {
+slog.DebugContext(ctx, "line notified", "jails", jails, "file", p, "line", line)
+}
+result = append(result, RawLine{FilePath: p, Line: line, Jails: jails, EnqueueAt: now})
+}
+return result
+}
 
-		// Step 2: rebuild pathToJails using cached glob results.
-		newPathToJails := make(map[string][]string)
-		pathReadFromEnd := make(map[string]bool)
-		for _, spec := range currentSpecs {
-			for _, pattern := range spec.Globs {
-				for _, p := range globCache[pattern] {
-					newPathToJails[p] = append(newPathToJails[p], spec.JailName)
-					if _, set := pathReadFromEnd[p]; !set {
-						pathReadFromEnd[p] = spec.ReadFromEnd
-					}
-				}
-			}
-		}
+openTailer := func(p string, readFromEnd bool) {
+if _, ok := tailers[p]; ok {
+return
+}
+ft, err := NewFileTailer(p, readFromEnd)
+if err != nil {
+return
+}
+tailers[p] = ft
+dirty[p] = struct{}{}
+_ = watcher.Add(p)
+}
 
-		// Open tailers for newly matched paths; mark them dirty for initial read.
-		for p := range newPathToJails {
-			if _, ok := tailers[p]; !ok {
-				ft, err := NewFileTailer(p, pathReadFromEnd[p])
-				if err != nil {
-					continue
-				}
-				tailers[p] = ft
-				dirty[p] = struct{}{}
-				// Ignore error if already watched.
-				_ = watcher.Add(p)
-			}
-		}
+initialScan := func() {
+currentSpecs := b.getSpecs()
+globCache := make(map[string][]string)
+for _, spec := range currentSpecs {
+for _, pattern := range spec.Globs {
+if _, seen := globCache[pattern]; !seen {
+paths, err := filepath.Glob(pattern)
+if err != nil || paths == nil {
+paths = []string{}
+}
+globCache[pattern] = paths
+}
+}
+}
+newPathToJails := make(map[string][]string)
+pathReadFromEnd := make(map[string]bool)
+for _, spec := range currentSpecs {
+for _, pattern := range spec.Globs {
+for _, p := range globCache[pattern] {
+newPathToJails[p] = append(newPathToJails[p], spec.JailName)
+if _, set := pathReadFromEnd[p]; !set {
+pathReadFromEnd[p] = spec.ReadFromEnd
+}
+}
+// Watch parent dir for CREATE events.
+pd := globParentDir(pattern)
+parentDirs[pd] = appendUniq(parentDirs[pd], pattern)
+_ = watcher.Add(pd)
+}
+}
+for p := range newPathToJails {
+openTailer(p, pathReadFromEnd[p])
+}
+pathToJails = newPathToJails
+}
 
-		// Close tailers for paths no longer matched by any spec.
-		for p, ft := range tailers {
-			if _, ok := newPathToJails[p]; !ok {
-				ft.Close()
-				delete(tailers, p)
-				delete(dirty, p)
-				_ = watcher.Remove(p)
-			}
-		}
+handleCreate := func(name string) {
+// Case 1: known file recreated (rotation).
+if ft, ok := tailers[name]; ok {
+_ = ft.Reopen(false)
+dirty[name] = struct{}{}
+return
+}
+// Case 2: new file matching a glob.
+currentSpecs := b.getSpecs()
+for _, spec := range currentSpecs {
+for _, pattern := range spec.Globs {
+if matched, err := filepath.Match(pattern, name); err == nil && matched {
+pathToJails[name] = appendUniq(pathToJails[name], spec.JailName)
+openTailer(name, spec.ReadFromEnd)
+return
+}
+}
+}
+// Case 3: new directory — check if its parent dir is being watched for globs.
+// Watch the new dir so CREATE events inside it are detected.
+if patterns, ok := parentDirs[filepath.Dir(name)]; ok {
+_ = watcher.Add(name)
+for _, pattern := range patterns {
+paths, err := filepath.Glob(pattern)
+if err != nil {
+continue
+}
+for _, p := range paths {
+for _, spec := range currentSpecs {
+for _, sp := range spec.Globs {
+if sp == pattern {
+pathToJails[p] = appendUniq(pathToJails[p], spec.JailName)
+}
+}
+}
+openTailer(p, false)
+}
+}
+}
+}
 
-		pathToJails = newPathToJails
-	}
+initialScan()
 
-	readAndSend := func(p string) {
-		ft, ok := tailers[p]
-		if !ok {
-			return
-		}
-		lines, err := ft.ReadLines()
-		if err != nil {
-			return
-		}
-		jails := pathToJails[p]
-		for _, line := range lines {
-			if slog.Default().Enabled(ctx, slog.LevelDebug) && ft.debugLog.Allow() {
-				slog.DebugContext(ctx, "line notified",
-					"jails", jails,
-					"file", p,
-					"line", line,
-				)
-			}
-			select {
-			case out <- RawLine{
-				FilePath:  p,
-				Line:      line,
-				Jails:     jails,
-				EnqueueAt: time.Now(),
-			}:
-			case <-ctx.Done():
-			}
-		}
-	}
+// Arm drain timer if initial scan found dirty files.
+if len(dirty) > 0 {
+wait := b.drainInterval
+if wait < time.Millisecond {
+wait = time.Millisecond
+}
+drainTimerC = time.NewTimer(wait).C
+}
 
-	// Initial scan.
-	rescan()
+for {
+select {
+case <-ctx.Done():
+for _, ft := range tailers {
+ft.Close()
+}
+return ctx.Err()
 
-	// batchInterval controls how often dirty paths are read. Coalescing multiple
-	// rapid WRITE events into a single ReadLines call is the primary CPU reduction.
-	// 50 ms means at most 20 reads/sec/file regardless of write frequency.
-	const batchInterval = 50 * time.Millisecond
-	batchTicker := time.NewTicker(batchInterval)
-	defer batchTicker.Stop()
+case event, ok := <-watcher.Events:
+if !ok {
+return nil
+}
+switch {
+case event.Has(fsnotify.Create):
+handleCreate(event.Name)
+if len(dirty) > 0 && drainTimerC == nil {
+wait := b.drainInterval - lastDrainTime
+if wait < time.Millisecond {
+wait = time.Millisecond
+}
+drainTimerC = time.NewTimer(wait).C
+}
+case event.Has(fsnotify.Write):
+if _, known := pathToJails[event.Name]; known {
+dirty[event.Name] = struct{}{}
+if drainTimerC == nil {
+wait := b.drainInterval - lastDrainTime
+if wait < time.Millisecond {
+wait = time.Millisecond
+}
+drainTimerC = time.NewTimer(wait).C
+}
+}
+}
 
-	rescanTicker := time.NewTicker(b.pollInterval)
-	defer rescanTicker.Stop()
+case <-drainTimerC:
+drainStart := time.Now()
+drainTimerC = nil
+var batch []RawLine
+for p := range dirty {
+batch = append(batch, readLines(p)...)
+delete(dirty, p)
+}
+drain(ctx, batch)
+lastDrainTime = time.Since(drainStart)
 
-	for {
-		select {
-		case <-ctx.Done():
-			for _, ft := range tailers {
-				ft.Close()
-			}
-			return ctx.Err()
+case _, ok := <-watcher.Errors:
+if !ok {
+return nil
+}
+}
+}
+}
 
-		case <-rescanTicker.C:
-			rescan()
+// globParentDir returns the deepest directory prefix before the first wildcard character.
+func globParentDir(pattern string) string {
+for i, ch := range pattern {
+if ch == '*' || ch == '?' || ch == '[' {
+return filepath.Dir(pattern[:i])
+}
+}
+return filepath.Dir(pattern)
+}
 
-		case <-batchTicker.C:
-			// Drain the dirty set: read each path once, fan out to watching jails.
-			for p := range dirty {
-				readAndSend(p)
-				delete(dirty, p)
-			}
-
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return nil
-			}
-			p := event.Name
-			if event.Has(fsnotify.Create) {
-				// File was recreated (rotation): reopen tailer from start immediately
-				// so subsequent reads come from the new file, not the old fd.
-				if ft, ok := tailers[p]; ok {
-					ft.Close()
-				}
-				ft, err := NewFileTailer(p, false)
-				if err != nil {
-					delete(tailers, p)
-					continue
-				}
-				tailers[p] = ft
-			}
-			// Mark dirty; the batch ticker will call readAndSend.
-			dirty[p] = struct{}{}
-
-		case _, ok := <-watcher.Errors:
-			if !ok {
-				return nil
-			}
-		}
-	}
+// appendUniq appends s to slice only if it is not already present.
+func appendUniq(slice []string, s string) []string {
+for _, v := range slice {
+if v == s {
+return slice
+}
+}
+return append(slice, s)
 }

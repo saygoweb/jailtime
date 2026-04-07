@@ -33,7 +33,12 @@ func TestReadUsageUsec(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := &cgroupCPUSampler{cgroupPath: path}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	s := &cgroupCPUSampler{cgroupPath: path, file: f}
 	usage, err := s.readUsageUsec()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -57,7 +62,12 @@ func TestCgroupCPUSamplerDelta(t *testing.T) {
 
 	// Prime with initial value.
 	writeUsage(1000000) // 1 second of CPU time
-	s := &cgroupCPUSampler{cgroupPath: path}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	s := &cgroupCPUSampler{cgroupPath: path, file: f}
 	usage, err := s.readUsageUsec()
 	if err != nil {
 		t.Fatal(err)

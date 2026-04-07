@@ -176,7 +176,7 @@ func (a *JailControllerAdapter) PerfStats() control.PerfResponse {
 	snap := a.m.PerfStats()
 	return control.PerfResponse{
 		CurrentLatencyMs: snap.CurrentLatencyMs,
-		CurrentDelayMs:   snap.CurrentDelayMs,
+		CurrentIntervalMs: snap.CurrentIntervalMs,
 		AvgExecTimeMs:    snap.AvgExecTimeMs,
 		AvgCPUPercent:    snap.AvgCPUPercent,
 		WindowSize:       snap.WindowSize,
