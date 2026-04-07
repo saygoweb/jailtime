@@ -54,12 +54,12 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 	pathToJails := make(map[string][]string) // tail-mode paths
 	staticPathToJails := make(map[string][]string)
 	staticSnapshots := make(map[string]map[string]bool)
-	dirty := make(map[string]struct{})        // tail-mode dirty paths
+	dirty := make(map[string]struct{})       // tail-mode dirty paths
 	staticDirty := make(map[string]struct{}) // static-mode dirty paths
-	parentDirs := make(map[string][]string) // parent dir → []glob patterns
+	parentDirs := make(map[string][]string)  // parent dir → []glob patterns
 
 	var drainTimerC <-chan time.Time // nil = idle
-	var lastDrainTime time.Duration // previous drain wall time
+	var lastDrainTime time.Duration  // previous drain wall time
 
 	readTailLines := func(p string) []RawLine {
 		ft, ok := tailers[p]

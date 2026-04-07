@@ -45,11 +45,11 @@ type PerfResponse struct {
 
 // WhitelistStatusResponse represents one whitelist's status.
 type WhitelistStatusResponse struct {
-Name   string `json:"name"`
-Status string `json:"status"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
 }
 
 // ListWhitelistsResponse is returned by GET /v1/whitelists.
 type ListWhitelistsResponse struct {
-Whitelists []WhitelistStatusResponse `json:"whitelists"`
+	Whitelists []WhitelistStatusResponse `json:"whitelists"`
 }

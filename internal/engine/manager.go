@@ -392,126 +392,126 @@ func (m *Manager) ConfigTest(name, filePath string, limit int, returnMatching bo
 
 // WhitelistStatus returns the status of a whitelist by name.
 func (m *Manager) WhitelistStatus(name string) (JailStatus, error) {
-m.mu.RLock()
-jr, ok := m.whitelists[name]
-m.mu.RUnlock()
-if !ok {
-return "", fmt.Errorf("whitelist %q not found", name)
-}
-return jr.Status(), nil
+	m.mu.RLock()
+	jr, ok := m.whitelists[name]
+	m.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("whitelist %q not found", name)
+	}
+	return jr.Status(), nil
 }
 
 // AllWhitelistStatuses returns a snapshot of whitelist name → status.
 func (m *Manager) AllWhitelistStatuses() map[string]JailStatus {
-m.mu.RLock()
-defer m.mu.RUnlock()
-out := make(map[string]JailStatus, len(m.whitelists))
-for name, jr := range m.whitelists {
-out[name] = jr.Status()
-}
-return out
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string]JailStatus, len(m.whitelists))
+	for name, jr := range m.whitelists {
+		out[name] = jr.Status()
+	}
+	return out
 }
 
 // StartWhitelist starts a specific whitelist by name.
 func (m *Manager) StartWhitelist(ctx context.Context, name string) error {
-m.mu.RLock()
-jr, ok := m.whitelists[name]
-m.mu.RUnlock()
-if !ok {
-return fmt.Errorf("whitelist %q not found", name)
-}
-return jr.Start(ctx)
+	m.mu.RLock()
+	jr, ok := m.whitelists[name]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("whitelist %q not found", name)
+	}
+	return jr.Start(ctx)
 }
 
 // StopWhitelist stops a specific whitelist by name.
 func (m *Manager) StopWhitelist(ctx context.Context, name string) error {
-m.mu.RLock()
-jr, ok := m.whitelists[name]
-m.mu.RUnlock()
-if !ok {
-return fmt.Errorf("whitelist %q not found", name)
-}
-return jr.Stop(ctx)
+	m.mu.RLock()
+	jr, ok := m.whitelists[name]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("whitelist %q not found", name)
+	}
+	return jr.Stop(ctx)
 }
 
 // RestartWhitelist reloads the config and restarts the named whitelist.
 func (m *Manager) RestartWhitelist(ctx context.Context, name string) error {
-newCfg, err := config.Load(m.configPath)
-if err != nil {
-return fmt.Errorf("reloading config: %w", err)
-}
+	newCfg, err := config.Load(m.configPath)
+	if err != nil {
+		return fmt.Errorf("reloading config: %w", err)
+	}
 
-newWlCfgs := make(map[string]*config.JailConfig, len(newCfg.Whitelists))
-for i := range newCfg.Whitelists {
-newWlCfgs[newCfg.Whitelists[i].Name] = &newCfg.Whitelists[i]
-}
+	newWlCfgs := make(map[string]*config.JailConfig, len(newCfg.Whitelists))
+	for i := range newCfg.Whitelists {
+		newWlCfgs[newCfg.Whitelists[i].Name] = &newCfg.Whitelists[i]
+	}
 
-m.mu.Lock()
+	m.mu.Lock()
 
-var toStop []*JailRuntime
-for wlName, jr := range m.whitelists {
-newWlCfg, exists := newWlCfgs[wlName]
-if !exists || !newWlCfg.Enabled {
-if jr.Status() == StatusStarted {
-toStop = append(toStop, jr)
-}
-delete(m.whitelists, wlName)
-} else {
-if err := jr.Reconfigure(newWlCfg); err != nil {
-m.mu.Unlock()
-return fmt.Errorf("reconfiguring whitelist %q: %w", wlName, err)
-}
-}
-}
+	var toStop []*JailRuntime
+	for wlName, jr := range m.whitelists {
+		newWlCfg, exists := newWlCfgs[wlName]
+		if !exists || !newWlCfg.Enabled {
+			if jr.Status() == StatusStarted {
+				toStop = append(toStop, jr)
+			}
+			delete(m.whitelists, wlName)
+		} else {
+			if err := jr.Reconfigure(newWlCfg); err != nil {
+				m.mu.Unlock()
+				return fmt.Errorf("reconfiguring whitelist %q: %w", wlName, err)
+			}
+		}
+	}
 
-var toStart []*JailRuntime
-for wlName, newWlCfg := range newWlCfgs {
-if _, exists := m.whitelists[wlName]; !exists {
-jr, err := NewJailRuntime(newWlCfg)
-if err != nil {
-m.mu.Unlock()
-return fmt.Errorf("creating whitelist runtime %q: %w", wlName, err)
-}
-m.whitelists[wlName] = jr
-if newWlCfg.Enabled && wlName != name {
-toStart = append(toStart, jr)
-}
-}
-}
+	var toStart []*JailRuntime
+	for wlName, newWlCfg := range newWlCfgs {
+		if _, exists := m.whitelists[wlName]; !exists {
+			jr, err := NewJailRuntime(newWlCfg)
+			if err != nil {
+				m.mu.Unlock()
+				return fmt.Errorf("creating whitelist runtime %q: %w", wlName, err)
+			}
+			m.whitelists[wlName] = jr
+			if newWlCfg.Enabled && wlName != name {
+				toStart = append(toStart, jr)
+			}
+		}
+	}
 
-targetJr, targetFound := m.whitelists[name]
-targetWasStarted := targetFound && targetJr.Status() == StatusStarted
+	targetJr, targetFound := m.whitelists[name]
+	targetWasStarted := targetFound && targetJr.Status() == StatusStarted
 
-m.cfg = newCfg
-m.injectIgnoreSets()
-specs := m.buildAllSpecs()
+	m.cfg = newCfg
+	m.injectIgnoreSets()
+	specs := m.buildAllSpecs()
 
-m.mu.Unlock()
+	m.mu.Unlock()
 
-for _, jr := range toStop {
-slog.Info("stopping removed/disabled whitelist", "whitelist", jr.cfg.Name)
-if stopErr := jr.Stop(ctx); stopErr != nil {
-slog.Warn("stopping whitelist", "whitelist", jr.cfg.Name, "error", stopErr)
-}
-}
+	for _, jr := range toStop {
+		slog.Info("stopping removed/disabled whitelist", "whitelist", jr.cfg.Name)
+		if stopErr := jr.Stop(ctx); stopErr != nil {
+			slog.Warn("stopping whitelist", "whitelist", jr.cfg.Name, "error", stopErr)
+		}
+	}
 
-for _, jr := range toStart {
-slog.Info("starting new whitelist", "whitelist", jr.cfg.Name)
-if startErr := jr.Start(ctx); startErr != nil {
-slog.Warn("starting new whitelist", "whitelist", jr.cfg.Name, "error", startErr)
-}
-}
+	for _, jr := range toStart {
+		slog.Info("starting new whitelist", "whitelist", jr.cfg.Name)
+		if startErr := jr.Start(ctx); startErr != nil {
+			slog.Warn("starting new whitelist", "whitelist", jr.cfg.Name, "error", startErr)
+		}
+	}
 
-m.backend.UpdateSpecs(specs)
+	m.backend.UpdateSpecs(specs)
 
-if !targetFound {
-return fmt.Errorf("whitelist %q not found", name)
-}
+	if !targetFound {
+		return fmt.Errorf("whitelist %q not found", name)
+	}
 
-if targetWasStarted {
-slog.Info("restarting whitelist", "whitelist", name)
-return targetJr.Restart(ctx)
-}
-slog.Info("starting whitelist", "whitelist", name)
-return targetJr.Start(ctx)
+	if targetWasStarted {
+		slog.Info("restarting whitelist", "whitelist", name)
+		return targetJr.Restart(ctx)
+	}
+	slog.Info("starting whitelist", "whitelist", name)
+	return targetJr.Start(ctx)
 }

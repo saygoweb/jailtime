@@ -99,7 +99,7 @@ type JailRuntime struct {
 	onRemoveTmpls []*template.Template
 	queryTmpl     *template.Template // nil if no query configured
 	// Whitelist membership state (only populated for watch_mode: static)
-	memberIPs  map[string]struct{}
+	memberIPs   map[string]struct{}
 	memberCIDRs []*net.IPNet
 	// ignoreSetsChecker is injected by Manager after all runtimes are created.
 	// When non-nil, a match on the checker suppresses on_add actions.

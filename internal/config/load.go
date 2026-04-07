@@ -215,4 +215,3 @@ func applyJailDefaults(jails []JailConfig) {
 		}
 	}
 }
-

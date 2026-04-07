@@ -16,10 +16,10 @@ func main() {
 	var socketPath string
 
 	root := &cobra.Command{
-		Use:          "jailtime",
-		Short:        "Control the jailtimed daemon",
-		Long:         "jailtime is the command-line client for the jailtimed intrusion-prevention daemon.\nIt communicates with jailtimed over a Unix domain socket.",
-		SilenceUsage: true,
+		Use:           "jailtime",
+		Short:         "Control the jailtimed daemon",
+		Long:          "jailtime is the command-line client for the jailtimed intrusion-prevention daemon.\nIt communicates with jailtimed over a Unix domain socket.",
+		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
 	root.PersistentFlags().StringVar(&socketPath, "socket", defaultSocket, "path to the jailtimed control socket")

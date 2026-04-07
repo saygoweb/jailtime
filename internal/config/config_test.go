@@ -343,32 +343,32 @@ func TestValidatePerfWindowLessThanOne(t *testing.T) {
 }
 
 func TestEngineConfigLogValue(t *testing.T) {
-cfg := EngineConfig{
-WatcherMode:  "fsnotify",
-PollInterval: Duration{Duration: 5 * time.Second},
-ReadFromEnd:  true,
-}
+	cfg := EngineConfig{
+		WatcherMode:  "fsnotify",
+		PollInterval: Duration{Duration: 5 * time.Second},
+		ReadFromEnd:  true,
+	}
 
-val := cfg.LogValue()
-if val.Kind() != slog.KindGroup {
-t.Fatalf("expected KindGroup, got %v", val.Kind())
-}
+	val := cfg.LogValue()
+	if val.Kind() != slog.KindGroup {
+		t.Fatalf("expected KindGroup, got %v", val.Kind())
+	}
 
-attrs := val.Group()
-m := make(map[string]slog.Value, len(attrs))
-for _, a := range attrs {
-m[a.Key] = a.Value
-}
+	attrs := val.Group()
+	m := make(map[string]slog.Value, len(attrs))
+	for _, a := range attrs {
+		m[a.Key] = a.Value
+	}
 
-if got := m["watcher_mode"].String(); got != "fsnotify" {
-t.Errorf("watcher_mode = %q, want %q", got, "fsnotify")
-}
-if got := m["poll_interval"].Duration(); got != 5*time.Second {
-t.Errorf("poll_interval = %v, want 5s", got)
-}
-if got := m["read_from_end"].Bool(); !got {
-t.Error("read_from_end should be true")
-}
+	if got := m["watcher_mode"].String(); got != "fsnotify" {
+		t.Errorf("watcher_mode = %q, want %q", got, "fsnotify")
+	}
+	if got := m["poll_interval"].Duration(); got != 5*time.Second {
+		t.Errorf("poll_interval = %v, want 5s", got)
+	}
+	if got := m["read_from_end"].Bool(); !got {
+		t.Error("read_from_end should be true")
+	}
 }
 
 // ---- New tests for whitelist/static/exclude features ----
@@ -410,7 +410,7 @@ jails:
 }
 
 func TestLoadStaticModeRejectsThresholdFields(t *testing.T) {
-y := `
+	y := `
 version: 1
 jails:
   - name: sshd
@@ -421,27 +421,27 @@ jails:
     watch_mode: static
     find_time: 10m
 `
-path := writeTemp(t, y)
-_, err := Load(path)
-if err == nil {
-t.Fatal("expected error for static jail with find_time, got nil")
-}
+	path := writeTemp(t, y)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for static jail with find_time, got nil")
+	}
 }
 
 func TestLoadOnMatchDeprecationMerge(t *testing.T) {
-// on_match should be merged into on_add by Load.
-path := writeTemp(t, minimalValidYAML)
-c, err := Load(path)
-if err != nil {
-t.Fatalf("Load() error: %v", err)
-}
-if len(c.Jails[0].Actions.OnAdd) == 0 {
-t.Error("on_match should have been merged into on_add")
-}
+	// on_match should be merged into on_add by Load.
+	path := writeTemp(t, minimalValidYAML)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Jails[0].Actions.OnAdd) == 0 {
+		t.Error("on_match should have been merged into on_add")
+	}
 }
 
 func TestLoadOnAddDirect(t *testing.T) {
-y := `
+	y := `
 version: 1
 jails:
   - name: sshd
@@ -458,33 +458,33 @@ jails:
     find_time: 10m
     jail_time: 1h
 `
-path := writeTemp(t, y)
-c, err := Load(path)
-if err != nil {
-t.Fatalf("Load() error: %v", err)
-}
-if len(c.Jails[0].Actions.OnAdd) != 1 {
-t.Errorf("OnAdd = %v, want 1 entry", c.Jails[0].Actions.OnAdd)
-}
-if len(c.Jails[0].Actions.OnRemove) != 1 {
-t.Errorf("OnRemove = %v, want 1 entry", c.Jails[0].Actions.OnRemove)
-}
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Jails[0].Actions.OnAdd) != 1 {
+		t.Errorf("OnAdd = %v, want 1 entry", c.Jails[0].Actions.OnAdd)
+	}
+	if len(c.Jails[0].Actions.OnRemove) != 1 {
+		t.Errorf("OnRemove = %v, want 1 entry", c.Jails[0].Actions.OnRemove)
+	}
 }
 
 func TestLoadExcludeFiles(t *testing.T) {
-y := minimalValidYAML + "    exclude_files:\n      - /var/log/exclude.log\n"
-path := writeTemp(t, y)
-c, err := Load(path)
-if err != nil {
-t.Fatalf("Load() error: %v", err)
-}
-if len(c.Jails[0].ExcludeFiles) != 1 || c.Jails[0].ExcludeFiles[0] != "/var/log/exclude.log" {
-t.Errorf("ExcludeFiles = %v, want [\"/var/log/exclude.log\"]", c.Jails[0].ExcludeFiles)
-}
+	y := minimalValidYAML + "    exclude_files:\n      - /var/log/exclude.log\n"
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Jails[0].ExcludeFiles) != 1 || c.Jails[0].ExcludeFiles[0] != "/var/log/exclude.log" {
+		t.Errorf("ExcludeFiles = %v, want [\"/var/log/exclude.log\"]", c.Jails[0].ExcludeFiles)
+	}
 }
 
 func TestLoadWhitelistsFromMain(t *testing.T) {
-y := minimalValidYAML + `
+	y := minimalValidYAML + `
 whitelists:
   - name: trusted-ips
     files:
@@ -493,26 +493,26 @@ whitelists:
       - '(?P<ip>[0-9.]+)'
     watch_mode: static
 `
-path := writeTemp(t, y)
-c, err := Load(path)
-if err != nil {
-t.Fatalf("Load() error: %v", err)
-}
-if len(c.Whitelists) != 1 {
-t.Fatalf("len(Whitelists) = %d, want 1", len(c.Whitelists))
-}
-if c.Whitelists[0].Name != "trusted-ips" {
-t.Errorf("Whitelist name = %q, want \"trusted-ips\"", c.Whitelists[0].Name)
-}
-if c.Whitelists[0].WatchMode != "static" {
-t.Errorf("Whitelist WatchMode = %q, want \"static\"", c.Whitelists[0].WatchMode)
-}
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Whitelists) != 1 {
+		t.Fatalf("len(Whitelists) = %d, want 1", len(c.Whitelists))
+	}
+	if c.Whitelists[0].Name != "trusted-ips" {
+		t.Errorf("Whitelist name = %q, want \"trusted-ips\"", c.Whitelists[0].Name)
+	}
+	if c.Whitelists[0].WatchMode != "static" {
+		t.Errorf("Whitelist WatchMode = %q, want \"static\"", c.Whitelists[0].WatchMode)
+	}
 }
 
 func TestLoadWhitelistsFromFragment(t *testing.T) {
-dir := t.TempDir()
+	dir := t.TempDir()
 
-fragYAML := `
+	fragYAML := `
 whitelists:
   - name: trusted-ips
     files:
@@ -521,28 +521,28 @@ whitelists:
       - '(?P<ip>[0-9.]+)'
     watch_mode: static
 `
-fragPath := dir + "/whitelists.yaml"
-if err := os.WriteFile(fragPath, []byte(fragYAML), 0o644); err != nil {
-t.Fatal(err)
-}
+	fragPath := dir + "/whitelists.yaml"
+	if err := os.WriteFile(fragPath, []byte(fragYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-mainYAML := minimalValidYAML + "include:\n  - " + dir + "/*.yaml\n"
-mainPath := dir + "/jail.yaml"
-if err := os.WriteFile(mainPath, []byte(mainYAML), 0o644); err != nil {
-t.Fatal(err)
-}
+	mainYAML := minimalValidYAML + "include:\n  - " + dir + "/*.yaml\n"
+	mainPath := dir + "/jail.yaml"
+	if err := os.WriteFile(mainPath, []byte(mainYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
-c, err := Load(mainPath)
-if err != nil {
-t.Fatalf("Load() error: %v", err)
-}
-if len(c.Whitelists) != 1 {
-t.Fatalf("len(Whitelists) = %d, want 1", len(c.Whitelists))
-}
+	c, err := Load(mainPath)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Whitelists) != 1 {
+		t.Fatalf("len(Whitelists) = %d, want 1", len(c.Whitelists))
+	}
 }
 
 func TestLoadJailWhitelistNameCollision(t *testing.T) {
-y := minimalValidYAML + `
+	y := minimalValidYAML + `
 whitelists:
   - name: sshd
     files:
@@ -551,20 +551,20 @@ whitelists:
       - '(?P<ip>[0-9.]+)'
     watch_mode: static
 `
-path := writeTemp(t, y)
-_, err := Load(path)
-if err == nil {
-t.Fatal("expected error for jail/whitelist name collision, got nil")
-}
+	path := writeTemp(t, y)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for jail/whitelist name collision, got nil")
+	}
 }
 
 func TestLoadWatchModeDefault(t *testing.T) {
-path := writeTemp(t, minimalValidYAML)
-c, err := Load(path)
-if err != nil {
-t.Fatalf("Load() error: %v", err)
-}
-if c.Jails[0].WatchMode != "tail" {
-t.Errorf("WatchMode default = %q, want \"tail\"", c.Jails[0].WatchMode)
-}
+	path := writeTemp(t, minimalValidYAML)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if c.Jails[0].WatchMode != "tail" {
+		t.Errorf("WatchMode default = %q, want \"tail\"", c.Jails[0].WatchMode)
+	}
 }

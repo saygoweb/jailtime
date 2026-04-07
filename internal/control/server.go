@@ -237,79 +237,79 @@ func (s *Server) handleJailConfig(w http.ResponseWriter, r *http.Request, name, 
 }
 
 func (s *Server) handleWhitelists(w http.ResponseWriter, r *http.Request) {
-slog.Info("control request", "method", r.Method, "path", r.URL.Path)
-if r.Method != http.MethodGet {
-writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
-return
-}
-statuses := s.controller.AllWhitelistStatuses()
-resp := ListWhitelistsResponse{Whitelists: make([]WhitelistStatusResponse, 0, len(statuses))}
-for name, status := range statuses {
-resp.Whitelists = append(resp.Whitelists, WhitelistStatusResponse{Name: name, Status: status})
-}
-writeJSON(w, http.StatusOK, resp)
+	slog.Info("control request", "method", r.Method, "path", r.URL.Path)
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+		return
+	}
+	statuses := s.controller.AllWhitelistStatuses()
+	resp := ListWhitelistsResponse{Whitelists: make([]WhitelistStatusResponse, 0, len(statuses))}
+	for name, status := range statuses {
+		resp.Whitelists = append(resp.Whitelists, WhitelistStatusResponse{Name: name, Status: status})
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleWhitelistAction handles /v1/whitelists/{name}/status|start|stop|restart
 func (s *Server) handleWhitelistAction(w http.ResponseWriter, r *http.Request) {
-slog.Info("control request", "method", r.Method, "path", r.URL.Path)
+	slog.Info("control request", "method", r.Method, "path", r.URL.Path)
 
-trimmed := strings.TrimPrefix(r.URL.Path, "/v1/whitelists/")
-parts := strings.SplitN(trimmed, "/", 3)
-if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
-writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "not found"})
-return
-}
-name := parts[0]
-action := parts[1]
+	trimmed := strings.TrimPrefix(r.URL.Path, "/v1/whitelists/")
+	parts := strings.SplitN(trimmed, "/", 3)
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "not found"})
+		return
+	}
+	name := parts[0]
+	action := parts[1]
 
-switch action {
-case "status":
-if r.Method != http.MethodGet {
-writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
-return
-}
-status, err := s.controller.WhitelistStatus(name)
-if err != nil {
-writeJSON(w, http.StatusNotFound, ErrorResponse{Error: err.Error()})
-return
-}
-writeJSON(w, http.StatusOK, WhitelistStatusResponse{Name: name, Status: status})
+	switch action {
+	case "status":
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+		status, err := s.controller.WhitelistStatus(name)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, ErrorResponse{Error: err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, WhitelistStatusResponse{Name: name, Status: status})
 
-case "start":
-if r.Method != http.MethodPost {
-writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
-return
-}
-if err := s.controller.StartWhitelist(r.Context(), name); err != nil {
-writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-return
-}
-writeJSON(w, http.StatusOK, HealthResponse{Status: "ok"})
+	case "start":
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+		if err := s.controller.StartWhitelist(r.Context(), name); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, HealthResponse{Status: "ok"})
 
-case "stop":
-if r.Method != http.MethodPost {
-writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
-return
-}
-if err := s.controller.StopWhitelist(r.Context(), name); err != nil {
-writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-return
-}
-writeJSON(w, http.StatusOK, HealthResponse{Status: "ok"})
+	case "stop":
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+		if err := s.controller.StopWhitelist(r.Context(), name); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, HealthResponse{Status: "ok"})
 
-case "restart":
-if r.Method != http.MethodPost {
-writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
-return
-}
-if err := s.controller.RestartWhitelist(r.Context(), name); err != nil {
-writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
-return
-}
-writeJSON(w, http.StatusOK, HealthResponse{Status: "ok"})
+	case "restart":
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+			return
+		}
+		if err := s.controller.RestartWhitelist(r.Context(), name); err != nil {
+			writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, HealthResponse{Status: "ok"})
 
-default:
-writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "not found"})
-}
+	default:
+		writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "not found"})
+	}
 }
