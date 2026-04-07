@@ -11,12 +11,11 @@ import (
 
 // rawEngineConfig is used during YAML parsing to detect unset booleans.
 type rawEngineConfig struct {
-	WatcherMode  string   `yaml:"watcher_mode"`
-	PollInterval Duration `yaml:"poll_interval"`
-	ReadFromEnd  *bool    `yaml:"read_from_end"`
-	MinLatency   Duration `yaml:"min_latency"`
-	MaxLatency   Duration `yaml:"max_latency"`
-	PerfWindow   *int     `yaml:"perf_window"`
+	WatcherMode   string   `yaml:"watcher_mode"`
+	PollInterval  Duration `yaml:"poll_interval"`
+	ReadFromEnd   *bool    `yaml:"read_from_end"`
+	TargetLatency Duration `yaml:"target_latency"`
+	PerfWindow    *int     `yaml:"perf_window"`
 }
 
 // rawJailConfig mirrors JailConfig with pointer booleans to detect unset fields.
@@ -94,10 +93,9 @@ func Load(path string) (*Config, error) {
 		Logging: raw.Logging,
 		Control: raw.Control,
 		Engine: EngineConfig{
-			WatcherMode:  raw.Engine.WatcherMode,
-			PollInterval: raw.Engine.PollInterval,
-			MinLatency:   raw.Engine.MinLatency,
-			MaxLatency:   raw.Engine.MaxLatency,
+			WatcherMode:   raw.Engine.WatcherMode,
+			PollInterval:  raw.Engine.PollInterval,
+			TargetLatency: raw.Engine.TargetLatency,
 		},
 	}
 
@@ -165,11 +163,8 @@ func applyDefaults(c *Config, readFromEnd *bool, perfWindow *int) {
 	} else {
 		c.Engine.ReadFromEnd = *readFromEnd
 	}
-	if c.Engine.MinLatency.Duration == 0 {
-		c.Engine.MinLatency.Duration = defaultMinLatency
-	}
-	if c.Engine.MaxLatency.Duration == 0 {
-		c.Engine.MaxLatency.Duration = defaultMaxLatency
+	if c.Engine.TargetLatency.Duration == 0 {
+		c.Engine.TargetLatency.Duration = defaultTargetLatency
 	}
 	if perfWindow == nil {
 		c.Engine.PerfWindow = defaultPerfWindow

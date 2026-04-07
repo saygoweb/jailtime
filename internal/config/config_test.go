@@ -305,11 +305,8 @@ func TestLoadEngineLatencyPerfWindowDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
-	if c.Engine.MinLatency.Duration != defaultMinLatency {
-		t.Errorf("MinLatency = %v, want %v", c.Engine.MinLatency.Duration, defaultMinLatency)
-	}
-	if c.Engine.MaxLatency.Duration != defaultMaxLatency {
-		t.Errorf("MaxLatency = %v, want %v", c.Engine.MaxLatency.Duration, defaultMaxLatency)
+	if c.Engine.TargetLatency.Duration != defaultTargetLatency {
+		t.Errorf("TargetLatency = %v, want %v", c.Engine.TargetLatency.Duration, defaultTargetLatency)
 	}
 	if c.Engine.PerfWindow != defaultPerfWindow {
 		t.Errorf("PerfWindow = %d, want %d", c.Engine.PerfWindow, defaultPerfWindow)
@@ -318,8 +315,7 @@ func TestLoadEngineLatencyPerfWindowDefaults(t *testing.T) {
 
 func TestLoadEngineLatencyPerfWindowExplicit(t *testing.T) {
 	y := minimalValidYAML + `engine:
-  min_latency: 500ms
-  max_latency: 30s
+  target_latency: 500ms
   perf_window: 5
 `
 	path := writeTemp(t, y)
@@ -327,26 +323,11 @@ func TestLoadEngineLatencyPerfWindowExplicit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error: %v", err)
 	}
-	if c.Engine.MinLatency.Duration != 500*time.Millisecond {
-		t.Errorf("MinLatency = %v, want 500ms", c.Engine.MinLatency.Duration)
-	}
-	if c.Engine.MaxLatency.Duration != 30*time.Second {
-		t.Errorf("MaxLatency = %v, want 30s", c.Engine.MaxLatency.Duration)
+	if c.Engine.TargetLatency.Duration != 500*time.Millisecond {
+		t.Errorf("TargetLatency = %v, want 500ms", c.Engine.TargetLatency.Duration)
 	}
 	if c.Engine.PerfWindow != 5 {
 		t.Errorf("PerfWindow = %d, want 5", c.Engine.PerfWindow)
-	}
-}
-
-func TestValidateMaxLatencyLessThanMinLatency(t *testing.T) {
-	y := minimalValidYAML + `engine:
-  min_latency: 10s
-  max_latency: 1s
-`
-	path := writeTemp(t, y)
-	_, err := Load(path)
-	if err == nil {
-		t.Fatal("expected error for max_latency < min_latency, got nil")
 	}
 }
 

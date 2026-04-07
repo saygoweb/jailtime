@@ -185,7 +185,7 @@ matched. No hit counts are modified and no actions are executed.`,
 			}
 			fmt.Printf("Performance Metrics (window=%d):\n", resp.WindowSize)
 			fmt.Printf("  Current latency:     %.0fms\n", resp.CurrentLatencyMs)
-			fmt.Printf("  Current delay:       %.0fms\n", resp.CurrentDelayMs)
+			fmt.Printf("  Current interval:    %.0fms\n", resp.CurrentIntervalMs)
 			fmt.Printf("  Avg execution time:  %.1fms\n", resp.AvgExecTimeMs)
 			fmt.Printf("  Avg CPU usage:       %.1f%%\n", resp.AvgCPUPercent)
 			return nil

@@ -9,17 +9,14 @@ func TestPerfMetrics_SnapshotAverages(t *testing.T) {
 	p := NewPerfMetrics(5, "nonexistent-service-for-test.service")
 
 	execTimes := []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 30 * time.Millisecond}
-	latencies := []time.Duration{5 * time.Millisecond, 15 * time.Millisecond}
 
-	// Push exec times with latency
+	// Push exec times; first two with batchSize=1 (records latency/CPU), third is idle.
 	for i, et := range execTimes {
-		lat := time.Duration(0)
 		bs := 0
-		if i < len(latencies) {
-			lat = latencies[i]
+		if i < 2 {
 			bs = 1
 		}
-		p.RecordExecution(et, lat, bs, 100*time.Millisecond)
+		p.RecordExecution(et, 100*time.Millisecond, bs)
 	}
 
 	snap := p.Snapshot()
@@ -29,14 +26,9 @@ func TestPerfMetrics_SnapshotAverages(t *testing.T) {
 		t.Errorf("AvgExecTimeMs = %v, want %v", snap.AvgExecTimeMs, wantAvgExec)
 	}
 
-	wantCurrent := 15.0 // currentLatency is updated only when batchSize > 0; the last such call used latencies[1] = 15ms.
-	if snap.CurrentLatencyMs != wantCurrent {
-		t.Errorf("CurrentLatencyMs = %v, want %v", snap.CurrentLatencyMs, wantCurrent)
-	}
-
-	wantDelay := 100.0
-	if snap.CurrentDelayMs != wantDelay {
-		t.Errorf("CurrentDelayMs = %v, want %v", snap.CurrentDelayMs, wantDelay)
+	wantInterval := 100.0
+	if snap.CurrentIntervalMs != wantInterval {
+		t.Errorf("CurrentIntervalMs = %v, want %v", snap.CurrentIntervalMs, wantInterval)
 	}
 
 	if snap.WindowSize != 5 {
@@ -51,7 +43,7 @@ func TestPerfMetrics_CircularBufferWrapping(t *testing.T) {
 	// Push windowSize+2 items: 10, 20, 30, 40, 50 ms
 	values := []time.Duration{10, 20, 30, 40, 50}
 	for _, v := range values {
-		p.RecordExecution(v*time.Millisecond, 0, 0, 0)
+		p.RecordExecution(v*time.Millisecond, 0, 0)
 	}
 
 	// After wrapping with windowSize=3 and 5 items:
@@ -69,8 +61,8 @@ func TestPerfMetrics_CircularBufferWrapping(t *testing.T) {
 func TestPerfMetrics_BatchSizeZeroSkipsLatency(t *testing.T) {
 	p := NewPerfMetrics(5, "nonexistent-service-for-test.service")
 
-	// Call with batchSize=0 — latency should not be recorded
-	p.RecordExecution(5*time.Millisecond, 999*time.Millisecond, 0, 50*time.Millisecond)
+	// Call with batchSize=0 — latency and CPU should not be recorded
+	p.RecordExecution(5*time.Millisecond, 50*time.Millisecond, 0)
 
 	snap := p.Snapshot()
 
@@ -96,7 +88,7 @@ func TestPerfMetrics_BatchSizeZeroSkipsLatency(t *testing.T) {
 func TestPerfMetrics_UnavailableCgroupNoPanic(t *testing.T) {
 	// Must not panic even when cgroup path doesn't exist
 	p := NewPerfMetrics(10, "no-such-service-xyz-123.service")
-	p.RecordExecution(1*time.Millisecond, 2*time.Millisecond, 1, 10*time.Millisecond)
+	p.RecordExecution(1*time.Millisecond, 10*time.Millisecond, 1)
 	snap := p.Snapshot()
 	if snap.WindowSize != 10 {
 		t.Errorf("WindowSize = %v, want 10", snap.WindowSize)

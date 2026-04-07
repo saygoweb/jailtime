@@ -1,11 +1,11 @@
 package engine
 
 import (
-	"bufio"
+	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -14,6 +14,8 @@ import (
 // via the existing cpuSampler.
 type cgroupCPUSampler struct {
 	cgroupPath string
+	file       *os.File  // kept open; nil if unavailable
+	buf        [512]byte // pre-allocated read buffer
 	lastUsage  int64     // microseconds (usage_usec)
 	lastTime   time.Time
 	useCgroup  bool
@@ -29,35 +31,46 @@ func newCgroupCPUSampler(serviceName string) *cgroupCPUSampler {
 	path := fmt.Sprintf("/sys/fs/cgroup/system.slice/%s/cpu.stat", serviceName)
 	s := &cgroupCPUSampler{cgroupPath: path}
 
-	// Prime: test if cgroup path is readable.
-	if usage, err := s.readUsageUsec(); err == nil {
-		s.useCgroup = true
-		s.lastUsage = usage
-		s.lastTime = time.Now()
+	f, err := os.Open(path)
+	if err == nil {
+		s.file = f
+		if usage, err := s.readUsageUsec(); err == nil {
+			s.useCgroup = true
+			s.lastUsage = usage
+			s.lastTime = time.Now()
+		} else {
+			f.Close()
+			s.file = nil
+			s.fallback = newCPUSampler()
+		}
 	} else {
-		s.useCgroup = false
-		s.fallback = newCPUSampler() // existing Go runtime sampler
+		s.fallback = newCPUSampler()
 	}
 	return s
 }
 
-// readUsageUsec reads the usage_usec field from the cgroup cpu.stat file.
+// readUsageUsec reads the usage_usec field from the cgroup cpu.stat file
+// using seek + read + manual parse — no Scanner, no allocation per call.
 func (s *cgroupCPUSampler) readUsageUsec() (int64, error) {
-	f, err := os.Open(s.cgroupPath)
-	if err != nil {
+	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
 		return 0, err
 	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "usage_usec ") {
-			val, err := strconv.ParseInt(strings.TrimPrefix(line, "usage_usec "), 10, 64)
-			return val, err
-		}
+	n, err := s.file.Read(s.buf[:])
+	if err != nil && err != io.EOF {
+		return 0, err
 	}
-	return 0, fmt.Errorf("usage_usec not found in %s", s.cgroupPath)
+	data := s.buf[:n]
+	const prefix = "usage_usec "
+	idx := bytes.Index(data, []byte(prefix))
+	if idx < 0 {
+		return 0, fmt.Errorf("usage_usec not found")
+	}
+	start := idx + len(prefix)
+	end := start
+	for end < len(data) && data[end] >= '0' && data[end] <= '9' {
+		end++
+	}
+	return strconv.ParseInt(string(data[start:end]), 10, 64)
 }
 
 // Sample returns CPU usage as a percentage since the last call.
@@ -85,4 +98,12 @@ func (s *cgroupCPUSampler) Sample() float64 {
 	s.lastUsage = usage
 	s.lastTime = now
 	return pct
+}
+
+// Close closes the underlying cgroup file descriptor if one is held open.
+func (s *cgroupCPUSampler) Close() error {
+	if s.file != nil {
+		return s.file.Close()
+	}
+	return nil
 }

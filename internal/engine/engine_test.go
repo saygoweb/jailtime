@@ -746,3 +746,68 @@ t.Errorf("expected IP %s in output, but it was missing:\n%s", ip, got)
 }
 }
 }
+
+// TestActionRunnerDrop verifies that a second Submit for the same IP while the
+// first is still in flight returns false (duplicate dropped) and the fn runs
+// exactly once.
+func TestActionRunnerDrop(t *testing.T) {
+var r ActionRunner
+
+ran := make(chan struct{}, 2)
+done := make(chan struct{})
+
+// First submit: slow fn that blocks until we close done.
+if !r.Submit("1.2.3.4", func() {
+ran <- struct{}{}
+<-done
+}) {
+t.Fatal("first Submit should return true")
+}
+
+// Wait until fn has started (to ensure inflight entry is set).
+select {
+case <-ran:
+case <-time.After(time.Second):
+t.Fatal("first fn did not start within 1s")
+}
+
+// Second submit while first is still in flight — must be dropped.
+if r.Submit("1.2.3.4", func() {
+ran <- struct{}{}
+}) {
+t.Fatal("second Submit should return false (duplicate in flight)")
+}
+
+close(done) // unblock first fn
+r.Wait()
+
+// Only one execution should have happened (ran has one buffered item already read).
+select {
+case <-ran:
+t.Fatal("expected no more items in ran channel — fn ran more than once")
+default:
+}
+}
+
+// TestActionRunnerSequential verifies that after the first Submit completes,
+// the same IP can be submitted again and the fn runs a second time.
+func TestActionRunnerSequential(t *testing.T) {
+var r ActionRunner
+
+count := 0
+fn := func() { count++ }
+
+if !r.Submit("1.2.3.4", fn) {
+t.Fatal("first Submit should return true")
+}
+r.Wait()
+
+if !r.Submit("1.2.3.4", fn) {
+t.Fatal("second Submit (after first completed) should return true")
+}
+r.Wait()
+
+if count != 2 {
+t.Fatalf("expected fn to run 2 times, got %d", count)
+}
+}

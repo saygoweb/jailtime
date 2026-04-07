@@ -33,12 +33,17 @@ type WatchSpec struct {
 	ReadFromEnd bool
 }
 
+// DrainFunc is called synchronously by the backend during each drain cycle.
+// lines contains all new RawLines from dirty files since the last drain.
+// It runs in the backend goroutine — implementations must not block.
+type DrainFunc func(ctx context.Context, lines []RawLine)
+
 // Backend is the abstraction for file watching implementations.
 type Backend interface {
 	Name() string
 	// Start begins watching. It blocks until ctx is cancelled or an error occurs.
-	// It emits RawLine values (one per file-line, with all interested jails) to out.
-	Start(ctx context.Context, specs []WatchSpec, out chan<- RawLine) error
+	// It calls drain synchronously with batches of new lines.
+	Start(ctx context.Context, specs []WatchSpec, drain DrainFunc) error
 	// UpdateSpecs replaces the set of watch specs. New jails are picked up on
 	// the next rescan/poll cycle; removed jails stop generating events.
 	UpdateSpecs(specs []WatchSpec)
@@ -83,15 +88,15 @@ func (r *debugRateLimiter) Allow() bool {
 // The selected backend is logged at Info level. For fsnotify/inotify modes,
 // the actual backend in use (fsnotify vs poll fallback) is also logged when
 // Start() is called.
-func NewAuto(mode string, pollInterval time.Duration) Backend {
+func NewAuto(mode string, interval time.Duration) Backend {
 	switch mode {
 	case "poll":
 		slog.Info("watch backend selected", "requested_mode", mode, "backend", "poll")
-		return NewPollBackend(pollInterval)
+		return NewPollBackend(interval)
 	default: // "auto", "fsnotify", "inotify", "os"
 		// "inotify" and "os" are aliases for the fsnotify backend, which uses
 		// the kernel inotify API on Linux.
 		slog.Info("watch backend selected", "requested_mode", mode, "backend", "fsnotify")
-		return NewFsnotifyBackend(pollInterval)
+		return NewFsnotifyBackend(interval)
 	}
 }

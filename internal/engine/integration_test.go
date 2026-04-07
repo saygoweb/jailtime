@@ -68,20 +68,11 @@ func startIntegrationPipeline(t *testing.T, jr *JailRuntime, logGlob string) con
 		ReadFromEnd: false,
 	}}
 
-	events := make(chan watch.RawLine, 64)
 	ctx, cancel := context.WithCancel(context.Background())
 
-	go func() { _ = b.Start(ctx, specs, events) }()
-
 	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case rawLine, ok := <-events:
-				if !ok {
-					return
-				}
+		_ = b.Start(ctx, specs, func(_ context.Context, lines []watch.RawLine) {
+			for _, rawLine := range lines {
 				for _, jailName := range rawLine.Jails {
 					evt := watch.Event{
 						JailName: jailName,
@@ -92,7 +83,7 @@ func startIntegrationPipeline(t *testing.T, jr *JailRuntime, logGlob string) con
 					_ = jr.HandleEvent(ctx, evt)
 				}
 			}
-		}
+		})
 	}()
 
 	// Allow the backend to reach its first poll cycle before the caller writes.
@@ -274,11 +265,10 @@ func TestManagerRunRoutesEvents(t *testing.T) {
 			*newApacheWPJailConfig(logFile, outFile, 1),
 		},
 		Engine: config.EngineConfig{
-			PollInterval: config.Duration{Duration: 50 * time.Millisecond},
-			MinLatency:   config.Duration{Duration: 100 * time.Millisecond},
-			MaxLatency:   config.Duration{Duration: 500 * time.Millisecond},
-			PerfWindow:   3,
-			ReadFromEnd:  false,
+			PollInterval:  config.Duration{Duration: 50 * time.Millisecond},
+			TargetLatency: config.Duration{Duration: 100 * time.Millisecond},
+			PerfWindow:    3,
+			ReadFromEnd:   false,
 		},
 	}
 

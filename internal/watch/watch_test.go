@@ -1,20 +1,124 @@
 package watch
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
-	"context"
 )
 
-func startBackend(t *testing.T, b Backend, specs []WatchSpec) (chan RawLine, context.CancelFunc) {
+// TestFileTailerNoSeekBetweenReads verifies that ReadLines works across
+// multiple calls without any seek/reset — the bufio reader retains state.
+func TestFileTailerNoSeekBetweenReads(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "tailer.log")
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(f, "line one")
+	fmt.Fprintln(f, "line two")
+	fmt.Fprintln(f, "line three")
+	f.Close()
+
+	ft, err := NewFileTailer(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ft.Close()
+
+	lines, err := ft.ReadLines()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("first ReadLines: want 3 lines, got %d: %v", len(lines), lines)
+	}
+	for i, want := range []string{"line one", "line two", "line three"} {
+		if lines[i] != want {
+			t.Errorf("line[%d]: want %q, got %q", i, want, lines[i])
+		}
+	}
+
+	// Append more lines and read again — no seek should be needed.
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(af, "line four")
+	fmt.Fprintln(af, "line five")
+	af.Close()
+
+	lines2, err := ft.ReadLines()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines2) != 2 {
+		t.Fatalf("second ReadLines: want 2 lines, got %d: %v", len(lines2), lines2)
+	}
+	for i, want := range []string{"line four", "line five"} {
+		if lines2[i] != want {
+			t.Errorf("second read line[%d]: want %q, got %q", i, want, lines2[i])
+		}
+	}
+}
+
+// TestFileTailerReopen verifies that after Reopen(false) the tailer reads
+// from the beginning of the file.
+func TestFileTailerReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "reopen.log")
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(f, "original line")
+	f.Close()
+
+	ft, err := NewFileTailer(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ft.Close()
+
+	// Read original content.
+	lines, err := ft.ReadLines()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 1 || lines[0] != "original line" {
+		t.Fatalf("initial read: want [\"original line\"], got %v", lines)
+	}
+
+	// Reopen from start.
+	if err := ft.Reopen(false); err != nil {
+		t.Fatalf("Reopen: %v", err)
+	}
+
+	// Should read from the beginning again.
+	lines2, err := ft.ReadLines()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lines2) != 1 || lines2[0] != "original line" {
+		t.Fatalf("after Reopen: want [\"original line\"], got %v", lines2)
+	}
+}
+
+func startBackendDrain(t *testing.T, b Backend, specs []WatchSpec) (chan RawLine, context.CancelFunc) {
 	t.Helper()
-	out := make(chan RawLine, 16)
+	out := make(chan RawLine, 64)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		_ = b.Start(ctx, specs, out)
+		_ = b.Start(ctx, specs, func(_ context.Context, lines []RawLine) {
+			for _, l := range lines {
+				out <- l
+			}
+		})
 	}()
 	return out, cancel
 }
@@ -51,7 +155,7 @@ func TestPollBackendBasic(t *testing.T) {
 
 	b := NewPollBackend(100 * time.Millisecond)
 	specs := []WatchSpec{{JailName: "jail1", Globs: []string{path}, ReadFromEnd: false}}
-	out, cancel := startBackend(t, b, specs)
+	out, cancel := startBackendDrain(t, b, specs)
 	defer cancel()
 
 	// Give the backend a moment to initialize.
@@ -87,7 +191,7 @@ func TestPollBackendNewFile(t *testing.T) {
 
 	b := NewPollBackend(100 * time.Millisecond)
 	specs := []WatchSpec{{JailName: "jail2", Globs: []string{pattern}, ReadFromEnd: true}}
-	out, cancel := startBackend(t, b, specs)
+	out, cancel := startBackendDrain(t, b, specs)
 	defer cancel()
 
 	time.Sleep(150 * time.Millisecond)
@@ -129,7 +233,7 @@ func TestPollBackendRotation(t *testing.T) {
 
 	b := NewPollBackend(100 * time.Millisecond)
 	specs := []WatchSpec{{JailName: "jail3", Globs: []string{path}, ReadFromEnd: false}}
-	out, cancel := startBackend(t, b, specs)
+	out, cancel := startBackendDrain(t, b, specs)
 	defer cancel()
 
 	// Drain the old line event.
@@ -174,7 +278,7 @@ func TestPollBackendSubdirGlob(t *testing.T) {
 
 	b := NewPollBackend(100 * time.Millisecond)
 	specs := []WatchSpec{{JailName: "apache", Globs: []string{pattern}, ReadFromEnd: true}}
-	out, cancel := startBackend(t, b, specs)
+	out, cancel := startBackendDrain(t, b, specs)
 	defer cancel()
 
 	// Let the backend complete at least one poll cycle before creating anything.
@@ -219,7 +323,7 @@ func TestPollBackendSubdirGlobMultiple(t *testing.T) {
 
 	b := NewPollBackend(100 * time.Millisecond)
 	specs := []WatchSpec{{JailName: "apache2", Globs: []string{pattern}, ReadFromEnd: true}}
-	out, cancel := startBackend(t, b, specs)
+	out, cancel := startBackendDrain(t, b, specs)
 	defer cancel()
 
 	time.Sleep(150 * time.Millisecond)
@@ -264,7 +368,7 @@ func TestFsnotifyBackendSubdirGlob(t *testing.T) {
 
 	b := NewFsnotifyBackend(100 * time.Millisecond)
 	specs := []WatchSpec{{JailName: "apache", Globs: []string{pattern}, ReadFromEnd: true}}
-	out, cancel := startBackend(t, b, specs)
+	out, cancel := startBackendDrain(t, b, specs)
 	defer cancel()
 
 	time.Sleep(150 * time.Millisecond)
@@ -311,7 +415,7 @@ func TestFsnotifyBackendBasic(t *testing.T) {
 
 	b := NewFsnotifyBackend(100 * time.Millisecond)
 	specs := []WatchSpec{{JailName: "jail4", Globs: []string{path}, ReadFromEnd: false}}
-	out, cancel := startBackend(t, b, specs)
+	out, cancel := startBackendDrain(t, b, specs)
 	defer cancel()
 
 	time.Sleep(150 * time.Millisecond)
@@ -352,7 +456,7 @@ f.Close()
 
 b := NewAuto("inotify", 100*time.Millisecond)
 specs := []WatchSpec{{JailName: "jail-inotify", Globs: []string{path}, ReadFromEnd: false}}
-out, cancel := startBackend(t, b, specs)
+out, cancel := startBackendDrain(t, b, specs)
 defer cancel()
 
 time.Sleep(150 * time.Millisecond)
@@ -393,7 +497,7 @@ f.Close()
 
 b := NewAuto("os", 100*time.Millisecond)
 specs := []WatchSpec{{JailName: "jail-os", Globs: []string{path}, ReadFromEnd: false}}
-out, cancel := startBackend(t, b, specs)
+out, cancel := startBackendDrain(t, b, specs)
 defer cancel()
 
 time.Sleep(150 * time.Millisecond)
@@ -437,7 +541,7 @@ func TestPollBackendSharedFile(t *testing.T) {
 		{JailName: "jail-a", Globs: []string{path}, ReadFromEnd: false},
 		{JailName: "jail-b", Globs: []string{path}, ReadFromEnd: false},
 	}
-	out, cancel := startBackend(t, b, specs)
+	out, cancel := startBackendDrain(t, b, specs)
 	defer cancel()
 
 	time.Sleep(150 * time.Millisecond)
@@ -481,7 +585,7 @@ func TestFsnotifyBackendSharedFile(t *testing.T) {
 		{JailName: "jail-c", Globs: []string{path}, ReadFromEnd: false},
 		{JailName: "jail-d", Globs: []string{path}, ReadFromEnd: false},
 	}
-	out, cancel := startBackend(t, b, specs)
+	out, cancel := startBackendDrain(t, b, specs)
 	defer cancel()
 
 	time.Sleep(150 * time.Millisecond)
@@ -524,7 +628,7 @@ func TestFsnotifyBackendCoalescing(t *testing.T) {
 
 	b := NewFsnotifyBackend(500 * time.Millisecond) // rescan interval; batch is 50ms
 	specs := []WatchSpec{{JailName: "jail-coalesce", Globs: []string{path}, ReadFromEnd: false}}
-	out, cancel := startBackend(t, b, specs)
+	out, cancel := startBackendDrain(t, b, specs)
 	defer cancel()
 
 	time.Sleep(150 * time.Millisecond)
@@ -592,4 +696,56 @@ t.Fatal("2nd call after window reset should be allowed")
 if rl.Allow() {
 t.Fatal("3rd call after window reset should be denied")
 }
+}
+
+// TestFsnotifyBackendIdleNoDrain verifies that when no writes occur the drain
+// callback is never invoked, i.e., the backend is truly idle with no wakeups.
+func TestFsnotifyBackendIdleNoDrain(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "idle.log")
+f, err := os.Create(path)
+if err != nil {
+t.Fatal(err)
+}
+f.Close()
+
+const drainInterval = 50 * time.Millisecond
+drainCount := 0
+ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
+
+b := NewFsnotifyBackend(drainInterval)
+specs := []WatchSpec{{JailName: "idle-jail", Globs: []string{path}, ReadFromEnd: true}}
+go func() {
+_ = b.Start(ctx, specs, func(_ context.Context, lines []RawLine) {
+drainCount += len(lines)
+})
+}()
+
+// Wait 4× drainInterval with no writes — drain should NOT be called.
+time.Sleep(4 * drainInterval)
+if drainCount != 0 {
+t.Errorf("expected 0 drain calls while idle, got drain count %d", drainCount)
+}
+
+// Now write a line — it should arrive.
+af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+if err != nil {
+t.Fatal(err)
+}
+fmt.Fprintln(af, "after idle")
+af.Close()
+
+deadline := time.After(2 * time.Second)
+for {
+select {
+case <-time.After(10 * time.Millisecond):
+if drainCount > 0 {
+goto done
+}
+case <-deadline:
+t.Fatal("timed out waiting for line after idle period")
+}
+}
+done:
 }

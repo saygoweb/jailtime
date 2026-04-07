@@ -7,11 +7,11 @@ import (
 
 // PerfSnapshot is a point-in-time view of performance metrics.
 type PerfSnapshot struct {
-	CurrentLatencyMs float64 `json:"current_latency_ms"`
-	CurrentDelayMs   float64 `json:"current_delay_ms"`
-	AvgExecTimeMs    float64 `json:"avg_exec_time_ms"`
-	AvgCPUPercent    float64 `json:"avg_cpu_percent"`
-	WindowSize       int     `json:"window_size"`
+	CurrentLatencyMs  float64 `json:"current_latency_ms"`
+	CurrentIntervalMs float64 `json:"current_interval_ms"`
+	AvgExecTimeMs     float64 `json:"avg_exec_time_ms"`
+	AvgCPUPercent     float64 `json:"avg_cpu_percent"`
+	WindowSize        int     `json:"window_size"`
 }
 
 // PerfMetrics collects performance metrics in circular buffers.
@@ -32,8 +32,8 @@ type PerfMetrics struct {
 	cpuIdx     int
 	cpuCount   int
 
-	currentDelay   time.Duration
-	currentLatency time.Duration
+	currentInterval time.Duration
+	currentLatency  time.Duration
 
 	cpuSampler *cgroupCPUSampler
 }
@@ -52,17 +52,12 @@ func NewPerfMetrics(windowSize int, serviceName string) *PerfMetrics {
 }
 
 // RecordExecution is called after each batch drain.
-// batchSize 0 means the queue was empty; latency is not recorded in that case.
-func (p *PerfMetrics) RecordExecution(execTime, measuredLatency time.Duration, batchSize int, currentDelay time.Duration) {
-	cpuPct := p.cpuSampler.Sample()
-
+// batchSize 0 means no lines were processed; CPU is not sampled in that case.
+func (p *PerfMetrics) RecordExecution(execTime, currentInterval time.Duration, batchSize int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.currentDelay = currentDelay
-	if batchSize > 0 {
-		p.currentLatency = measuredLatency
-	}
+	p.currentInterval = currentInterval
 
 	// Push exec time
 	p.execTimes[p.execIdx%p.windowSize] = execTime
@@ -71,21 +66,29 @@ func (p *PerfMetrics) RecordExecution(execTime, measuredLatency time.Duration, b
 		p.execCount++
 	}
 
-	// Push latency (only when batch had items)
 	if batchSize > 0 {
-		p.latencies[p.latencyIdx%p.windowSize] = measuredLatency
+		p.currentLatency = execTime
+
+		// Push latency
+		p.latencies[p.latencyIdx%p.windowSize] = execTime
 		p.latencyIdx++
 		if p.latencyCount < p.windowSize {
 			p.latencyCount++
 		}
-	}
 
-	// Push CPU
-	p.cpuSamples[p.cpuIdx%p.windowSize] = cpuPct
-	p.cpuIdx++
-	if p.cpuCount < p.windowSize {
-		p.cpuCount++
+		// Push CPU — only sample when there was actual work to do.
+		cpuPct := p.cpuSampler.Sample()
+		p.cpuSamples[p.cpuIdx%p.windowSize] = cpuPct
+		p.cpuIdx++
+		if p.cpuCount < p.windowSize {
+			p.cpuCount++
+		}
 	}
+}
+
+// Close releases resources held by the PerfMetrics (e.g. the open cgroup fd).
+func (p *PerfMetrics) Close() {
+	_ = p.cpuSampler.Close()
 }
 
 // Snapshot returns a point-in-time view of performance metrics.
@@ -94,11 +97,11 @@ func (p *PerfMetrics) Snapshot() PerfSnapshot {
 	defer p.mu.RUnlock()
 
 	return PerfSnapshot{
-		CurrentLatencyMs: float64(p.currentLatency.Microseconds()) / 1000.0,
-		CurrentDelayMs:   float64(p.currentDelay.Microseconds()) / 1000.0,
-		AvgExecTimeMs:    avgDurationMs(p.execTimes, p.execCount),
-		AvgCPUPercent:    avgFloat(p.cpuSamples, p.cpuCount),
-		WindowSize:       p.windowSize,
+		CurrentLatencyMs:  float64(p.currentLatency.Microseconds()) / 1000.0,
+		CurrentIntervalMs: float64(p.currentInterval.Microseconds()) / 1000.0,
+		AvgExecTimeMs:     avgDurationMs(p.execTimes, p.execCount),
+		AvgCPUPercent:     avgFloat(p.cpuSamples, p.cpuCount),
+		WindowSize:        p.windowSize,
 	}
 }
 

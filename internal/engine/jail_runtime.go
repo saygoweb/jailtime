@@ -57,6 +57,33 @@ func (r *debugRateLimiter) Allow() bool {
 	return false
 }
 
+// ActionRunner manages non-blocking, deduplicated execution of on_match actions.
+// At most one action per IP is in flight at any time; duplicate submits are dropped.
+type ActionRunner struct {
+	inflight sync.Map
+	wg       sync.WaitGroup
+}
+
+// Submit runs fn in a goroutine for the given ip. Returns false if an action
+// for this ip is already in flight (duplicate dropped).
+func (r *ActionRunner) Submit(ip string, fn func()) bool {
+	if _, exists := r.inflight.LoadOrStore(ip, struct{}{}); exists {
+		return false
+	}
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		defer r.inflight.Delete(ip)
+		fn()
+	}()
+	return true
+}
+
+// Wait blocks until all in-flight actions complete.
+func (r *ActionRunner) Wait() {
+	r.wg.Wait()
+}
+
 // JailRuntime manages the lifecycle of a single jail.
 type JailRuntime struct {
 	cfg      *config.JailConfig
@@ -66,11 +93,7 @@ type JailRuntime struct {
 	mu       sync.RWMutex
 	status   JailStatus
 	debugLog *debugRateLimiter
-	// inflight tracks IPs that currently have an on_match action running.
-	// Only one on_match execution per IP is allowed at a time; concurrent
-	// threshold triggers for an in-flight IP are silently skipped.
-	inflight   sync.Map
-	inflightWg sync.WaitGroup // counts all in-flight on_match goroutines
+	runner   ActionRunner
 	// Pre-compiled action templates (populated by compileTemplates)
 	onMatchTmpls []*template.Template
 	queryTmpl    *template.Template // nil if no query configured
@@ -192,7 +215,7 @@ func (jr *JailRuntime) Stop(ctx context.Context) error {
 // WaitForInflight blocks until all in-flight on_match goroutines have
 // completed.  Useful in tests and for graceful shutdown.
 func (jr *JailRuntime) WaitForInflight() {
-	jr.inflightWg.Wait()
+	jr.runner.Wait()
 }
 
 // Restart runs on_restart actions; status remains started.
@@ -371,18 +394,6 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		"threshold", threshold,
 	)
 
-	// Ensure at most one on_match action runs per IP at a time.
-	// If a previous trigger for the same IP is still executing its actions,
-	// skip this one — the IP will re-trigger once the in-flight action
-	// completes and the hit window fills again.
-	if _, alreadyInFlight := jr.inflight.LoadOrStore(result.IP, struct{}{}); alreadyInFlight {
-		slog.Info("on_match already in flight for ip, skipping duplicate trigger",
-			"jail", cfg.Name,
-			"ip", result.IP,
-		)
-		return nil
-	}
-
 	actCtx := action.Context{
 		IP:        result.IP,
 		Jail:      cfg.Name,
@@ -394,16 +405,8 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		Timestamp: t.UTC().Format(time.RFC3339),
 	}
 
-	// Run query pre-check and on_match in a goroutine so the event loop is
-	// never blocked by slow shell actions.  The inflight entry is held for
-	// the full goroutine lifetime, which prevents duplicate triggers while
-	// an action is in progress — including across sequential processBatch
-	// calls when the action outlasts the timer interval.
-	jr.inflightWg.Add(1)
-	go func() {
-		defer jr.inflightWg.Done()
-		defer jr.inflight.Delete(result.IP)
-
+	submitted := jr.runner.Submit(result.IP, func() {
+		cfg := jr.cfg
 		// Query pre-check: only run when query_before_match is true.
 		// Exit 0 means the IP is already blocked — skip on_match.
 		if cfg.QueryBeforeMatch && queryTmpl != nil {
@@ -412,16 +415,20 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 				slog.Info("query pre-check suppressed on_match",
 					"jail", cfg.Name,
 					"ip", result.IP,
-					"query_exit_code", res.ExitCode,
 				)
 				return
 			}
 		}
-
 		if _, err := action.RunAllCompiled(ctx, onMatchTmpls, actCtx, cfg.ActionTimeout.Duration); err != nil {
 			slog.Warn("on_match action failed", "jail", cfg.Name, "ip", result.IP, "error", err)
 		}
-	}()
+	})
+	if !submitted {
+		slog.Info("on_match already in flight for ip, duplicate dropped",
+			"jail", jr.cfg.Name,
+			"ip", result.IP,
+		)
+	}
 
 	return nil
 }
