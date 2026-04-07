@@ -175,11 +175,12 @@ func (a *JailControllerAdapter) ConfigTest(name, filePath string, limit int, ret
 func (a *JailControllerAdapter) PerfStats() control.PerfResponse {
 	snap := a.m.PerfStats()
 	return control.PerfResponse{
-		CurrentLatencyMs:  snap.CurrentLatencyMs,
-		CurrentIntervalMs: snap.CurrentIntervalMs,
-		AvgExecTimeMs:     snap.AvgExecTimeMs,
-		AvgCPUPercent:     snap.AvgCPUPercent,
-		WindowSize:        snap.WindowSize,
+		TargetLatencyMs: snap.TargetLatencyMs,
+		LatencyMs:       snap.LatencyMs,
+		ExecutionMs:     snap.ExecutionMs,
+		SleepMs:         snap.SleepMs,
+		LinesProcessed:  snap.LinesProcessed,
+		CPUPercent:      snap.CPUPercent,
 	}
 }
 
