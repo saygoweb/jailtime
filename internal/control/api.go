@@ -42,3 +42,14 @@ type PerfResponse struct {
 	AvgCPUPercent     float64 `json:"avg_cpu_percent"`
 	WindowSize        int     `json:"window_size"`
 }
+
+// WhitelistStatusResponse represents one whitelist's status.
+type WhitelistStatusResponse struct {
+Name   string `json:"name"`
+Status string `json:"status"`
+}
+
+// ListWhitelistsResponse is returned by GET /v1/whitelists.
+type ListWhitelistsResponse struct {
+Whitelists []WhitelistStatusResponse `json:"whitelists"`
+}

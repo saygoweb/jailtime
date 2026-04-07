@@ -21,6 +21,11 @@ type JailController interface {
 	ConfigFiles(name string, limit int, logFiles bool) ([]string, error)
 	ConfigTest(name, filePath string, limit int, returnMatching bool) (totalLines, matchingLines int, matches []string, err error)
 	PerfStats() PerfResponse
+	StartWhitelist(ctx context.Context, name string) error
+	StopWhitelist(ctx context.Context, name string) error
+	RestartWhitelist(ctx context.Context, name string) error
+	WhitelistStatus(name string) (string, error)
+	AllWhitelistStatuses() map[string]string
 }
 
 // Server serves the control API over a Unix domain socket.
@@ -52,6 +57,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux.HandleFunc("/v1/perf", s.handlePerf)
 	mux.HandleFunc("/v1/jails", s.handleJails)
 	mux.HandleFunc("/v1/jails/", s.handleJailAction)
+	mux.HandleFunc("/v1/whitelists", s.handleWhitelists)
+	mux.HandleFunc("/v1/whitelists/", s.handleWhitelistAction)
 
 	srv := &http.Server{Handler: mux}
 
@@ -227,4 +234,82 @@ func (s *Server) handleJailConfig(w http.ResponseWriter, r *http.Request, name, 
 	default:
 		writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "not found"})
 	}
+}
+
+func (s *Server) handleWhitelists(w http.ResponseWriter, r *http.Request) {
+slog.Info("control request", "method", r.Method, "path", r.URL.Path)
+if r.Method != http.MethodGet {
+writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+return
+}
+statuses := s.controller.AllWhitelistStatuses()
+resp := ListWhitelistsResponse{Whitelists: make([]WhitelistStatusResponse, 0, len(statuses))}
+for name, status := range statuses {
+resp.Whitelists = append(resp.Whitelists, WhitelistStatusResponse{Name: name, Status: status})
+}
+writeJSON(w, http.StatusOK, resp)
+}
+
+// handleWhitelistAction handles /v1/whitelists/{name}/status|start|stop|restart
+func (s *Server) handleWhitelistAction(w http.ResponseWriter, r *http.Request) {
+slog.Info("control request", "method", r.Method, "path", r.URL.Path)
+
+trimmed := strings.TrimPrefix(r.URL.Path, "/v1/whitelists/")
+parts := strings.SplitN(trimmed, "/", 3)
+if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "not found"})
+return
+}
+name := parts[0]
+action := parts[1]
+
+switch action {
+case "status":
+if r.Method != http.MethodGet {
+writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+return
+}
+status, err := s.controller.WhitelistStatus(name)
+if err != nil {
+writeJSON(w, http.StatusNotFound, ErrorResponse{Error: err.Error()})
+return
+}
+writeJSON(w, http.StatusOK, WhitelistStatusResponse{Name: name, Status: status})
+
+case "start":
+if r.Method != http.MethodPost {
+writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+return
+}
+if err := s.controller.StartWhitelist(r.Context(), name); err != nil {
+writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+return
+}
+writeJSON(w, http.StatusOK, HealthResponse{Status: "ok"})
+
+case "stop":
+if r.Method != http.MethodPost {
+writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+return
+}
+if err := s.controller.StopWhitelist(r.Context(), name); err != nil {
+writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+return
+}
+writeJSON(w, http.StatusOK, HealthResponse{Status: "ok"})
+
+case "restart":
+if r.Method != http.MethodPost {
+writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+return
+}
+if err := s.controller.RestartWhitelist(r.Context(), name); err != nil {
+writeJSON(w, http.StatusInternalServerError, ErrorResponse{Error: err.Error()})
+return
+}
+writeJSON(w, http.StatusOK, HealthResponse{Status: "ok"})
+
+default:
+writeJSON(w, http.StatusNotFound, ErrorResponse{Error: "not found"})
+}
 }

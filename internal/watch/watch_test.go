@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -748,4 +749,152 @@ t.Fatal("timed out waiting for line after idle period")
 }
 }
 done:
+}
+
+// ---- New tests for ExcludeGlobs and static watch_mode ----
+
+// drainToSlice collects RawLines from a backend into a slice via channel.
+// It cancels ctx after first drain call that produces at least minLines.
+func drainToSliceN(minLines int) (DrainFunc, func() []RawLine) {
+var mu sync.Mutex
+var collected []RawLine
+done := make(chan struct{})
+var once sync.Once
+
+drain := func(ctx context.Context, lines []RawLine) {
+mu.Lock()
+collected = append(collected, lines...)
+total := len(collected)
+mu.Unlock()
+if total >= minLines {
+once.Do(func() { close(done) })
+}
+}
+wait := func() []RawLine {
+<-done
+mu.Lock()
+defer mu.Unlock()
+out := make([]RawLine, len(collected))
+copy(out, collected)
+return out
+}
+return drain, wait
+}
+
+func TestPollBackendExcludeGlobs(t *testing.T) {
+dir := t.TempDir()
+included := filepath.Join(dir, "included.log")
+excluded := filepath.Join(dir, "excluded.log")
+
+if err := os.WriteFile(included, []byte("line-a\n"), 0o644); err != nil {
+t.Fatal(err)
+}
+if err := os.WriteFile(excluded, []byte("line-b\n"), 0o644); err != nil {
+t.Fatal(err)
+}
+
+spec := WatchSpec{
+JailName:     "test",
+Globs:        []string{filepath.Join(dir, "*.log")},
+ExcludeGlobs: []string{excluded},
+WatchMode:    "tail",
+ReadFromEnd:  false,
+}
+
+drain, wait := drainToSliceN(1)
+ctx, cancel := context.WithCancel(context.Background())
+
+b := NewPollBackend(50 * time.Millisecond)
+go b.Start(ctx, []WatchSpec{spec}, drain)
+time.Sleep(150 * time.Millisecond)
+
+lines := wait()
+cancel()
+
+for _, l := range lines {
+if l.FilePath == excluded {
+t.Errorf("excluded file appeared in drain: %s", l.FilePath)
+}
+}
+found := false
+for _, l := range lines {
+if l.Line == "line-a" {
+found = true
+}
+}
+if !found {
+t.Error("included file line-a not found in drain")
+}
+}
+
+func TestPollBackendStaticMode(t *testing.T) {
+dir := t.TempDir()
+path := filepath.Join(dir, "whitelist.txt")
+
+if err := os.WriteFile(path, []byte("1.2.3.4\n"), 0o644); err != nil {
+t.Fatal(err)
+}
+
+type kindLine struct {
+line string
+kind EventKind
+}
+var mu sync.Mutex
+var got []kindLine
+addedSeen := make(chan struct{})
+var addedOnce sync.Once
+
+drain := func(_ context.Context, lines []RawLine) {
+mu.Lock()
+defer mu.Unlock()
+for _, l := range lines {
+got = append(got, kindLine{l.Line, l.Kind})
+}
+for _, l := range got {
+if l.kind == EventAdded {
+addedOnce.Do(func() { close(addedSeen) })
+}
+}
+}
+
+spec := WatchSpec{
+JailName:  "wl",
+Globs:     []string{path},
+WatchMode: "static",
+}
+
+ctx, cancel := context.WithCancel(context.Background())
+b := NewPollBackend(50 * time.Millisecond)
+go b.Start(ctx, []WatchSpec{spec}, drain)
+
+select {
+case <-addedSeen:
+case <-time.After(2 * time.Second):
+cancel()
+t.Fatal("timed out waiting for EventAdded")
+}
+
+// Remove the IP and wait for EventRemoved.
+if err := os.WriteFile(path, []byte(""), 0o644); err != nil {
+t.Fatal(err)
+}
+
+deadline := time.After(2 * time.Second)
+for {
+select {
+case <-deadline:
+cancel()
+t.Fatal("timed out waiting for EventRemoved")
+case <-time.After(100 * time.Millisecond):
+mu.Lock()
+for _, l := range got {
+if l.kind == EventRemoved && l.line == "1.2.3.4" {
+mu.Unlock()
+cancel()
+return
+}
+}
+mu.Unlock()
+}
+}
 }

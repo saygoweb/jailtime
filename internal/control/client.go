@@ -136,3 +136,36 @@ func (c *Client) ConfigTest(name, filePath string, limit int, returnMatching boo
 	}
 	return &resp, nil
 }
+
+// ListWhitelists calls GET /v1/whitelists.
+func (c *Client) ListWhitelists() (*ListWhitelistsResponse, error) {
+var resp ListWhitelistsResponse
+if err := c.get("/v1/whitelists", &resp); err != nil {
+return nil, err
+}
+return &resp, nil
+}
+
+// WhitelistStatus calls GET /v1/whitelists/{name}/status.
+func (c *Client) WhitelistStatus(name string) (*WhitelistStatusResponse, error) {
+var resp WhitelistStatusResponse
+if err := c.get("/v1/whitelists/"+name+"/status", &resp); err != nil {
+return nil, err
+}
+return &resp, nil
+}
+
+// StartWhitelist calls POST /v1/whitelists/{name}/start.
+func (c *Client) StartWhitelist(name string) error {
+return c.post("/v1/whitelists/" + name + "/start")
+}
+
+// StopWhitelist calls POST /v1/whitelists/{name}/stop.
+func (c *Client) StopWhitelist(name string) error {
+return c.post("/v1/whitelists/" + name + "/stop")
+}
+
+// RestartWhitelist calls POST /v1/whitelists/{name}/restart.
+func (c *Client) RestartWhitelist(name string) error {
+return c.post("/v1/whitelists/" + name + "/restart")
+}

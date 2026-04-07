@@ -242,7 +242,7 @@ func TestJailRuntimeHandleEvent(t *testing.T) {
 		HitCount: 1,
 		FindTime: config.Duration{Duration: time.Minute},
 		Actions: config.JailActions{
-			OnMatch: []string{"echo {{ .IP }} > " + outFile},
+			OnAdd: []string{"echo {{ .IP }} > " + outFile},
 		},
 	}
 
@@ -287,7 +287,7 @@ func TestJailRuntimeExcludeFilter(t *testing.T) {
 		HitCount:       1,
 		FindTime:       config.Duration{Duration: time.Minute},
 		Actions: config.JailActions{
-			OnMatch: []string{"echo {{ .IP }} > " + outFile},
+			OnAdd: []string{"echo {{ .IP }} > " + outFile},
 		},
 	}
 
@@ -358,7 +358,7 @@ Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
 HitCount: 1,
 FindTime: config.Duration{Duration: time.Minute},
 Actions: config.JailActions{
-OnMatch: []string{"echo {{ .IP }} > " + outFile},
+OnAdd: []string{"echo {{ .IP }} > " + outFile},
 },
 }
 
@@ -398,7 +398,7 @@ FindTime: config.Duration{Duration: time.Minute},
 Query:            "true",
 QueryBeforeMatch: true,
 Actions: config.JailActions{
-OnMatch: []string{"echo {{ .IP }} > " + outFile},
+OnAdd: []string{"echo {{ .IP }} > " + outFile},
 },
 }
 
@@ -441,7 +441,7 @@ FindTime: config.Duration{Duration: time.Minute},
 Query:            "false",
 QueryBeforeMatch: true,
 Actions: config.JailActions{
-OnMatch: []string{"echo {{ .IP }} > " + outFile},
+OnAdd: []string{"echo {{ .IP }} > " + outFile},
 },
 }
 
@@ -491,7 +491,7 @@ FindTime: config.Duration{Duration: time.Minute},
 Query:            "true",
 QueryBeforeMatch: false,
 Actions: config.JailActions{
-OnMatch: []string{"echo {{ .IP }} > " + outFile},
+OnAdd: []string{"echo {{ .IP }} > " + outFile},
 },
 }
 
@@ -536,7 +536,7 @@ Filters:  []string{`word=(?P<ip>[a-z]+)`},
 HitCount: 1,
 FindTime: config.Duration{Duration: time.Minute},
 Actions: config.JailActions{
-OnMatch: []string{"echo hit > " + outFile},
+OnAdd: []string{"echo hit > " + outFile},
 },
 }
 
@@ -577,7 +577,7 @@ Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
 HitCount: 1,
 FindTime: config.Duration{Duration: time.Minute},
 Actions: config.JailActions{
-OnMatch: []string{"sleep 0.2 && echo hit >> " + countFile},
+OnAdd: []string{"sleep 0.2 && echo hit >> " + countFile},
 },
 }
 
@@ -643,7 +643,7 @@ func TestHandleEventInflightPreventsBatchRetrigger(t *testing.T) {
 		HitCount: 1,
 		FindTime: config.Duration{Duration: time.Minute},
 		Actions: config.JailActions{
-			OnMatch: []string{"sleep 0.2 && echo hit >> " + countFile},
+			OnAdd: []string{"sleep 0.2 && echo hit >> " + countFile},
 		},
 	}
 
@@ -703,7 +703,7 @@ Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
 HitCount: 1,
 FindTime: config.Duration{Duration: time.Minute},
 Actions: config.JailActions{
-OnMatch: []string{"sleep 0.1 && echo {{ .IP }} >> " + filepath.Join(dir, "out.txt")},
+OnAdd: []string{"sleep 0.1 && echo {{ .IP }} >> " + filepath.Join(dir, "out.txt")},
 },
 }
 
@@ -809,5 +809,222 @@ r.Wait()
 
 if count != 2 {
 t.Fatalf("expected fn to run 2 times, got %d", count)
+}
+}
+
+// ---- Tests for static watch_mode (EventAdded / EventRemoved) ----
+
+func TestHandleEventStaticAdded(t *testing.T) {
+dir := t.TempDir()
+outFile := filepath.Join(dir, "added.txt")
+
+cfg := &config.JailConfig{
+Name:      "wl",
+Enabled:   true,
+WatchMode: "static",
+Files:     []string{"/tmp/wl.txt"},
+Filters:   []string{`(?P<ip>[0-9.]+)`},
+NetType:   "IP",
+Actions: config.JailActions{
+OnAdd: []string{"echo add-{{ .IP }} > " + outFile},
+},
+ActionTimeout: config.Duration{Duration: 5 * time.Second},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+
+ctx := context.Background()
+if err := jr.HandleEvent(ctx, watch.Event{
+JailName: "wl",
+FilePath: "/tmp/wl.txt",
+Line:     "1.2.3.4",
+Kind:     watch.EventAdded,
+}); err != nil {
+t.Fatalf("HandleEvent: %v", err)
+}
+jr.WaitForInflight()
+
+data, err := os.ReadFile(outFile)
+if err != nil {
+t.Fatalf("on_add output not created: %v", err)
+}
+if !strings.Contains(string(data), "add-1.2.3.4") {
+t.Errorf("output = %q, want to contain \"add-1.2.3.4\"", string(data))
+}
+
+// Verify IsMember works.
+if !jr.IsMember("1.2.3.4") {
+t.Error("IsMember(1.2.3.4) should be true after EventAdded")
+}
+}
+
+func TestHandleEventStaticRemoved(t *testing.T) {
+dir := t.TempDir()
+outFile := filepath.Join(dir, "removed.txt")
+
+cfg := &config.JailConfig{
+Name:      "wl",
+Enabled:   true,
+WatchMode: "static",
+Files:     []string{"/tmp/wl.txt"},
+Filters:   []string{`(?P<ip>[0-9.]+)`},
+NetType:   "IP",
+Actions: config.JailActions{
+OnRemove: []string{"echo remove-{{ .IP }} > " + outFile},
+},
+ActionTimeout: config.Duration{Duration: 5 * time.Second},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+ctx := context.Background()
+
+// First add the IP so it can be removed.
+if err := jr.HandleEvent(ctx, watch.Event{
+Line: "1.2.3.4",
+Kind: watch.EventAdded,
+}); err != nil {
+t.Fatalf("HandleEvent Added: %v", err)
+}
+jr.WaitForInflight()
+
+if !jr.IsMember("1.2.3.4") {
+t.Fatal("IsMember should be true after EventAdded")
+}
+
+// Remove it.
+if err := jr.HandleEvent(ctx, watch.Event{
+JailName: "wl",
+FilePath: "/tmp/wl.txt",
+Line:     "1.2.3.4",
+Kind:     watch.EventRemoved,
+}); err != nil {
+t.Fatalf("HandleEvent Removed: %v", err)
+}
+
+data, err := os.ReadFile(outFile)
+if err != nil {
+t.Fatalf("on_remove output not created: %v", err)
+}
+if !strings.Contains(string(data), "remove-1.2.3.4") {
+t.Errorf("output = %q, want to contain \"remove-1.2.3.4\"", string(data))
+}
+
+if jr.IsMember("1.2.3.4") {
+t.Error("IsMember(1.2.3.4) should be false after EventRemoved")
+}
+}
+
+func TestIsMemberCIDR(t *testing.T) {
+cfg := &config.JailConfig{
+Name:      "wl",
+Enabled:   true,
+WatchMode: "static",
+Files:     []string{"/tmp/wl.txt"},
+Filters:   []string{`(?P<ip>[0-9./]+)`},
+NetType:   "CIDR",
+ActionTimeout: config.Duration{Duration: 5 * time.Second},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+ctx := context.Background()
+
+// Add a CIDR.
+if err := jr.HandleEvent(ctx, watch.Event{
+Line: "192.168.1.0/24",
+Kind: watch.EventAdded,
+}); err != nil {
+t.Fatalf("HandleEvent: %v", err)
+}
+jr.WaitForInflight()
+
+if !jr.IsMember("192.168.1.100") {
+t.Error("192.168.1.100 should match 192.168.1.0/24")
+}
+if jr.IsMember("10.0.0.1") {
+t.Error("10.0.0.1 should NOT match 192.168.1.0/24")
+}
+}
+
+// ---- Tests for ignore_sets (Phase 4) ----
+
+func TestIgnoreSetsSuppress(t *testing.T) {
+dir := t.TempDir()
+outFile := filepath.Join(dir, "output.txt")
+
+cfg := &config.JailConfig{
+Name:     "test-jail",
+Enabled:  true,
+WatchMode: "tail",
+Files:    []string{"/var/log/auth.log"},
+Filters:  []string{`Failed password from (?P<ip>[0-9.]+)`},
+NetType:  "IP",
+HitCount: 1,
+FindTime: config.Duration{Duration: time.Minute},
+JailTime: config.Duration{Duration: time.Hour},
+Actions: config.JailActions{
+OnAdd: []string{"echo {{ .IP }} >> " + outFile},
+},
+ActionTimeout: config.Duration{Duration: 5 * time.Second},
+IgnoreSets:   []string{"whitelist"},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+
+// Inject an ignore-set checker that blocks 1.2.3.4.
+jr.mu.Lock()
+jr.ignoreSetsChecker = func(ip string) bool {
+return ip == "1.2.3.4"
+}
+jr.mu.Unlock()
+
+ctx := context.Background()
+
+// Blocked IP: should be suppressed.
+if err := jr.HandleEvent(ctx, watch.Event{
+JailName: "test-jail",
+FilePath: "/var/log/auth.log",
+Line:     "Failed password from 1.2.3.4",
+Time:     time.Now(),
+}); err != nil {
+t.Fatalf("HandleEvent: %v", err)
+}
+jr.WaitForInflight()
+
+if _, err := os.Stat(outFile); err == nil {
+data, _ := os.ReadFile(outFile)
+if strings.Contains(string(data), "1.2.3.4") {
+t.Error("on_add should have been suppressed by ignore_sets for 1.2.3.4")
+}
+}
+
+// Non-whitelisted IP: should fire.
+if err := jr.HandleEvent(ctx, watch.Event{
+JailName: "test-jail",
+FilePath: "/var/log/auth.log",
+Line:     "Failed password from 5.6.7.8",
+Time:     time.Now(),
+}); err != nil {
+t.Fatalf("HandleEvent: %v", err)
+}
+jr.WaitForInflight()
+
+data, err := os.ReadFile(outFile)
+if err != nil {
+t.Fatalf("on_add should have fired for non-whitelisted IP: %v", err)
+}
+if !strings.Contains(string(data), "5.6.7.8") {
+t.Errorf("expected 5.6.7.8 in output, got %q", string(data))
 }
 }

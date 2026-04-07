@@ -7,12 +7,13 @@ import (
 
 // Config is the top-level configuration structure.
 type Config struct {
-	Version int           `yaml:"version"`
-	Include []string      `yaml:"include"`
-	Logging LoggingConfig `yaml:"logging"`
-	Control ControlConfig `yaml:"control"`
-	Engine  EngineConfig  `yaml:"engine"`
-	Jails   []JailConfig  `yaml:"jails"`
+	Version    int           `yaml:"version"`
+	Include    []string      `yaml:"include"`
+	Logging    LoggingConfig `yaml:"logging"`
+	Control    ControlConfig `yaml:"control"`
+	Engine     EngineConfig  `yaml:"engine"`
+	Jails      []JailConfig  `yaml:"jails"`
+	Whitelists []JailConfig  `yaml:"whitelists"`
 }
 
 // LoggingConfig controls log output destination and verbosity.
@@ -46,6 +47,7 @@ type JailConfig struct {
 	Name           string      `yaml:"name"`
 	Enabled        bool        `yaml:"enabled"`
 	Files          []string    `yaml:"files"`
+	ExcludeFiles   []string    `yaml:"exclude_files"`
 	Filters        []string    `yaml:"filters"`
 	ExcludeFilters []string    `yaml:"exclude_filters"`
 	Actions        JailActions `yaml:"actions"`
@@ -54,20 +56,29 @@ type JailConfig struct {
 	JailTime       Duration    `yaml:"jail_time"`
 	// NetType is "IP" or "CIDR".
 	NetType string `yaml:"net_type"`
-	Query   string `yaml:"query"`
+	// WatchMode is "tail" (default) or "static".
+	WatchMode string `yaml:"watch_mode"`
+	Query     string `yaml:"query"`
 	// QueryBeforeMatch controls whether the query pre-check is run before
-	// on_match actions.  When false (the default), the query is never run and
-	// on_match is always executed on a threshold hit.  When true, the query is
-	// run first; an exit code of 0 suppresses on_match (IP already handled).
+	// on_add actions.  When false (the default), the query is never run and
+	// on_add is always executed on a threshold hit.  When true, the query is
+	// run first; an exit code of 0 suppresses on_add (IP already handled).
 	QueryBeforeMatch bool `yaml:"query_before_match"`
 	// ActionTimeout is the maximum time allowed for each individual action
-	// command (on_match, query).  Defaults to defaultActionTimeout.
+	// command (on_add, query).  Defaults to defaultActionTimeout.
 	ActionTimeout Duration `yaml:"action_timeout"`
+	// IgnoreSets names loaded whitelists whose in-memory IP/CIDR membership
+	// suppresses on_add for a matched IP.  Phase 4.
+	IgnoreSets []string `yaml:"ignore_sets"`
 }
 
 // JailActions holds the shell command templates run at various lifecycle points.
 type JailActions struct {
+	// OnAdd fires when an IP is newly seen (threshold hit for tail, first
+	// appearance in static file).  OnMatch is a deprecated alias for OnAdd.
+	OnAdd     []string `yaml:"on_add"`
 	OnMatch   []string `yaml:"on_match"`
+	OnRemove  []string `yaml:"on_remove"`
 	OnStart   []string `yaml:"on_start"`
 	OnStop    []string `yaml:"on_stop"`
 	OnRestart []string `yaml:"on_restart"`

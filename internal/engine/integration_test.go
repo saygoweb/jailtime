@@ -51,7 +51,7 @@ func newApacheWPJailConfig(logGlob, outFile string, hitCount int) *config.JailCo
 		HitCount: hitCount,
 		FindTime: config.Duration{Duration: time.Minute},
 		Actions: config.JailActions{
-			OnMatch: []string{"echo {{ .IP }} >> " + outFile},
+			OnAdd: []string{"echo {{ .IP }} >> " + outFile},
 		},
 	}
 }
