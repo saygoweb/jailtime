@@ -34,10 +34,6 @@ func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
 		jails[jailCfg.Name] = jr
 	}
 
-	pollInterval := cfg.Engine.PollInterval.Duration
-	if pollInterval == 0 {
-		pollInterval = 2 * time.Second
-	}
 	targetLatency := cfg.Engine.TargetLatency.Duration
 	if targetLatency == 0 {
 		targetLatency = 2000 * time.Millisecond
