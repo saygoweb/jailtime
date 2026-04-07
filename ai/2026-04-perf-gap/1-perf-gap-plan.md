@@ -146,9 +146,24 @@ drain:
 
 This is correct because the backend sends all lines from a drain cycle before the next event is processed. The manager wakes up only when the backend fires, collects everything available, and processes it. No timer, no mutex, no goroutine overhead.
 
-**About `adaptInterval`:** With async on_match goroutines (from the fix/multi-trigger change), `processBatch` returns in microseconds — it only dispatches goroutines. The EMA interval adaptation was designed to avoid processing taking longer than the interval. Since `processBatch` is now non-blocking, the EMA is no longer necessary for correctness. However, the `adaptInterval` function and its tests are preserved as-is since they represent valid algorithmic work that may be useful if synchronous processing is ever needed.
+**About `adaptInterval` and `currentInterval`:**
 
-`currentInterval` is retained as a field for perf API reporting; it is set to `targetLatency` at construction and remains unchanged.
+The EMA-based `adaptInterval` function is removed. It is replaced by a simple, directly-measured model:
+
+- **`executionTime`** — wall-clock time to run `processBatch` (directly measured each drain).
+- **`adaptInterval`** — the computed wait before the next drain: `targetLatency - executionTime`. This is exactly the timer value the backend uses (clamped to ≥ 1 ms). It is not measured; it is derived.
+- **`currentInterval`** — the actual wall-clock time between the start of one drain and the start of the next. This is directly measured by recording `time.Now()` at the top of each `rawLines` receive and computing `currentInterval = now - lastDrainAt`. It should be close to `targetLatency`.
+
+The invariant `currentInterval ≈ executionTime + adaptInterval` holds by construction:
+- the backend waits `adaptInterval = targetLatency - executionTime` before sending lines
+- the manager spends `executionTime` processing them
+- total elapsed ≈ `targetLatency`
+
+`currentInterval` deviations from `targetLatency` reflect scheduling jitter and are useful for diagnosing latency problems via the perf API.
+
+The `adaptInterval` function and its tests (`TestAdaptInterval_*`) are **deleted** — the logic is no longer needed.
+
+`currentInterval` is stored as a field in `Manager`, updated each drain cycle from the directly-measured inter-drain wall time, and reported via the perf API.
 
 ---
 
@@ -673,6 +688,10 @@ Both `NewFsnotifyBackend` and `NewPollBackend` receive the same `interval` param
                }
            }
            drainStart := time.Now()
+           if m.lastDrainAt != (time.Time{}) {
+               m.currentInterval = drainStart.Sub(m.lastDrainAt)
+           }
+           m.lastDrainAt = drainStart
            m.processBatch(ctx, batch)
            execTime := time.Since(drainStart)
            var latency time.Duration
@@ -696,13 +715,19 @@ Both `NewFsnotifyBackend` and `NewPollBackend` receive the same `interval` param
    ```
    (Passes `targetLatency` instead of `pollInterval` — both backends use this as their interval.)
 
-7. **`adaptInterval` is retained** (it has its own unit tests). It is no longer called from `Run()`, but `currentInterval` is set to `targetLatency` in `NewManager` and not modified. The perf API reports `currentInterval` as the current drain interval.
+7. **Add `lastDrainAt time.Time` and `currentInterval time.Duration` fields to `Manager`.**
+   - `currentInterval` is initialised to `targetLatency` in `NewManager`.
+   - Each drain cycle sets `currentInterval = drainStart - lastDrainAt` (directly measured inter-drain wall time).
+   - The perf API reports this as the actual drain interval; it should be close to `targetLatency`.
 
-8. **Wire `perf.Close()`** into the `ctx.Done()` shutdown path.
+8. **Delete `adaptInterval` method and `emaAlpha` constant** — no longer needed. Delete `TestAdaptInterval_*` tests in `manager_test.go`.
+
+9. **Wire `perf.Close()`** into the `ctx.Done()` shutdown path.
 
 **Test changes (`internal/engine/manager_test.go`):**
 
-- Tests for `adaptInterval` (`TestAdaptInterval_*`) remain unchanged — they test the algorithm in isolation and remain valid.
+- **Delete** `TestAdaptInterval_*` tests — `adaptInterval` is removed.
+- Add `TestManagerCurrentInterval`: start a manager with a mock backend that fires twice; verify `currentInterval` is close to `targetLatency`.
 - Integration tests (`internal/engine/engine_test.go`, `internal/engine/integration_test.go`) may need small adjustments due to `processBatch` signature change.
 - Verify that `TestHandleEventInflightPreventsBatchRetrigger` continues to pass.
 
@@ -797,7 +822,7 @@ backend := watch.NewAuto(cfg.Engine.WatcherMode, targetLatency)
 | File | Tests affected |
 |------|---------------|
 | `internal/watch/watch_test.go` | All fsnotify + poll tests — verify they still pass after signature/behavior changes |
-| `internal/engine/manager_test.go` | `TestAdaptInterval_*` — untouched. May need to remove/update `processBatch` tests if any use `pendingItem`. |
+| `internal/engine/manager_test.go` | **Delete** `TestAdaptInterval_*`. Add `TestManagerCurrentInterval`. May need to remove/update `processBatch` tests if any use `pendingItem`. |
 | `internal/engine/engine_test.go` | `TestHandleEvent*`, `WaitForInflight` calls — adjust `processBatch` call if needed |
 | `internal/engine/integration_test.go` | Adjust for removed enqueue goroutine |
 
@@ -822,6 +847,7 @@ Run `go test ./...` after each unit. All existing tests must pass.
 - `processBatch` changes from `[]pendingItem` to `[]watch.RawLine`. Only called internally.
 - `FileTailer.ReadLines` no longer handles rotation. Any code that calls `ReadLines` on a `FileTailer` directly (e.g., in `ConfigTest`) should be verified: since `ConfigTest` calls `ReadLines` once on a freshly opened tailer, it is unaffected.
 - `FsnotifyBackend` has `pollInterval` renamed to `drainInterval`. Only affects construction.
+- `adaptInterval` method and `emaAlpha` constant are deleted from `manager.go`. `Manager` gains `lastDrainAt time.Time`; `currentInterval` is now measured directly rather than computed via EMA.
 
 ## Expected Outcome
 
