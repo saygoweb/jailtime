@@ -224,8 +224,18 @@ FsnotifyBackend.Start() — THE single goroutine:
 
 Manager.processDrain() — called inline by backend, same goroutine:
   → measure currentInterval = drainStart - lastDrainAt
-  → processBatch(ctx, lines)   ← regex match, HitTracker, fire on_match goroutines
+  → processBatch(ctx, lines)   ← regex match + HitTracker per jail
+      → threshold hit: ActionRunner.Submit(jail, ip, actCtx)  ← non-blocking
   → perf.RecordExecution(execTime, currentInterval, len(lines))
+
+ActionRunner — one goroutine per jail-ip pair (managed, non-blocking submit):
+  → Submit(jail, ip, actCtx):
+      if inflight[jail+ip] exists → DROP (duplicate suppressed, logged)
+      else mark inflight; launch goroutine:
+          defer clear inflight[jail+ip]
+          run query pre-check (if enabled) → if exit 0: suppress, return
+          run on_match actions with ActionTimeout
+          log result
 
 Manager.Run():
   → start jails
@@ -239,13 +249,15 @@ Manager.Run():
 - One timer only, armed on WRITE, disarmed after drain
 - One goroutine for the entire watch+process pipeline
 - Manager is scheduling-free: pure processing logic called synchronously by the backend
+- Actions are fully decoupled: `Submit` returns immediately; the backend is never blocked by shell scripts
+- Duplicate jail+ip actions are **dropped** (not queued) — if an action is already in flight for a jail+ip, the new trigger is logged and discarded; the IP will re-trigger on the next drain cycle if still active
 - CPU sampling only on actual work (non-empty drain)
 
 ---
 
 ## Implementation Plan
 
-Each unit below is self-contained and can be implemented independently by a sub-agent. Units 1 and 4 are prerequisites for Units 2 and 5 respectively. Unit 3 is independent.
+Each unit below is self-contained and can be implemented independently by a sub-agent. Units 1 and 4 are prerequisites for Units 2 and 5 respectively. Unit 3 and Unit 7 are independent.
 
 ---
 
@@ -860,6 +872,80 @@ backend := watch.NewAuto(cfg.Engine.WatcherMode, targetLatency)
 
 ---
 
+### Unit 7: Formalise `ActionRunner` in `JailRuntime`
+
+**File:** `internal/engine/jail_runtime.go`
+
+**Goal:** Make the action-execution contract explicit and correct:
+- `Submit` must never block the backend goroutine
+- Duplicate jail+ip triggers while an action is in flight are **dropped** (not queued)
+- Each action execution is bounded by `ActionTimeout`
+
+**Current state (from fix/multi-trigger):** `JailRuntime` already implements most of this correctly via `inflight sync.Map` + goroutines + `inflightWg`. This unit formalises the design, extracts it to a named type for clarity, and ensures the drop-duplicate path is correctly logged.
+
+**Proposed design:** Extract into an `ActionRunner` type within `jail_runtime.go` (no new file needed unless it grows large):
+
+```go
+// ActionRunner manages non-blocking, deduplicated execution of on_match actions.
+// At most one action per (jail, ip) key is in flight at any time.
+// Duplicate submits while an action is in flight are dropped and logged.
+type ActionRunner struct {
+    inflight sync.Map     // key: ip string → struct{}
+    wg       sync.WaitGroup
+}
+
+// Submit attempts to run fn for the given ip.
+// Returns true if the action was started, false if dropped (already in flight).
+// fn must be non-blocking itself (it will be run in a goroutine).
+func (r *ActionRunner) Submit(ip string, fn func()) bool {
+    if _, exists := r.inflight.LoadOrStore(ip, struct{}{}); exists {
+        return false  // already in flight: DROP
+    }
+    r.wg.Add(1)
+    go func() {
+        defer r.wg.Done()
+        defer r.inflight.Delete(ip)
+        fn()
+    }()
+    return true
+}
+
+// Wait blocks until all in-flight actions have completed. Used for clean shutdown.
+func (r *ActionRunner) Wait() {
+    r.wg.Wait()
+}
+```
+
+**Changes to `JailRuntime`:**
+- Replace `inflight sync.Map` + `inflightWg sync.WaitGroup` fields with a single `runner ActionRunner` field.
+- In `HandleEvent`, replace the manual `LoadOrStore` + goroutine + `inflightWg.Add/Done` with:
+  ```go
+  submitted := jr.runner.Submit(result.IP, func() {
+      // query pre-check + on_match actions with timeout
+      ...
+  })
+  if !submitted {
+      slog.Info("on_match already in flight for ip, duplicate dropped",
+          "jail", cfg.Name, "ip", result.IP)
+  }
+  ```
+- Replace `jr.inflightWg.Wait()` in `WaitForInflight()` with `jr.runner.Wait()`.
+
+**Action timeout:** Each action is already bounded by `cfg.ActionTimeout.Duration` via `action.RunAllCompiled`. No change needed there.
+
+**Key correctness properties:**
+- `Submit` is called from `processBatch` which runs in the backend goroutine → must return immediately (it does: goroutine launch is non-blocking)
+- `inflight.LoadOrStore` is atomic → no lock needed, safe for concurrent goroutine completions
+- The goroutine holds the `inflight` entry for its full lifetime → a new trigger after the goroutine exits will be accepted normally
+
+**Test changes (`internal/engine/engine_test.go`):**
+- Replace `jr.inflightWg.Wait()` calls with `jr.runner.Wait()` (or keep `WaitForInflight()` as a wrapper — preferred for test stability).
+- `TestHandleEventInflightPreventsBatchRetrigger` tests the drop-duplicate behaviour and must continue to pass unchanged in semantics.
+- Add `TestActionRunnerDrop`: submit same IP twice while first is in flight; verify second returns `false` and only one action runs.
+- Add `TestActionRunnerSequential`: submit same IP, wait for completion, submit again; verify both run (second is not blocked by first).
+
+---
+
 ## Test Strategy
 
 ### Unit tests to update
@@ -868,8 +954,8 @@ backend := watch.NewAuto(cfg.Engine.WatcherMode, targetLatency)
 |------|---------------|
 | `internal/watch/watch_test.go` | All fsnotify + poll tests — verify they still pass after signature/behavior changes |
 | `internal/engine/manager_test.go` | **Delete** `TestAdaptInterval_*`. Add `TestManagerCurrentInterval`. May need to remove/update `processBatch` tests if any use `pendingItem`. |
-| `internal/engine/engine_test.go` | `TestHandleEvent*`, `WaitForInflight` calls — adjust `processBatch` call if needed |
-| `internal/engine/integration_test.go` | Adjust for removed enqueue goroutine |
+| `internal/engine/engine_test.go` | `TestHandleEvent*`, `WaitForInflight` / `runner.Wait()` calls — update for `ActionRunner` refactor |
+| `internal/engine/integration_test.go` | Adjust for removed enqueue goroutine and `DrainFunc` callback |
 
 ### New tests to add
 
@@ -879,6 +965,8 @@ backend := watch.NewAuto(cfg.Engine.WatcherMode, targetLatency)
 | `TestFileTailerReopen` | `watch_test.go` | Reopen resets reader; subsequent ReadLines starts from position 0 |
 | `TestFsnotifyBackendIdleNoDrain` | `watch_test.go` | With a file and no writes, no lines emitted for 2× targetLatency |
 | `TestCgroupCPUSamplerNoAlloc` | `engine` | AllocsPerRun(10, sampler.Sample) == 0 (or 1 for string conversion) |
+| `TestActionRunnerDrop` | `engine_test.go` | Duplicate submit while in-flight returns false; only one action runs |
+| `TestActionRunnerSequential` | `engine_test.go` | Submit after completion succeeds; both actions run |
 
 ### Regression test
 
@@ -895,6 +983,7 @@ Run `go test ./...` after each unit. All existing tests must pass.
 - `FsnotifyBackend` has `pollInterval` renamed to `drainInterval`. Only affects construction.
 - `adaptInterval` method and `emaAlpha` constant are deleted from `manager.go`. `Manager` gains `lastDrainAt time.Time`; `currentInterval` is now measured directly.
 - `Manager.Run()` no longer creates a goroutine — it blocks on `backend.Start()` directly. Tests that previously used `go m.Run()` and a `rawLines` channel must switch to providing a mock backend that calls the drain callback.
+- `JailRuntime.inflight` + `inflightWg` replaced by embedded `ActionRunner`. `WaitForInflight()` delegates to `runner.Wait()`; external callers are unaffected.
 
 ## Expected Outcome
 
