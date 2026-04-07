@@ -124,27 +124,41 @@ The current architecture has two timer layers:
 - Backend: 50 ms `batchTicker` (collects WRITE events into dirty set)
 - Manager: adaptive EMA timer (drains `batchQueue` → calls `processBatch`)
 
-With the backend's lazy one-shot drain timer (RC-1 fix), the backend now fires at `targetLatency` (default 2000 ms). The manager's separate timer is redundant. The `batchQueue` mutex + enqueue goroutine adds latency and CPU overhead.
+With the backend's lazy one-shot drain timer (RC-1 fix), scheduling belongs entirely to the backend. The manager's timer, `batchQueue`, and enqueue goroutine are redundant layers — they add CPU overhead and latency jitter.
 
-**Fix:** Remove the `batchQueue`, the enqueue goroutine, and the manager's timer. The manager's `Run()` loop simply reads from `rawLines` using a **channel drain** pattern:
+**Fix:** Collapse to a **single goroutine owned by the backend**. The `Backend.Start` signature changes from pushing to a channel to accepting a **drain callback**:
 
 ```go
-case line, ok := <-rawLines:
-    batch := []watch.RawLine{line}
-    // Non-blocking drain: collect all lines the backend sent in this drain cycle
-drain:
-    for {
-        select {
-        case l := <-rawLines:
-            batch = append(batch, l)
-        default:
-            break drain
-        }
-    }
-    processBatch(ctx, batch)
+// DrainFunc is called by the backend synchronously during each drain cycle.
+// lines contains all new lines read from dirty files in this cycle.
+type DrainFunc func(ctx context.Context, lines []RawLine)
+
+// Start now calls drain(ctx, lines) in-place during drain, instead of
+// sending to an output channel.
+Start(ctx context.Context, specs []WatchSpec, drain DrainFunc) error
 ```
 
-This is correct because the backend sends all lines from a drain cycle before the next event is processed. The manager wakes up only when the backend fires, collects everything available, and processes it. No timer, no mutex, no goroutine overhead.
+`Manager.Run()` becomes:
+
+```go
+func (m *Manager) Run(ctx context.Context) error {
+    // start jails, build specs...
+    return m.backend.Start(ctx, specs, m.processDrain)
+}
+
+func (m *Manager) processDrain(ctx context.Context, lines []watch.RawLine) {
+    drainStart := time.Now()
+    if !m.lastDrainAt.IsZero() {
+        m.currentInterval = drainStart.Sub(m.lastDrainAt)
+    }
+    m.lastDrainAt = drainStart
+    m.processBatch(ctx, lines)
+    execTime := time.Since(drainStart)
+    m.perf.RecordExecution(execTime, m.currentInterval, len(lines))
+}
+```
+
+No channel. No separate goroutine. No mutex on the queue. The backend calls `processDrain` synchronously within its drain case, then returns to `select`. The entire pipeline runs in one goroutine.
 
 **About `adaptInterval` and `currentInterval`:**
 
@@ -152,10 +166,10 @@ The EMA-based `adaptInterval` function is removed. It is replaced by a simple, d
 
 - **`executionTime`** — wall-clock time to run `processBatch` (directly measured each drain).
 - **`adaptInterval`** — the computed wait before the next drain: `targetLatency - executionTime`. This is exactly the timer value the backend uses (clamped to ≥ 1 ms). It is not measured; it is derived.
-- **`currentInterval`** — the actual wall-clock time between the start of one drain and the start of the next. This is directly measured by recording `time.Now()` at the top of each `rawLines` receive and computing `currentInterval = now - lastDrainAt`. It should be close to `targetLatency`.
+- **`currentInterval`** — the actual wall-clock time between the start of one drain and the start of the next. This is directly measured by recording `time.Now()` at the top of each `processDrain` call and computing `currentInterval = now - lastDrainAt`. It should be close to `targetLatency`.
 
 The invariant `currentInterval ≈ executionTime + adaptInterval` holds by construction:
-- the backend waits `adaptInterval = targetLatency - executionTime` before sending lines
+- the backend waits `adaptInterval = targetLatency - executionTime` before calling drain
 - the manager spends `executionTime` processing them
 - total elapsed ≈ `targetLatency`
 
@@ -177,13 +191,16 @@ The `adaptInterval` function and its tests (`TestAdaptInterval_*`) are **deleted
 
 ## Target Architecture
 
+**One goroutine.** The backend owns the `select` loop. The Manager is a pure processing unit — it has no goroutine, no timer, no channel of its own.
+
 ```
 fsnotify inotify kernel events
     │
     ▼
-FsnotifyBackend.Start() — single goroutine:
+FsnotifyBackend.Start() — THE single goroutine:
 
   var drainTimerC <-chan time.Time  // nil = idle; never fires in select
+  var lastDrainTime time.Duration
 
   select:
     case <-ctx.Done()        → cleanup + return
@@ -201,25 +218,28 @@ FsnotifyBackend.Start() — single goroutine:
     case <-drainTimerC:
       → drainStart = time.Now()
       → drainTimerC = nil     // disarm; will re-arm on next WRITE
-      → for p in dirty: ft.ReadLines() → send to rawLines channel
-      → clear dirty set
+      → collect lines from all dirty files (ReadLines)
+      → call drain(ctx, lines)   ← Manager.processDrain() runs inline here
       → lastDrainTime = time.Since(drainStart)
 
-Manager.Run() — single goroutine:
+Manager.processDrain() — called inline by backend, same goroutine:
+  → measure currentInterval = drainStart - lastDrainAt
+  → processBatch(ctx, lines)   ← regex match, HitTracker, fire on_match goroutines
+  → perf.RecordExecution(execTime, currentInterval, len(lines))
 
-  select:
-    case <-ctx.Done()         → stop jails + return
-    case err = <-backendErr   → return err
-    case line = <-rawLines:   → collect all available lines (non-blocking drain)
-                                → processBatch(ctx, batch)
-                                → if len(batch) > 0: perf.RecordExecution (samples CPU)
+Manager.Run():
+  → start jails
+  → build specs
+  → return backend.Start(ctx, specs, m.processDrain)   ← blocks here
 ```
 
 **Key properties:**
-- Zero goroutine wakeups when idle (no tickers)
+- Zero goroutine wakeups when idle (no tickers, no channel selects)
 - Zero stat/seek/alloc syscalls on idle files
 - One timer only, armed on WRITE, disarmed after drain
-- CPU sampling only on actual work
+- One goroutine for the entire watch+process pipeline
+- Manager is scheduling-free: pure processing logic called synchronously by the backend
+- CPU sampling only on actual work (non-empty drain)
 
 ---
 
@@ -326,13 +346,13 @@ type FsnotifyBackend struct {
 **Core `Start()` rewrite:**
 
 ```go
-func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan<- RawLine) error {
+func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain DrainFunc) error {
     b.UpdateSpecs(specs)
 
     watcher, err := fsnotify.NewWatcher()
     if err != nil {
         slog.Info("fsnotify unavailable, falling back to poll", "error", err)
-        return NewPollBackend(b.drainInterval).Start(ctx, b.getSpecs(), out)
+        return NewPollBackend(b.drainInterval).Start(ctx, b.getSpecs(), drain)
     }
     defer watcher.Close()
     slog.Info("fsnotify backend started")
@@ -404,23 +424,22 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
         pathToJails = newPathToJails
     }
 
-    readAndSend := func(p string) {
+    readLines := func(p string) []RawLine {
         ft, ok := tailers[p]
         if !ok {
-            return
+            return nil
         }
         lines, err := ft.ReadLines()
         if err != nil {
-            return
+            return nil
         }
         jails := pathToJails[p]
+        now := time.Now()
+        out := make([]RawLine, 0, len(lines))
         for _, line := range lines {
-            // debug logging (rate-limited) omitted for brevity
-            select {
-            case out <- RawLine{FilePath: p, Line: line, Jails: jails, EnqueueAt: time.Now()}:
-            case <-ctx.Done():
-            }
+            out = append(out, RawLine{FilePath: p, Line: line, Jails: jails, EnqueueAt: now})
         }
+        return out
     }
 
     handleCreate := func(name string) {
@@ -521,10 +540,12 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, out chan
         case <-drainTimerC:
             drainStart := time.Now()
             drainTimerC = nil  // disarm — will re-arm on next WRITE event
+            var batch []RawLine
             for p := range dirty {
-                readAndSend(p)
+                batch = append(batch, readLines(p)...)
                 delete(dirty, p)
             }
+            drain(ctx, batch)
             lastDrainTime = time.Since(drainStart)
 
         case _, ok := <-watcher.Errors:
@@ -559,12 +580,28 @@ func appendUniq(slice []string, s string) []string {
 }
 ```
 
-**Changes to `backend.go` / `NewAuto`:**
+**Changes to `internal/watch/backend.go`:**
 ```go
-// NewAuto now takes drainInterval for the fsnotify backend (= targetLatency).
+// DrainFunc is called synchronously by the backend during each drain cycle.
+// lines contains all new RawLines collected from dirty files in this cycle.
+// It runs in the backend's goroutine — do not block.
+type DrainFunc func(ctx context.Context, lines []RawLine)
+
+// Backend is the interface for file-watching backends.
+type Backend interface {
+    Name() string
+    // Start watches files and calls drain synchronously on each drain cycle.
+    // Replaces the previous out chan<- RawLine signature.
+    Start(ctx context.Context, specs []WatchSpec, drain DrainFunc) error
+    UpdateSpecs(specs []WatchSpec)
+}
+
+// NewAuto creates a Backend according to mode.
+// interval is used as the poll interval (PollBackend) or drain timer interval
+// (FsnotifyBackend); both default to targetLatency = 2000ms.
 func NewAuto(mode string, interval time.Duration) Backend
 ```
-Both `NewFsnotifyBackend` and `NewPollBackend` receive the same `interval` parameter; for poll it is the poll interval, for fsnotify it is the drain timer interval.
+Both `NewFsnotifyBackend` and `NewPollBackend` receive the same `interval` parameter.
 
 **Test changes:**
 
@@ -640,13 +677,13 @@ Both `NewFsnotifyBackend` and `NewPollBackend` receive the same `interval` param
 
 ---
 
-### Unit 4: Simplify `Manager.Run()` — remove batchQueue, enqueue goroutine, and manager timer
+### Unit 4: Simplify `Manager` — remove batchQueue, enqueue goroutine, timer, and own goroutine
 
 **File:** `internal/engine/manager.go`
 
-**Prerequisite:** Unit 2 (backend now drives timing)
+**Prerequisite:** Unit 2 (backend `Start` now takes `DrainFunc`)
 
-**Goal:** The manager no longer owns a timer. It reads lines from `rawLines` and processes them as they arrive from the backend's drain cycles.
+**Goal:** The Manager has no goroutine, no channel, no timer, no select loop. It is a pure processing unit. `Manager.Run()` simply calls `backend.Start()` passing `m.processDrain` as the drain callback and blocks until the backend exits.
 
 **Changes:**
 
@@ -654,81 +691,77 @@ Both `NewFsnotifyBackend` and `NewPollBackend` receive the same `interval` param
 
 2. **Remove the enqueue goroutine** (the `go func()` that reads from `rawLines` and calls `m.queue.Enqueue`).
 
-3. **Remove `timer` from `Run()`.**
+3. **Remove `rawLines` channel, `backendErr` channel, and the manager's `select` loop from `Run()`.**
 
-4. **Rewrite the drain loop:**
+4. **Rewrite `Run()`:**
    ```go
-   for {
-       select {
-       case err := <-backendErr:
-           if err != nil {
-               return fmt.Errorf("watch backend: %w", err)
+   func (m *Manager) Run(ctx context.Context) error {
+       for name, jr := range m.jails {
+           if !jr.cfg.Enabled {
+               continue
            }
-           return nil
-       case <-ctx.Done():
-           // ... stop jails ...
-           return ctx.Err()
-       case line, ok := <-rawLines:
-           if !ok {
-               return nil
+           if err := jr.Start(ctx); err != nil {
+               return fmt.Errorf("starting jail %q: %w", name, err)
            }
-           // Collect all lines the backend flushed in this drain cycle.
-           batch := make([]watch.RawLine, 0, 64)
-           batch = append(batch, line)
-       drainMore:
-           for {
-               select {
-               case l, ok := <-rawLines:
-                   if !ok {
-                       break drainMore
-                   }
-                   batch = append(batch, l)
-               default:
-                   break drainMore
-               }
-           }
-           drainStart := time.Now()
-           if m.lastDrainAt != (time.Time{}) {
-               m.currentInterval = drainStart.Sub(m.lastDrainAt)
-           }
-           m.lastDrainAt = drainStart
-           m.processBatch(ctx, batch)
-           execTime := time.Since(drainStart)
-           var latency time.Duration
-           if len(batch) > 0 {
-               latency = drainStart.Sub(batch[0].EnqueueAt)
-           }
-           m.perf.RecordExecution(execTime, latency, len(batch), m.currentInterval)
        }
+       specs := buildSpecs(m.jails, m.cfg.Engine.ReadFromEnd)
+       err := m.backend.Start(ctx, specs, m.processDrain)
+       // Shutdown: stop all running jails.
+       stopCtx := context.Background()
+       m.mu.RLock()
+       for _, jr := range m.jails {
+           if jr.Status() == StatusStarted {
+               _ = jr.Stop(stopCtx)
+           }
+       }
+       m.mu.RUnlock()
+       m.perf.Close()
+       if err != nil && err != context.Canceled {
+           return fmt.Errorf("watch backend: %w", err)
+       }
+       return nil
    }
    ```
 
-5. **`processBatch` signature change:** accepts `[]watch.RawLine` directly (no `pendingItem` wrapper):
+5. **Add `processDrain` method:**
    ```go
-   func (m *Manager) processBatch(ctx context.Context, batch []watch.RawLine)
+   func (m *Manager) processDrain(ctx context.Context, lines []watch.RawLine) {
+       drainStart := time.Now()
+       if !m.lastDrainAt.IsZero() {
+           m.currentInterval = drainStart.Sub(m.lastDrainAt)
+       }
+       m.lastDrainAt = drainStart
+       m.processBatch(ctx, lines)
+       execTime := time.Since(drainStart)
+       m.perf.RecordExecution(execTime, m.currentInterval, len(lines))
+   }
    ```
-   Inside: replace `item.line.Jails` with `item.Jails`, etc.
 
-6. **`NewAuto` call in `NewManager`:**
+6. **`processBatch` signature change:** accepts `[]watch.RawLine` directly (no `pendingItem` wrapper):
+   ```go
+   func (m *Manager) processBatch(ctx context.Context, lines []watch.RawLine)
+   ```
+   Inside: replace `item.line.Jails` with `line.Jails`, etc.
+
+7. **`NewAuto` call in `NewManager`:**
    ```go
    backend := watch.NewAuto(cfg.Engine.WatcherMode, targetLatency)
    ```
-   (Passes `targetLatency` instead of `pollInterval` — both backends use this as their interval.)
 
-7. **Add `lastDrainAt time.Time` and `currentInterval time.Duration` fields to `Manager`.**
+8. **Add `lastDrainAt time.Time` and `currentInterval time.Duration` fields to `Manager`.**
    - `currentInterval` is initialised to `targetLatency` in `NewManager`.
-   - Each drain cycle sets `currentInterval = drainStart - lastDrainAt` (directly measured inter-drain wall time).
+   - Each `processDrain` call sets `currentInterval = drainStart - lastDrainAt`.
    - The perf API reports this as the actual drain interval; it should be close to `targetLatency`.
 
-8. **Delete `adaptInterval` method and `emaAlpha` constant** — no longer needed. Delete `TestAdaptInterval_*` tests in `manager_test.go`.
+9. **Delete `adaptInterval` method and `emaAlpha` constant.**
 
-9. **Wire `perf.Close()`** into the `ctx.Done()` shutdown path.
+10. **`perf.Close()`** called in `Run()` after backend exits (as shown above).
 
 **Test changes (`internal/engine/manager_test.go`):**
 
 - **Delete** `TestAdaptInterval_*` tests — `adaptInterval` is removed.
-- Add `TestManagerCurrentInterval`: start a manager with a mock backend that fires twice; verify `currentInterval` is close to `targetLatency`.
-- Integration tests (`internal/engine/engine_test.go`, `internal/engine/integration_test.go`) may need small adjustments due to `processBatch` signature change.
+- Add `TestManagerCurrentInterval`: create a manager with a mock backend whose `Start()` calls the drain callback twice with a known delay; verify `currentInterval` is close to the expected inter-drain time.
+- Integration tests (`internal/engine/engine_test.go`, `internal/engine/integration_test.go`) need updating: replace channel-based patterns with the new `DrainFunc` callback approach in any test scaffolding that creates a backend directly.
 - Verify that `TestHandleEventInflightPreventsBatchRetrigger` continues to pass.
 
 ---
@@ -739,12 +772,15 @@ Both `NewFsnotifyBackend` and `NewPollBackend` receive the same `interval` param
 
 **Prerequisite:** Unit 1 (new `ReadLines`, `CheckRotation()`)
 
-**Goal:** Poll backend no longer relies on `ReadLines` for rotation detection.
+**Goal:** Poll backend adopts the `DrainFunc` signature and no longer relies on `ReadLines` for rotation detection.
 
 **Changes:**
 
-1. In the per-tick read loop, before calling `ft.ReadLines()`, call `ft.CheckRotation()`:
+1. **Change `Start` signature** from `out chan<- RawLine` to `drain DrainFunc` (same change as Unit 2 for fsnotify).
+
+2. In the per-tick read loop: call `ft.CheckRotation()` before `ft.ReadLines()`; collect all lines into a local slice; call `drain(ctx, batch)` once per tick:
    ```go
+   var batch []RawLine
    for p, ft := range tailers {
        pi, matched := pathInfos[p]
        if !matched {
@@ -757,11 +793,20 @@ Both `NewFsnotifyBackend` and `NewPollBackend` receive the same `interval` param
            continue
        }
        lines, err := ft.ReadLines()
-       // ... rest unchanged
+       if err != nil {
+           continue
+       }
+       now := time.Now()
+       for _, line := range lines {
+           batch = append(batch, RawLine{FilePath: p, Line: line, Jails: pi.jails, EnqueueAt: now})
+       }
+   }
+   if len(batch) > 0 {
+       drain(ctx, batch)
    }
    ```
 
-2. No other changes needed. The poll backend's ticker continues to run at `b.interval` (now passed as `targetLatency` from `NewAuto`).
+3. No timer changes needed. The poll backend's ticker continues to run at `b.interval` (passed as `targetLatency` from `NewAuto`).
 
 **Test changes:**
 
@@ -843,11 +888,13 @@ Run `go test ./...` after each unit. All existing tests must pass.
 
 ## Migration Notes
 
-- `NewAuto(mode, pollInterval)` signature changes to `NewAuto(mode, interval)`. This is a package-internal API; only `manager.go` calls it. Update `NewManager` accordingly.
+- `Backend.Start` signature changes from `out chan<- RawLine` to `drain DrainFunc`. All callers (only `Manager.Run()` and test scaffolding) must be updated.
+- `NewAuto(mode, pollInterval)` signature changes to `NewAuto(mode, interval)`. This is a package-internal API; only `manager.go` calls it.
 - `processBatch` changes from `[]pendingItem` to `[]watch.RawLine`. Only called internally.
 - `FileTailer.ReadLines` no longer handles rotation. Any code that calls `ReadLines` on a `FileTailer` directly (e.g., in `ConfigTest`) should be verified: since `ConfigTest` calls `ReadLines` once on a freshly opened tailer, it is unaffected.
 - `FsnotifyBackend` has `pollInterval` renamed to `drainInterval`. Only affects construction.
-- `adaptInterval` method and `emaAlpha` constant are deleted from `manager.go`. `Manager` gains `lastDrainAt time.Time`; `currentInterval` is now measured directly rather than computed via EMA.
+- `adaptInterval` method and `emaAlpha` constant are deleted from `manager.go`. `Manager` gains `lastDrainAt time.Time`; `currentInterval` is now measured directly.
+- `Manager.Run()` no longer creates a goroutine — it blocks on `backend.Start()` directly. Tests that previously used `go m.Run()` and a `rawLines` channel must switch to providing a mock backend that calls the drain callback.
 
 ## Expected Outcome
 
