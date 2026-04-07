@@ -7,25 +7,24 @@ ban IPs that exceed a hit threshold. This plan adds four related capabilities:
 
 1. **Static-file watching** — some files (e.g. a Cloudflare CIDR list updated by
    a cron job or API call) are replaced wholesale. The engine must diff the old and
-   new contents, running actions for added, removed, and (optionally) unchanged
-   entries.
+   new contents, running actions for added and removed entries.
 
-2. **Whitelist.d** — a parallel concept to jails.d. Whitelists are functionally
+2. **whitelist.d** — a parallel concept to jails.d. Whitelists are functionally
    identical to jails (same config shape, same action hooks) but the typical
    action is an iptables ACCEPT rule rather than DROP. Critically, **whitelist
    on_start / on_add actions must run before jail on_start / on_add** so that
    ACCEPT rules are inserted above DROP rules in iptables. Whitelists, like
-   jails, have a `type` field which can be `cidr` or `ip`.
+   jails, have a `net_type` field which can be `IP` or `CIDR`.
 
-3. **First-class whitelist-ignore in jails** — a new `whitelist_sets` field on a
-   jail lets operators name one or more whitelist sets whose membership suppresses
-   `on_add` for that IP, without hand-writing a `query` template. Membership is
-   checked in-memory in Go (supporting ip-vs-ip-list and ip-vs-CIDR), not via
+3. **First-class whitelist-ignore in jails** — a new `ignore_sets` field on a
+   jail names one or more loaded whitelists whose in-memory IP/CIDR set suppresses
+   `on_add` for a matched IP, without hand-writing a `query` template. Membership
+   is checked in-memory in Go (ip-vs-ip-list and ip-vs-CIDR), not via
    external ipset calls.
 
 4. **File-glob exclusions** — a new `exclude_files` field on jails/whitelists so
    that specific files matched by a broad glob can be silently skipped (e.g.
-   apache access logs that are behind Cloudflare and carry proxy IPs only).
+   apache access logs behind Cloudflare that carry only proxy IPs).
 
 ---
 
@@ -43,22 +42,23 @@ jails:
       - /var/log/apache2/cloudflare*/access.log
 ```
 
-- Add `ExcludeFiles []string \`yaml:"exclude_files"\`` to `rawJailConfig` and
-  `JailConfig`.
-- Add `ExcludeGlobs []string` to `watch.WatchSpec`.
-- In `buildSpecs` (manager) copy the new field through.
-- In `PollBackend.Start` and `FsnotifyBackend.Start`, after expanding `Globs`,
-  expand each `ExcludeGlobs` pattern and subtract matches from the result set
-  before opening / tailing files.
-- Validation: warn (not error) if an exclude_files entry matches no file at
-  startup.
+**Code changes:**
+
+- Add `ExcludeFiles []string \`yaml:"exclude_files"\`` to both `rawJailConfig`
+  and `JailConfig` in `internal/config/types.go` and `load.go`.
+- Add `ExcludeGlobs []string` to `watch.WatchSpec` in `internal/watch/backend.go`.
+- In `buildSpecs` (manager) copy `cfg.ExcludeFiles` → `spec.ExcludeGlobs`.
+- In `PollBackend.Start`: after building `pathInfos`, expand each `ExcludeGlobs`
+  pattern and delete matching keys from `pathInfos` before opening tailers.
+- In `FsnotifyBackend.Start`: same exclusion in `initialScan` and `handleCreate`.
+- Validation: warn (not error) if an `exclude_files` entry matches no file at startup.
 
 ### Phase 2 — Static-file watching
 
 **The core problem:**  
 A static file (e.g. `/etc/jailtime/whitelists/cloudflare.txt`) is atomically
-replaced. We need to diff the previous set of matching lines against the new set
-and fire different actions for added, removed, and persisting entries.
+replaced. We need to diff the previous set of lines against the new set and fire
+actions for added and removed entries.
 
 #### 2a — Config shape
 
@@ -75,91 +75,158 @@ whitelists:
       - '^(?P<ip>[0-9./]+)\s*$'
     actions:
       on_start:   [...]
-      on_add:     ['ipset add jt_whitelist {{ .IP }}']   # IP newly present (replaces on_match)
-      on_remove:  ['ipset del jt_whitelist {{ .IP }}']   # NEW — IP gone
+      on_add:     ['ipset add jt_whitelist {{ .IP }}']   # IP newly present
+      on_remove:  ['ipset del jt_whitelist {{ .IP }}']   # IP gone
       on_stop:    [...]
 ```
 
-- `on_add` = IP **appeared** (new since last scan, or first scan). `on_match` remains as a deprecated alias for `on_add`.
-- `on_remove` = IP **disappeared** (was in previous scan, not in current).
+- `on_add` = IP **appeared** (new since last scan, or first scan). `on_match` is a
+  deprecated alias: if `on_add` is empty and `on_match` is set, use `on_match`.
+- `on_remove` = IP **disappeared**.
+
+**Config struct changes** in `internal/config/types.go` / `load.go`:
+
+```go
+// JailConfig gains:
+WatchMode    string   `yaml:"watch_mode"`    // "tail" | "static"; default "tail"
+ExcludeFiles []string `yaml:"exclude_files"` // Phase 1
+
+// JailActions gains:
+OnAdd    []string `yaml:"on_add"`    // replaces on_match for static mode
+OnRemove []string `yaml:"on_remove"` // static: IP removed from file
+// OnMatch []string kept as deprecated alias
+```
+
+`rawJailConfig` mirrors these additions. In `Load`, after building `JailConfig`,
+merge: if `OnAdd` is empty and `OnMatch` is non-empty, log a deprecation warning
+and copy `OnMatch` → `OnAdd`.
+
+`applyDefaults` sets `WatchMode = "tail"` when unset, for all jails **and**
+whitelists.
+
+**Validation changes** in `internal/config/validate.go`:
+
+- For `watch_mode: tail` jails: existing rules unchanged (`on_match`/`on_add`
+  required, `find_time`/`jail_time`/`hit_count` required).
+- For `watch_mode: static` jails: `on_add` required; `find_time`, `jail_time`,
+  and `hit_count` must **not** be set (error if they are).
+- Validate `watch_mode` is one of `"tail"`, `"static"`.
 
 #### 2b — Watch layer changes
 
+The watch layer communicates with the engine via two types:
+
 ```go
-// watch/backend.go
-type EventKind string
-
-const (
-    EventLine    EventKind = "line"     // existing tail event
-    EventAdded   EventKind = "added"    // static: IP newly present
-    EventRemoved EventKind = "removed"  // static: IP no longer present
-)
-
-type Event struct {
-    Kind     EventKind   // NEW (defaults to EventLine for backward compat)
-    JailName string
-    FilePath string
-    Offset   int64
-    Line     string
-    Time     time.Time
+// RawLine is the unit emitted by backends via DrainFunc — gains Kind field:
+type RawLine struct {
+    Kind      EventKind  // NEW — "line" (default), "added", "removed"
+    FilePath  string
+    Line      string
+    Jails     []string
+    EnqueueAt time.Time
 }
 
+// EventKind distinguishes tail vs static diff events:
+type EventKind string
+const (
+    EventLine    EventKind = "line"    // existing tail event (zero value for compat)
+    EventAdded   EventKind = "added"   // static: line newly present
+    EventRemoved EventKind = "removed" // static: line no longer present
+)
+
+// Event (constructed in manager.processBatch from RawLine) also gains Kind:
+type Event struct {
+    Kind     EventKind
+    JailName string
+    FilePath string
+    Line     string
+    Time     time.Time
+    // Offset field retained but unused
+}
+
+// WatchSpec gains two new fields:
 type WatchSpec struct {
     JailName     string
     Globs        []string
-    ExcludeGlobs []string   // Phase 1
+    ExcludeGlobs []string // Phase 1
     ReadFromEnd  bool
-    WatchMode    string     // "tail" | "static"
+    WatchMode    string   // "tail" | "static"
 }
 ```
 
-`PollBackend` gains a separate map of **static file snapshots**:
+**`PollBackend`** gains a static snapshot map:
+
+```go
+staticSnapshots map[string]map[string]bool  // file path → set of raw lines
 ```
-staticSnapshots map[tailerKey]map[string]bool  // path → set of matching lines
+
+(keyed by file path string, same as the existing `tailers` map)
+
+On each tick for specs where `WatchMode == "static"`:
+1. Open and read the entire file (no `FileTailer` / offset tracking).
+2. Collect all lines into a `map[string]bool`.
+3. Compare against `staticSnapshots[path]`:
+   - `added = current − previous` → emit `RawLine{Kind: EventAdded}`
+   - `removed = previous − current` → emit `RawLine{Kind: EventRemoved}`
+4. Replace `staticSnapshots[path]` with current set.
+5. On first scan (no previous snapshot): treat all lines as added.
+
+Snapshots track **raw lines** (not extracted IPs) so the engine applies its
+normal `filter.Match` pipeline consistently, just as for tail events.
+
+**`FsnotifyBackend`** mirrors the same static snapshot logic: on
+`fsnotify.Write` or `fsnotify.Create` for a static-mode file, re-read and diff
+the snapshot. `fsnotify.Rename` (atomic replace) must also trigger a re-read
+and re-watch of the new inode (see Open Questions).
+
+**`manager.processBatch`** must propagate `RawLine.Kind` to `watch.Event.Kind`:
+
+```go
+evt := watch.Event{
+    Kind:     line.Kind,    // propagate
+    JailName: jailName,
+    FilePath: line.FilePath,
+    Line:     line.Line,
+    Time:     line.EnqueueAt,
+}
 ```
-
-On each tick for a static-mode spec:
-1. Re-read the entire file (no offset tracking).
-2. Run each line through the jail's include/exclude filter chain **in the watch
-   layer** — only store lines that match (or store raw lines and let the engine
-   filter; see trade-off note below).
-3. Compute `added = current − previous`, `removed = previous − current`.
-4. Emit `EventAdded` / `EventRemoved` events accordingly.
-
-> **Trade-off:** Filtering in the watch layer couples the backend to the filter
-> package. The simpler approach is to emit raw lines and let `JailRuntime`
-> handle filtering, just as it does today for tail mode. Static snapshots should
-> therefore track **raw lines** (the full line, not the extracted IP) so the
-> engine can re-run filters consistently.
-
-`FsnotifyBackend` mirrors the same static snapshot logic, triggered on
-`fsnotify.Write` or `fsnotify.Create` events for watched static files.
 
 #### 2c — Engine changes
 
-`JailRuntime.HandleEvent` dispatches on `evt.Kind`:
+**`JailRuntime` gains new compiled template fields:**
 
-- `EventLine` (tail) — existing logic unchanged.
-- `EventAdded` — run include/exclude filters, extract IP, skip HitTracker
-  entirely, run `on_add` actions directly (treat as immediate threshold hit
-  with count=1). `on_match` is a deprecated alias for `on_add`.
-- `EventRemoved` — extract IP from line (same filter), run `on_remove` actions.
-  No HitTracker involvement.
+```go
+type JailRuntime struct {
+    // existing:
+    onMatchTmpls []*template.Template  // renamed/repurposed as onAddTmpls
+    queryTmpl    *template.Template
 
-The `query` pre-check still applies to `EventAdded` (suppresses `on_add` if
-the IP is already in the target ipset). It does **not** apply to `EventRemoved`.
+    // new:
+    onAddTmpls    []*template.Template  // compiled from OnAdd (or OnMatch fallback)
+    onRemoveTmpls []*template.Template  // compiled from OnRemove
+}
+```
 
-`HitTracker` is not involved in static mode. `hit_count`, `find_time`, and
-`jail_time` have no meaning for static entries (the file itself determines
-membership duration). Validation should warn if those fields are set alongside
-`watch_mode: static`.
+`compileTemplates` and `Reconfigure` compile both `OnAdd` and `OnRemove`
+template slices. The `onMatchTmpls` field is replaced by `onAddTmpls` internally.
+
+**`HandleEvent` dispatches on `evt.Kind`:**
+
+- `EventLine` (tail, default) — existing logic entirely unchanged.
+- `EventAdded` — run `filter.Match`, validate IP (same `net.ParseIP`/`net.ParseCIDR`
+  switch as today), skip `HitTracker`, run `onAddTmpls` directly.
+  The `query_before_match` gate still applies: if `cfg.QueryBeforeMatch && queryTmpl != nil`,
+  run the query; exit 0 suppresses `on_add`. No `ActionRunner.Submit` dedup is
+  needed since the watch layer guarantees each added line fires only once per scan.
+- `EventRemoved` — run `filter.Match`, validate IP, run `onRemoveTmpls`.
+  No query check, no HitTracker.
 
 ### Phase 3 — Whitelist.d support
 
 #### 3a — Config shape
 
-Add `Whitelists []JailConfig` to `Config`. Fragment files in `whitelist.d/` use
-a `whitelists:` key (not `jails:`):
+Add `Whitelists []JailConfig` to `Config`. Fragment files may contain either
+key (or both):
 
 ```yaml
 # /etc/jailtime/whitelist.d/cloudflare.yaml
@@ -169,21 +236,12 @@ whitelists:
     ...
 ```
 
-Main config gains a parallel include mechanism:
+The existing `include:` glob list already handles fragment-file discovery.
+Fragment files need not be segregated by directory — any included file may
+contain both `jails:` and `whitelists:` keys.
 
-```yaml
-# /etc/jailtime/jail.yaml
-include:
-  - jails.d/*.yaml
-  - whitelist.d/*.yaml    # fragment files may contain jails: or whitelists:
-```
+**`rawJailsFile` → `rawFragmentFile`** in `internal/config/load.go`:
 
-OR add a dedicated `include_whitelists` key. The simpler approach is to allow
-fragment files to contain **either** `jails:` or `whitelists:` (or both), and
-extend `loadJailsFile` → `loadFragmentFile` to parse both keys. This avoids a
-second include directive.
-
-`rawJailsFile` becomes `rawFragmentFile`:
 ```go
 type rawFragmentFile struct {
     Jails      []rawJailConfig `yaml:"jails"`
@@ -191,32 +249,72 @@ type rawFragmentFile struct {
 }
 ```
 
+`loadJailsFile` is renamed `loadFragmentFile`, returns
+`(jails []rawJailConfig, whitelists []rawJailConfig, error)`.
+
+**`rawConfig`** gains a `Whitelists` field:
+```go
+type rawConfig struct {
+    ...
+    Jails      []rawJailConfig `yaml:"jails"`
+    Whitelists []rawJailConfig `yaml:"whitelists"` // NEW
+}
+```
+
+The main `Load` function builds `config.Config.Whitelists` from `raw.Whitelists`
+using the same `rawJailConfig → JailConfig` conversion as for jails.
+
+**`applyDefaults`** must loop over `c.Whitelists` in addition to `c.Jails`.
+
+**`Validate`** must:
+- Check `c.Whitelists` with the same per-entry rules as `c.Jails`.
+- Error on name collisions between jails and whitelists.
+
 #### 3b — Startup ordering (iptables rule order)
 
-The `Manager` must start whitelist runtimes and wait for their `on_start` actions
-to complete **before** starting any jail runtimes. This ensures whitelist ACCEPT
-rules exist in iptables before any DROP rules are inserted.
+`Manager.Run` starts whitelist runtimes **before** jail runtimes. Both complete
+`on_start` before any jail action is triggered.
 
 ```go
 // manager.go — Run()
-// 1. Start whitelists (on_start + set up watchers)
-// 2. Start jails (on_start + set up watchers)
+// 1. Start all enabled whitelists (on_start + watchers)
+// 2. Start all enabled jails (on_start + watchers)
 ```
 
-Both share the same watch backend and event channel. The backend receives specs
-from both pools. The event router resolves `evt.JailName` in a combined map
-`allRuntimes = whitelists ∪ jails`.
+**`Manager` struct** gains:
 
-The `Manager` struct gains:
 ```go
 type Manager struct {
-    cfg        *config.Config
-    jails      map[string]*JailRuntime
-    whitelists map[string]*JailRuntime   // NEW
-    backend    watch.Backend
-    mu         sync.RWMutex
+    cfg             *config.Config
+    configPath      string
+    jails           map[string]*JailRuntime
+    whitelists      map[string]*JailRuntime  // NEW
+    backend         watch.Backend
+    mu              sync.RWMutex
+    perf            *PerfMetrics
+    currentInterval time.Duration
+    lastDrainAt     time.Time
 }
 ```
+
+`NewManager` initialises `m.whitelists` from `cfg.Whitelists`, same pattern as
+`m.jails`.
+
+**`buildSpecs`** is updated to include specs from `m.whitelists` as well as
+`m.jails` (all share the same backend).
+
+**`processBatch`** looks up runtimes in a combined map:
+
+```go
+// snapshot from both maps under RLock
+allRuntimes := make(map[string]*JailRuntime, len(m.jails)+len(m.whitelists))
+for name, jr := range m.jails      { allRuntimes[name] = jr }
+for name, jr := range m.whitelists { allRuntimes[name] = jr }
+```
+
+**`RestartJail`** already reloads and reconciles jails. A parallel
+`RestartWhitelist` method handles the whitelist map. Both must also call
+`m.backend.UpdateSpecs` with the merged spec list.
 
 #### 3c — Control API & CLI
 
@@ -232,36 +330,102 @@ Mirror the existing jail endpoints for whitelists:
 | GET | `/v1/whitelists/{name}/config/files` | matched files |
 | GET | `/v1/whitelists/{name}/config/test` | test filters |
 
-CLI: `jailtime whitelist [list|status|start|stop|restart]` mirroring `jailtime jail`.
+**`control/server.go`**: register `/v1/whitelists` and `/v1/whitelists/` handlers,
+mirroring `handleJails` / `handleJailAction`. Path parsing via
+`strings.SplitN(trimmed, "/", 3)` (same pattern as existing).
 
-Implementing the full chain per the architecture guide:
-`api.go` → `jail_runtime.go` (no change; shared) → `manager.go` → `server.go` →
-`client.go` → `jailtimed/main.go` (adapter) → `jailtime/main.go` (cobra).
+**`JailController` interface** gains whitelist equivalents of every jail method:
+`StartWhitelist`, `StopWhitelist`, `RestartWhitelist`, `WhitelistStatus`,
+`AllWhitelistStatuses`, `WhitelistConfigFiles`, `WhitelistConfigTest`.
+
+**`control/api.go`** adds `ListWhitelistsResponse`, reusing `JailStatusResponse`.
+
+**`control/client.go`** adds client methods for each new endpoint using the
+existing `c.get` / `c.post` helpers.
+
+**`cmd/jailtimed/main.go`** — `JailControllerAdapter` gains whitelist methods
+bridging to `Manager`.
+
+**`cmd/jailtime/main.go`** — add `whitelist` cobra subcommand tree mirroring
+the existing `status`/`start`/`stop`/`restart`/`config` commands, with a
+`whitelist` parent command.
 
 ### Phase 4 — First-class whitelist-ignore in jails
 
-Add a convenience field `whitelist_sets` to `JailConfig`:
+Add `ignore_sets` to `JailConfig`:
 
 ```yaml
 jails:
   - name: nginx
-    whitelist_sets:
-      - cloudflare        # NEW — name of a whitelist defined in whitelists:/whitelist.d/
+    ignore_sets:
+      - cloudflare      # name of a loaded whitelist runtime
       - trusted_nets
 ```
 
-When `whitelist_sets` is non-empty, the engine performs an **in-memory Go
-membership check** against the named whitelists before running `on_add`. This
-check handles both `type: ip` whitelists (exact IP match against a set of IPs)
-and `type: cidr` whitelists (IP contained within any CIDR range). The check is
-not delegated to ipset or any external tool — it is a pure Go comparison.
+**In-memory membership on `JailRuntime`:**
 
-If the candidate IP is a member of any named whitelist set, `on_add` is
-suppressed. This replaces the need to hand-write a `query` template.
+Each static whitelist runtime maintains two in-memory sets, updated on every
+`HandleEvent` call:
 
-Validation: error if both `query` and `whitelist_sets` are set simultaneously
-(ambiguous semantics) — require the operator to merge them manually or leave
-`query` empty.
+```go
+type JailRuntime struct {
+    ...
+    memberIPs   map[string]struct{}  // for net_type: IP  (keyed by normalised IP string)
+    memberCIDRs []*net.IPNet         // for net_type: CIDR
+}
+
+func (jr *JailRuntime) IsMember(ip string) bool
+```
+
+`EventAdded` adds to the set; `EventRemoved` removes from it. The sets are
+guarded by `jr.mu`.
+
+**Injection at construction time:**
+
+`JailRuntime` holds a membership-checker function injected by the manager after
+all runtimes are created:
+
+```go
+type MembershipChecker func(ip string) bool
+
+type JailRuntime struct {
+    ...
+    ignoreSetsChecker MembershipChecker  // nil if ignore_sets not configured
+}
+```
+
+In `Manager.NewManager` (and `RestartJail` after reconciliation), after
+constructing all runtimes, inject:
+
+```go
+func (m *Manager) injectIgnoreSets() {
+    for _, jr := range m.jails {
+        if len(jr.cfg.IgnoreSets) > 0 {
+            jr.ignoreSetsChecker = m.buildIgnoreChecker(jr.cfg.IgnoreSets)
+        }
+    }
+}
+
+func (m *Manager) buildIgnoreChecker(sets []string) MembershipChecker {
+    return func(ip string) bool {
+        m.mu.RLock()
+        defer m.mu.RUnlock()
+        for _, name := range sets {
+            if wl, ok := m.whitelists[name]; ok && wl.IsMember(ip) {
+                return true
+            }
+        }
+        return false
+    }
+}
+```
+
+In `HandleEvent`, after a threshold hit for `EventLine` (or for `EventAdded`),
+call `ignoreSetsChecker` before executing `onAddTmpls`. If it returns `true`,
+suppress `on_add` and log.
+
+**Validation**: error if both `query` and `ignore_sets` are set simultaneously
+(require the operator to choose one approach).
 
 ---
 
@@ -269,35 +433,35 @@ Validation: error if both `query` and `whitelist_sets` are set simultaneously
 
 | File | Change |
 |------|--------|
-| `internal/config/types.go` | Add `ExcludeFiles`, `WatchMode`, `WhitelistSets`, `Type` to `JailConfig`; add `OnAdd`, `OnRemove` to `JailActions` (keep `OnMatch` as deprecated alias for `OnAdd`); add `Whitelists []JailConfig` to `Config` |
-| `internal/config/load.go` | Extend `rawFragmentFile` to parse `whitelists:`; load whitelist fragments; build `Config.Whitelists` |
-| `internal/config/validate.go` | Validate `watch_mode` values; warn on `hit_count`/`find_time` with static mode; validate `whitelist_sets`/`query` conflict; error on whitelist/jail name collision |
-| `internal/watch/backend.go` | Add `EventKind`, `Kind` to `Event`; add `ExcludeGlobs`, `WatchMode` to `WatchSpec` |
-| `internal/watch/poll.go` | Implement static snapshot diffing; apply `ExcludeGlobs` |
-| `internal/watch/fsnotify.go` | Implement static snapshot diffing; apply `ExcludeGlobs` |
-| `internal/engine/jail_runtime.go` | Dispatch on `evt.Kind`; handle `EventAdded`/`EventRemoved`; implement `whitelist_sets` in-memory membership check (ip and CIDR) |
-| `internal/engine/manager.go` | Add `whitelists map`; start whitelists before jails; expose whitelist management methods; update `buildSpecs` |
-| `internal/control/api.go` | Add whitelist request/response structs |
-| `internal/control/server.go` | Add whitelist routes and `JailController` interface methods |
-| `internal/control/client.go` | Add whitelist client methods |
-| `cmd/jailtimed/main.go` | Extend `JailControllerAdapter` with whitelist methods |
-| `cmd/jailtime/main.go` | Add `whitelist` cobra subcommand tree |
-| `samples/whitelist.d/` | Add sample whitelist configs (cloudflare CIDR, trusted-nets) |
+| `internal/config/types.go` | Add `WatchMode`, `ExcludeFiles`, `IgnoreSets []string` to `JailConfig`; add `OnAdd`, `OnRemove []string` to `JailActions` (keep `OnMatch` as deprecated alias); add `Whitelists []JailConfig` to `Config` |
+| `internal/config/load.go` | Rename `rawJailsFile` → `rawFragmentFile` (adds `Whitelists` key); rename `loadJailsFile` → `loadFragmentFile`; add `WatchMode`, `ExcludeFiles`, `IgnoreSets` to `rawJailConfig`; build `Config.Whitelists` from `raw.Whitelists`; merge `OnMatch` → `OnAdd` with deprecation warning |
+| `internal/config/validate.go` | Branch on `watch_mode`: relax `find_time`/`jail_time`/`hit_count` for static; require `on_add`; validate `watch_mode` values; error on `ignore_sets`+`query` conflict; error on whitelist/jail name collision; validate `c.Whitelists` entries |
+| `internal/watch/backend.go` | Add `EventKind` type + `EventLine`/`EventAdded`/`EventRemoved` consts; add `Kind` to `RawLine`; add `Kind` to `Event`; add `ExcludeGlobs`, `WatchMode` to `WatchSpec` |
+| `internal/watch/poll.go` | Add `staticSnapshots map[string]map[string]bool`; on each tick: for static specs, read whole file, diff against snapshot, emit `RawLine{Kind: EventAdded/EventRemoved}`; apply `ExcludeGlobs` before opening tailers |
+| `internal/watch/fsnotify.go` | Same static snapshot diffing triggered on `Write`/`Create`/`Rename` events; apply `ExcludeGlobs` in `initialScan` and `handleCreate` |
+| `internal/engine/jail_runtime.go` | Add `onAddTmpls`, `onRemoveTmpls []*template.Template`, `memberIPs map[string]struct{}`, `memberCIDRs []*net.IPNet`, `ignoreSetsChecker MembershipChecker`; update `compileTemplates`/`Reconfigure` for new templates; dispatch in `HandleEvent` on `evt.Kind`; add `IsMember(ip string) bool` method |
+| `internal/engine/manager.go` | Add `whitelists map[string]*JailRuntime`; start whitelists before jails in `Run`; add `injectIgnoreSets`/`buildIgnoreChecker`; update `buildSpecs`, `processBatch` to include whitelists; add `StartWhitelist`/`StopWhitelist`/`RestartWhitelist`/`WhitelistStatus`/`AllWhitelistStatuses`/`WhitelistConfigFiles`/`WhitelistConfigTest` methods |
+| `internal/control/api.go` | Add `ListWhitelistsResponse` (reuses `JailStatusResponse`) |
+| `internal/control/server.go` | Add whitelist methods to `JailController` interface; register `/v1/whitelists` and `/v1/whitelists/` handlers; add `handleWhitelists` and `handleWhitelistAction` (mirror of `handleJails`/`handleJailAction`) |
+| `internal/control/client.go` | Add `ListWhitelists`, `WhitelistStatus`, `StartWhitelist`, `StopWhitelist`, `RestartWhitelist`, `WhitelistConfigFiles`, `WhitelistConfigTest` client methods |
+| `cmd/jailtimed/main.go` | Extend `JailControllerAdapter` with whitelist methods delegating to `Manager` |
+| `cmd/jailtime/main.go` | Add `whitelist` cobra command with `status`/`start`/`stop`/`restart`/`config files`/`config test` subcommands mirroring the jail commands |
+| `samples/whitelist.d/` | Add sample configs: cloudflare CIDR static whitelist, trusted-nets IP static whitelist |
 
 ---
 
 ## Implementation Order
 
-The phases are designed to be independently mergeable:
+The phases are independently mergeable:
 
-1. **Phase 1** (exclude_files) — pure config + watch layer, no engine changes.
-2. **Phase 2** (static files) — watch layer + engine; no whitelist concept yet.
-   Can be validated with a regular jail using `watch_mode: static`.
-3. **Phase 3** (whitelist.d) — config + manager + API + CLI; builds on Phase 2
-   for the common case of static whitelists, but works with `watch_mode: tail`
-   too.
-4. **Phase 4** (whitelist_sets) — small engine change; can be deferred if the
-   `query` field is sufficient for early adopters.
+1. **Phase 1** (exclude_files) — config + watch layer only, no engine changes.
+2. **Phase 2** (static files) — watch layer (`RawLine.Kind`, static snapshots) +
+   engine (`HandleEvent` dispatch, `onAddTmpls`/`onRemoveTmpls`). Can be validated
+   with a regular jail using `watch_mode: static` before any whitelist concept exists.
+3. **Phase 3** (whitelist.d) — config schema + manager + full API + CLI chain;
+   builds on Phase 2 for static whitelists but also works with `watch_mode: tail`.
+4. **Phase 4** (ignore_sets) — adds `IsMember`, `MembershipChecker` injection, and
+   the `ignore_sets` config field; can be deferred if operators use `query` directly.
 
 ---
 
