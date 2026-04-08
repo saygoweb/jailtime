@@ -31,7 +31,7 @@ no log activity occurs.
 ## Why JailTime
 
 - It's faster than crowdsec
-- It's more configurable that Fail2ban, especially in support of whitelists
+- It's more configurable than Fail2ban, especially in support of whitelists
 - It's really very efficient at what it does. Approx 3x more performant that Fail2ban
 - Dynamic start, stop, restart (including reload of config) of jails / whitelists
 
