@@ -6,11 +6,18 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"strings"
 	"text/template"
 	"time"
 )
 
 const defaultTimeout = 10 * time.Second
+
+// cleanOutput trims trailing newlines then replaces remaining interior newlines with "; ".
+func cleanOutput(s string) string {
+	s = strings.TrimRight(s, "\n")
+	return strings.ReplaceAll(s, "\n", "; ")
+}
 
 // Result holds the outcome of running a single command.
 type Result struct {
@@ -72,10 +79,10 @@ func Run(ctx context.Context, tmpl string, actCtx Context, timeout time.Duration
 		Error:    runErr,
 	}
 
-	slog.Info("action run",
+	slog.Info("ACTN run",
 		"command", rendered,
-		"stdout", result.Stdout,
-		"stderr", result.Stderr,
+		"stdout", cleanOutput(result.Stdout),
+		"stderr", cleanOutput(result.Stderr),
 		"exitCode", exitCode,
 	)
 
@@ -120,10 +127,10 @@ func RunCompiled(ctx context.Context, tmpl *template.Template, actCtx Context, t
 		Error:    runErr,
 	}
 
-	slog.Info("action run",
+	slog.Info("ACTN run",
 		"command", rendered,
-		"stdout", result.Stdout,
-		"stderr", result.Stderr,
+		"stdout", cleanOutput(result.Stdout),
+		"stderr", cleanOutput(result.Stderr),
 		"exitCode", exitCode,
 	)
 

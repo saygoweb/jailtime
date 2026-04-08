@@ -24,3 +24,18 @@ func Extract(re *regexp.Regexp, line string) string {
 	}
 	return ""
 }
+
+// ExtractLabel attempts to get the "label" named capture group from a regex match on line.
+// Returns "" if no named "label" group exists or it didn't match.
+func ExtractLabel(re *regexp.Regexp, line string) string {
+	match := re.FindStringSubmatch(line)
+	if match == nil {
+		return ""
+	}
+	for i, name := range re.SubexpNames() {
+		if name == "label" && i < len(match) {
+			return match[i]
+		}
+	}
+	return ""
+}

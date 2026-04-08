@@ -518,9 +518,10 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 			return nil
 		}
 
-		slog.Info("hit threshold reached, running on_add",
+		slog.Info("JAIL on_add",
 			"jail", cfg.Name,
 			"ip", result.IP,
+			"label", result.Label,
 			"count", count,
 			"threshold", threshold,
 		)

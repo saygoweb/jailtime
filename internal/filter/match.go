@@ -3,6 +3,7 @@ package filter
 // Result is returned from a successful match.
 type Result struct {
 	IP      string // extracted IP or CIDR text
+	Label   string // extracted label text (from (?P<label>...) group), may be empty
 	Line    string // original log line
 	Pattern string // matched filter pattern
 }
@@ -35,10 +36,12 @@ func Match(line string, includes, excludes []*CompiledFilter) (*Result, error) {
 
 	// Step 4: extract IP from named (or first) capture group.
 	ip := Extract(matched.re, line)
+	label := ExtractLabel(matched.re, line)
 
 	// Step 5: return result.
 	return &Result{
 		IP:      ip,
+		Label:   label,
 		Line:    line,
 		Pattern: matched.pattern,
 	}, nil
