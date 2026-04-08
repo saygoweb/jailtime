@@ -102,6 +102,44 @@ func TestExtractFallback(t *testing.T) {
 	}
 }
 
+func TestExtractNamedGroups(t *testing.T) {
+	cf, _ := Compile(`(?P<ip>\d+\.\d+\.\d+\.\d+) (?P<tag1>\S+) (?P<tag2>\S+)`)
+	line := "1.2.3.4 webapp prod"
+	got := ExtractNamedGroups(cf.re, line)
+	if got["tag1"] != "webapp" {
+		t.Errorf("tag1 = %q, want %q", got["tag1"], "webapp")
+	}
+	if got["tag2"] != "prod" {
+		t.Errorf("tag2 = %q, want %q", got["tag2"], "prod")
+	}
+	// "ip" group must be excluded.
+	if _, ok := got["ip"]; ok {
+		t.Error("NamedGroups should not include the \"ip\" group")
+	}
+}
+
+func TestExtractNamedGroupsNoMatch(t *testing.T) {
+	cf, _ := Compile(`(?P<ip>\d+\.\d+\.\d+\.\d+)`)
+	got := ExtractNamedGroups(cf.re, "no ip here")
+	if got != nil {
+		t.Errorf("expected nil for non-matching line, got %v", got)
+	}
+}
+
+func TestMatchPopulatesNamedGroups(t *testing.T) {
+	inc, _ := CompileAll([]string{`(?P<ip>\d+\.\d+\.\d+\.\d+) (?P<tag1>\S+)`})
+	res, err := Match("1.2.3.4 webapp", inc, nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected Result, got nil")
+	}
+	if res.NamedGroups["tag1"] != "webapp" {
+		t.Errorf("NamedGroups[tag1] = %q, want %q", res.NamedGroups["tag1"], "webapp")
+	}
+}
+
 // --- ValidateNetType tests ---
 
 func TestValidateNetTypeIP(t *testing.T) {

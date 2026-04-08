@@ -25,17 +25,20 @@ func Extract(re *regexp.Regexp, line string) string {
 	return ""
 }
 
-// ExtractLabel attempts to get the "label" named capture group from a regex match on line.
-// Returns "" if no named "label" group exists or it didn't match.
-func ExtractLabel(re *regexp.Regexp, line string) string {
+// ExtractNamedGroups returns a map of all named capture groups (excluding "ip")
+// that matched in line. Groups that are present in the pattern but did not
+// participate in the match are included with an empty string value.
+// Returns nil when the pattern does not match line at all.
+func ExtractNamedGroups(re *regexp.Regexp, line string) map[string]string {
 	match := re.FindStringSubmatch(line)
 	if match == nil {
-		return ""
+		return nil
 	}
+	groups := make(map[string]string)
 	for i, name := range re.SubexpNames() {
-		if name == "label" && i < len(match) {
-			return match[i]
+		if name != "" && name != "ip" && i < len(match) {
+			groups[name] = match[i]
 		}
 	}
-	return ""
+	return groups
 }

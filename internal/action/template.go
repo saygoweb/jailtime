@@ -7,16 +7,13 @@ import (
 
 // Context holds values available in action command templates.
 type Context struct {
-	IP        string
-	Jail      string
-	File      string
-	Line      string
-	// Label is a user-configured value that identifies the source of the match.
-	// Its content is determined by the jail's label_from setting:
-	//   "match"      (default) – text captured by (?P<label>...) in the filter
-	//   "parent_dir"           – name of the directory containing File
-	// Empty when the configured source yields no value.
-	Label     string
+	IP       string
+	Jail     string
+	File     string
+	Line     string
+	// Tags is the comma-joined list of tag values resolved from the jail's
+	// tags_from config. Empty string when tags_from is empty or yields no values.
+	Tags      string
 	JailTime  int64 // seconds
 	FindTime  int64 // seconds
 	HitCount  int

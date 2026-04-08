@@ -1121,83 +1121,66 @@ func TestHandleEventCIDRWithSlashNormalized(t *testing.T) {
 	}
 }
 
-// TestResolveLabelMatch verifies that resolveLabel returns the filter-captured
-// label when label_from is "match" or empty.
-func TestResolveLabelMatch(t *testing.T) {
-	for _, labelFrom := range []string{"", "match"} {
-		got := resolveLabel(labelFrom, "captured", "/var/log/svc/access.log")
-		if got != "captured" {
-			t.Errorf("resolveLabel(%q) = %q, want %q", labelFrom, got, "captured")
-		}
+// TestResolveTagsParentDir verifies that resolveTags returns the parent
+// directory name of the file for the "parent_dir" source.
+func TestResolveTagsParentDir(t *testing.T) {
+	got := resolveTags([]string{"parent_dir"}, nil, "/var/log/apache2/some-domain.com/access.log")
+	if len(got) != 1 || got[0] != "some-domain.com" {
+		t.Errorf("resolveTags(parent_dir) = %v, want [some-domain.com]", got)
 	}
 }
 
-// TestResolveLabelParentDir verifies that resolveLabel returns the parent
-// directory name of the file when label_from is "parent_dir".
-func TestResolveLabelParentDir(t *testing.T) {
-	got := resolveLabel("parent_dir", "captured", "/var/log/apache2/some-domain.com/access.log")
-	if got != "some-domain.com" {
-		t.Errorf("resolveLabel(parent_dir) = %q, want %q", got, "some-domain.com")
+// TestResolveTagsMatchTag verifies that resolveTags extracts the correct named
+// capture group for a match_tagN source.
+func TestResolveTagsMatchTag(t *testing.T) {
+	groups := map[string]string{"tag1": "webapp", "tag2": "prod"}
+	got := resolveTags([]string{"match_tag1", "match_tag2"}, groups, "/var/log/app.log")
+	if len(got) != 2 || got[0] != "webapp" || got[1] != "prod" {
+		t.Errorf("resolveTags(match_tag1, match_tag2) = %v, want [webapp prod]", got)
 	}
 }
 
-// TestHandleEventLabelFromMatch verifies that with label_from unset the Label
-// template variable is populated from the (?P<label>...) capture group.
-func TestHandleEventLabelFromMatch(t *testing.T) {
+// TestResolveTagsMixed verifies multiple sources are combined in order.
+func TestResolveTagsMixed(t *testing.T) {
+	groups := map[string]string{"tag1": "webapp"}
+	got := resolveTags([]string{"parent_dir", "match_tag1"}, groups, "/var/log/apache2/site.example/access.log")
+	if len(got) != 2 || got[0] != "site.example" || got[1] != "webapp" {
+		t.Errorf("resolveTags(mixed) = %v, want [site.example webapp]", got)
+	}
+}
+
+// TestResolveTagsEmpty verifies an empty tags_from yields no tags.
+func TestResolveTagsEmpty(t *testing.T) {
+	got := resolveTags(nil, map[string]string{"tag1": "x"}, "/var/log/app.log")
+	if len(got) != 0 {
+		t.Errorf("resolveTags(nil) = %v, want []", got)
+	}
+}
+
+// TestResolveTagsMissingGroup verifies that a match_tagN source with no
+// corresponding capture group is silently omitted.
+func TestResolveTagsMissingGroup(t *testing.T) {
+	got := resolveTags([]string{"match_tag3"}, map[string]string{"tag1": "x"}, "/var/log/app.log")
+	if len(got) != 0 {
+		t.Errorf("resolveTags(missing group) = %v, want []", got)
+	}
+}
+
+// TestHandleEventTagsFromParentDir verifies that with tags_from: [parent_dir]
+// the Tags template variable contains the parent directory name.
+func TestHandleEventTagsFromParentDir(t *testing.T) {
 	dir := t.TempDir()
 	outFile := filepath.Join(dir, "output.txt")
 
 	cfg := &config.JailConfig{
-		Name:     "label-match-jail",
+		Name:     "tags-parentdir-jail",
 		Enabled:  true,
-		Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+) (?P<label>\S+)`},
+		TagsFrom: []string{"parent_dir"},
+		Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
 		HitCount: 1,
 		FindTime: config.Duration{Duration: time.Minute},
 		Actions: config.JailActions{
-			OnAdd: []string{"echo {{ .Label }} > " + outFile},
-		},
-		ActionTimeout: config.Duration{Duration: 5 * time.Second},
-	}
-
-	jr, err := NewJailRuntime(cfg)
-	if err != nil {
-		t.Fatalf("NewJailRuntime: %v", err)
-	}
-
-	if err := jr.HandleEvent(context.Background(), watch.Event{
-		JailName: cfg.Name,
-		FilePath: "/var/log/app.log",
-		Line:     "Failed from 1.2.3.4 webapp",
-		Time:     time.Now(),
-	}); err != nil {
-		t.Fatalf("HandleEvent: %v", err)
-	}
-	jr.WaitForInflight()
-
-	data, err := os.ReadFile(outFile)
-	if err != nil {
-		t.Fatalf("output file not created: %v", err)
-	}
-	if got := strings.TrimSpace(string(data)); got != "webapp" {
-		t.Errorf("Label = %q, want %q", got, "webapp")
-	}
-}
-
-// TestHandleEventLabelFromParentDir verifies that with label_from: parent_dir
-// the Label template variable is populated with the parent directory name.
-func TestHandleEventLabelFromParentDir(t *testing.T) {
-	dir := t.TempDir()
-	outFile := filepath.Join(dir, "output.txt")
-
-	cfg := &config.JailConfig{
-		Name:      "label-parentdir-jail",
-		Enabled:   true,
-		LabelFrom: "parent_dir",
-		Filters:   []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
-		HitCount:  1,
-		FindTime:  config.Duration{Duration: time.Minute},
-		Actions: config.JailActions{
-			OnAdd: []string{"echo {{ .Label }} > " + outFile},
+			OnAdd: []string{"echo {{ .Tags }} > " + outFile},
 		},
 		ActionTimeout: config.Duration{Duration: 5 * time.Second},
 	}
@@ -1222,7 +1205,93 @@ func TestHandleEventLabelFromParentDir(t *testing.T) {
 		t.Fatalf("output file not created: %v", err)
 	}
 	if got := strings.TrimSpace(string(data)); got != "some-domain.com" {
-		t.Errorf("Label = %q, want %q", got, "some-domain.com")
+		t.Errorf("Tags = %q, want %q", got, "some-domain.com")
+	}
+}
+
+// TestHandleEventTagsFromMatchTag verifies that tags_from: [match_tag1]
+// exposes the (?P<tag1>...) capture group as Tags.
+func TestHandleEventTagsFromMatchTag(t *testing.T) {
+	dir := t.TempDir()
+	outFile := filepath.Join(dir, "output.txt")
+
+	cfg := &config.JailConfig{
+		Name:     "tags-matchtag-jail",
+		Enabled:  true,
+		TagsFrom: []string{"match_tag1"},
+		Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+) (?P<tag1>\S+)`},
+		HitCount: 1,
+		FindTime: config.Duration{Duration: time.Minute},
+		Actions: config.JailActions{
+			OnAdd: []string{"echo {{ .Tags }} > " + outFile},
+		},
+		ActionTimeout: config.Duration{Duration: 5 * time.Second},
+	}
+
+	jr, err := NewJailRuntime(cfg)
+	if err != nil {
+		t.Fatalf("NewJailRuntime: %v", err)
+	}
+
+	if err := jr.HandleEvent(context.Background(), watch.Event{
+		JailName: cfg.Name,
+		FilePath: "/var/log/app.log",
+		Line:     "Failed from 1.2.3.4 webapp",
+		Time:     time.Now(),
+	}); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	jr.WaitForInflight()
+
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("output file not created: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "webapp" {
+		t.Errorf("Tags = %q, want %q", got, "webapp")
+	}
+}
+
+// TestHandleEventTagsFromMultiple verifies that multiple tags_from sources are
+// joined with "," in Tags.
+func TestHandleEventTagsFromMultiple(t *testing.T) {
+	dir := t.TempDir()
+	outFile := filepath.Join(dir, "output.txt")
+
+	cfg := &config.JailConfig{
+		Name:     "tags-multi-jail",
+		Enabled:  true,
+		TagsFrom: []string{"parent_dir", "match_tag1"},
+		Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+) (?P<tag1>\S+)`},
+		HitCount: 1,
+		FindTime: config.Duration{Duration: time.Minute},
+		Actions: config.JailActions{
+			OnAdd: []string{"echo {{ .Tags }} > " + outFile},
+		},
+		ActionTimeout: config.Duration{Duration: 5 * time.Second},
+	}
+
+	jr, err := NewJailRuntime(cfg)
+	if err != nil {
+		t.Fatalf("NewJailRuntime: %v", err)
+	}
+
+	if err := jr.HandleEvent(context.Background(), watch.Event{
+		JailName: cfg.Name,
+		FilePath: "/var/log/apache2/site.example/access.log",
+		Line:     "Failed from 1.2.3.4 webapp",
+		Time:     time.Now(),
+	}); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	jr.WaitForInflight()
+
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("output file not created: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "site.example,webapp" {
+		t.Errorf("Tags = %q, want %q", got, "site.example,webapp")
 	}
 }
 

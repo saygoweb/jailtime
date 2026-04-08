@@ -28,23 +28,23 @@ func TestRenderJailTime(t *testing.T) {
 	}
 }
 
-func TestRenderLabel(t *testing.T) {
-	result, err := Render("label={{ .Label }}", Context{Label: "some-domain.com"})
+func TestRenderTags(t *testing.T) {
+	result, err := Render("tags={{ .Tags }}", Context{Tags: "some-domain.com,webapp"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result != "label=some-domain.com" {
-		t.Errorf("got %q, want %q", result, "label=some-domain.com")
+	if result != "tags=some-domain.com,webapp" {
+		t.Errorf("got %q, want %q", result, "tags=some-domain.com,webapp")
 	}
 }
 
-func TestRenderLabelEmpty(t *testing.T) {
-	result, err := Render("{{ .IP }} label={{ .Label }}", Context{IP: "1.2.3.4"})
+func TestRenderTagsEmpty(t *testing.T) {
+	result, err := Render("{{ .IP }} tags={{ .Tags }}", Context{IP: "1.2.3.4"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if result != "1.2.3.4 label=" {
-		t.Errorf("got %q, want %q", result, "1.2.3.4 label=")
+	if result != "1.2.3.4 tags=" {
+		t.Errorf("got %q, want %q", result, "1.2.3.4 tags=")
 	}
 }
 
