@@ -699,6 +699,153 @@ func TestDebugRateLimiterInWatch(t *testing.T) {
 	}
 }
 
+// TestPollBackendSharedFileNewFile verifies that when two jails watch the same
+// path and the file is created after the backend starts, both jails receive
+// events for lines appended to that file.
+func TestPollBackendSharedFileNewFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "blockhandler.log")
+
+	b := NewPollBackend(100 * time.Millisecond)
+	specs := []WatchSpec{
+		{JailName: "blockhandler", Globs: []string{path}, WatchMode: "tail", ReadFromEnd: true},
+		{JailName: "whitelist-blockhandler", Globs: []string{path}, WatchMode: "tail", ReadFromEnd: true},
+	}
+	out, cancel := startBackendDrain(t, b, specs)
+	defer cancel()
+
+	time.Sleep(150 * time.Millisecond)
+
+	// Create the file after the backend is running (simulates a log file that
+	// does not yet exist at daemon startup).
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	fmt.Fprintln(f, "1.2.3.4 blocked")
+	f.Close()
+
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for event")
+	}
+	if ev.Line != "1.2.3.4 blocked" {
+		t.Errorf("expected line %q, got %q", "1.2.3.4 blocked", ev.Line)
+	}
+	seen := make(map[string]bool)
+	for _, j := range ev.Jails {
+		seen[j] = true
+	}
+	if !seen["blockhandler"] || !seen["whitelist-blockhandler"] {
+		t.Errorf("expected both jails in RawLine.Jails, got: %v", ev.Jails)
+	}
+}
+
+// TestFsnotifyBackendSharedFileNewFile verifies that when two jails watch the
+// same path and the file is created after the backend starts, both jails
+// receive events. This is the regression test for the handleCreate early-return
+// bug where only the first matching jail was registered in pathToJails.
+func TestFsnotifyBackendSharedFileNewFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "blockhandler.log")
+
+	b := NewFsnotifyBackend(100 * time.Millisecond)
+	specs := []WatchSpec{
+		{JailName: "blockhandler", Globs: []string{path}, WatchMode: "tail", ReadFromEnd: true},
+		{JailName: "whitelist-blockhandler", Globs: []string{path}, WatchMode: "tail", ReadFromEnd: true},
+	}
+	out, cancel := startBackendDrain(t, b, specs)
+	defer cancel()
+
+	time.Sleep(150 * time.Millisecond)
+
+	// Create the file after the backend has started — this triggers handleCreate.
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	fmt.Fprintln(f, "1.2.3.4 blocked")
+	f.Close()
+
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for event after late-created shared file")
+	}
+	if ev.Line != "1.2.3.4 blocked" {
+		t.Errorf("expected line %q, got %q", "1.2.3.4 blocked", ev.Line)
+	}
+	seen := make(map[string]bool)
+	for _, j := range ev.Jails {
+		seen[j] = true
+	}
+	if !seen["blockhandler"] || !seen["whitelist-blockhandler"] {
+		t.Errorf("expected both jails in RawLine.Jails after late-created file, got: %v", ev.Jails)
+	}
+}
+
+// TestFsnotifyBackendSharedFileRotation verifies that after a log rotation
+// (rename + recreate) both jails remain registered and continue to receive
+// events for the new file.
+func TestFsnotifyBackendSharedFileRotation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "blockhandler.log")
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	b := NewFsnotifyBackend(100 * time.Millisecond)
+	specs := []WatchSpec{
+		{JailName: "blockhandler", Globs: []string{path}, WatchMode: "tail", ReadFromEnd: false},
+		{JailName: "whitelist-blockhandler", Globs: []string{path}, WatchMode: "tail", ReadFromEnd: false},
+	}
+	out, cancel := startBackendDrain(t, b, specs)
+	defer cancel()
+
+	time.Sleep(150 * time.Millisecond)
+	// Drain any events from the initial empty file.
+	drainTimeout := time.After(300 * time.Millisecond)
+drainLoop:
+	for {
+		select {
+		case <-out:
+		case <-drainTimeout:
+			break drainLoop
+		}
+	}
+
+	// Rotate: rename old file, create new one at the same path.
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	newF, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	fmt.Fprintln(newF, "5.6.7.8 blocked after rotation")
+	newF.Close()
+
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for event after rotation")
+	}
+	if ev.Line != "5.6.7.8 blocked after rotation" {
+		t.Errorf("expected line %q, got %q", "5.6.7.8 blocked after rotation", ev.Line)
+	}
+	seen := make(map[string]bool)
+	for _, j := range ev.Jails {
+		seen[j] = true
+	}
+	if !seen["blockhandler"] || !seen["whitelist-blockhandler"] {
+		t.Errorf("expected both jails after rotation, got: %v", ev.Jails)
+	}
+}
+
 // TestFsnotifyBackendIdleNoDrain verifies that when no writes occur the drain
 // callback is never invoked, i.e., the backend is truly idle with no wakeups.
 func TestFsnotifyBackendIdleNoDrain(t *testing.T) {
