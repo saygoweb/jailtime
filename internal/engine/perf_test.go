@@ -8,8 +8,8 @@ import (
 func TestPerfMetrics_SnapshotLastValues(t *testing.T) {
 	p := NewPerfMetrics(2*time.Second, 3, "nonexistent-service-for-test.service")
 
-	p.RecordExecution(10*time.Millisecond, 100*time.Millisecond, 90*time.Millisecond, 5)
-	p.RecordExecution(30*time.Millisecond, 120*time.Millisecond, 95*time.Millisecond, 8)
+	p.RecordExecution(10*time.Millisecond, 80*time.Millisecond, 100*time.Millisecond, 90*time.Millisecond, 5)
+	p.RecordExecution(30*time.Millisecond, 90*time.Millisecond, 120*time.Millisecond, 95*time.Millisecond, 8)
 
 	snap := p.Snapshot()
 
@@ -19,8 +19,11 @@ func TestPerfMetrics_SnapshotLastValues(t *testing.T) {
 	if snap.ExecutionMs != 30.0 {
 		t.Errorf("ExecutionMs = %v, want 30.0 (last value)", snap.ExecutionMs)
 	}
-	if snap.LatencyMs != 120.0 {
-		t.Errorf("LatencyMs = %v, want 120.0 (last value)", snap.LatencyMs)
+	if snap.LatencyMs != 90.0 {
+		t.Errorf("LatencyMs = %v, want 90.0 (last event latency)", snap.LatencyMs)
+	}
+	if snap.InterDrainMs != 120.0 {
+		t.Errorf("InterDrainMs = %v, want 120.0 (last inter-drain)", snap.InterDrainMs)
 	}
 	if snap.SleepMs != 95.0 {
 		t.Errorf("SleepMs = %v, want 95.0 (last value)", snap.SleepMs)
@@ -40,6 +43,9 @@ func TestPerfMetrics_ZeroBeforeFirstRecord(t *testing.T) {
 	if snap.LatencyMs != 0 {
 		t.Errorf("LatencyMs = %v before any record, want 0", snap.LatencyMs)
 	}
+	if snap.InterDrainMs != 0 {
+		t.Errorf("InterDrainMs = %v before any record, want 0", snap.InterDrainMs)
+	}
 	if snap.LinesProcessed != 0 {
 		t.Errorf("LinesProcessed = %v before any record, want 0", snap.LinesProcessed)
 	}
@@ -48,7 +54,7 @@ func TestPerfMetrics_ZeroBeforeFirstRecord(t *testing.T) {
 func TestPerfMetrics_UnavailableCgroupNoPanic(t *testing.T) {
 	// Must not panic even when cgroup path doesn't exist.
 	p := NewPerfMetrics(2*time.Second, 3, "no-such-service-xyz-123.service")
-	p.RecordExecution(1*time.Millisecond, 10*time.Millisecond, 9*time.Millisecond, 1)
+	p.RecordExecution(1*time.Millisecond, 5*time.Millisecond, 10*time.Millisecond, 9*time.Millisecond, 1)
 	snap := p.Snapshot()
 	if snap.TargetLatencyMs != 2000.0 {
 		t.Errorf("TargetLatencyMs = %v, want 2000.0", snap.TargetLatencyMs)
@@ -71,7 +77,7 @@ func TestPerfMetrics_IntendedSleepNeverExceedsTarget(t *testing.T) {
 	}
 
 	// After recording a fast execution, sleep should be slightly below target.
-	p.RecordExecution(10*time.Millisecond, target, target-10*time.Millisecond, 5)
+	p.RecordExecution(10*time.Millisecond, 10*time.Millisecond, target, target-10*time.Millisecond, 5)
 	sleep = p.IntendedSleep()
 	if sleep > target {
 		t.Errorf("IntendedSleep = %v exceeds targetLatency %v", sleep, target)
@@ -79,7 +85,7 @@ func TestPerfMetrics_IntendedSleepNeverExceedsTarget(t *testing.T) {
 
 	// After recording a slow execution (larger than target), sleep should be 0.
 	p2 := NewPerfMetrics(50*time.Millisecond, 1, "nonexistent-service-for-test.service")
-	p2.RecordExecution(100*time.Millisecond, 100*time.Millisecond, 0, 1)
+	p2.RecordExecution(100*time.Millisecond, 50*time.Millisecond, 100*time.Millisecond, 0, 1)
 	sleep2 := p2.IntendedSleep()
 	if sleep2 != 0 {
 		t.Errorf("IntendedSleep = %v, want 0 when exec > target", sleep2)
@@ -93,7 +99,7 @@ func TestPerfMetrics_MovingAvgWindow(t *testing.T) {
 	// ring buffer holds [40, 20, 30] (oldest entry overwritten), avg = 30ms.
 	p := NewPerfMetrics(2*time.Second, 3, "nonexistent-service-for-test.service")
 	for _, d := range []time.Duration{10, 20, 30, 40} {
-		p.RecordExecution(d*time.Millisecond, 2*time.Second, 0, 1)
+		p.RecordExecution(d*time.Millisecond, 0, 2*time.Second, 0, 1)
 	}
 
 	avg := p.MovingAvgExec()

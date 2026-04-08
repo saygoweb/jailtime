@@ -177,6 +177,7 @@ func (a *JailControllerAdapter) PerfStats() control.PerfResponse {
 	return control.PerfResponse{
 		TargetLatencyMs: snap.TargetLatencyMs,
 		LatencyMs:       snap.LatencyMs,
+		InterDrainMs:    snap.InterDrainMs,
 		ExecutionMs:     snap.ExecutionMs,
 		SleepMs:         snap.SleepMs,
 		LinesProcessed:  snap.LinesProcessed,
