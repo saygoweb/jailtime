@@ -558,6 +558,41 @@ whitelists:
 	}
 }
 
+func TestLoadGlobalActions(t *testing.T) {
+	y := minimalValidYAML + `
+actions:
+  on_start:
+    - "echo 'global on_start'"
+  on_stop:
+    - "echo 'global on_stop'"
+`
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Actions.OnStart) != 1 || c.Actions.OnStart[0] != "echo 'global on_start'" {
+		t.Errorf("Actions.OnStart = %v, want [\"echo 'global on_start'\"]", c.Actions.OnStart)
+	}
+	if len(c.Actions.OnStop) != 1 || c.Actions.OnStop[0] != "echo 'global on_stop'" {
+		t.Errorf("Actions.OnStop = %v, want [\"echo 'global on_stop'\"]", c.Actions.OnStop)
+	}
+}
+
+func TestLoadGlobalActionsDefault(t *testing.T) {
+	path := writeTemp(t, minimalValidYAML)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Actions.OnStart) != 0 {
+		t.Errorf("Actions.OnStart should be empty by default, got %v", c.Actions.OnStart)
+	}
+	if len(c.Actions.OnStop) != 0 {
+		t.Errorf("Actions.OnStop should be empty by default, got %v", c.Actions.OnStop)
+	}
+}
+
 func TestLoadWatchModeDefault(t *testing.T) {
 	path := writeTemp(t, minimalValidYAML)
 	c, err := Load(path)

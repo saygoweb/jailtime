@@ -46,6 +46,7 @@ type rawConfig struct {
 	Logging    LoggingConfig   `yaml:"logging"`
 	Control    ControlConfig   `yaml:"control"`
 	Engine     rawEngineConfig `yaml:"engine"`
+	Actions    GlobalActions   `yaml:"actions"`
 	Jails      []rawJailConfig `yaml:"jails"`
 	Whitelists []rawJailConfig `yaml:"whitelists"`
 }
@@ -105,6 +106,7 @@ func Load(path string) (*Config, error) {
 			PollInterval:  raw.Engine.PollInterval,
 			TargetLatency: raw.Engine.TargetLatency,
 		},
+		Actions: raw.Actions,
 	}
 
 	for _, rj := range raw.Jails {
