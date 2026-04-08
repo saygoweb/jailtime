@@ -52,6 +52,9 @@ type EngineConfig struct {
 
 // JailConfig defines a single jail rule.
 type JailConfig struct {
+	// SourceFile is the path of the config file from which this jail was loaded.
+	// It is set during loading and is not part of the YAML schema.
+	SourceFile     string      `yaml:"-"`
 	Name           string      `yaml:"name"`
 	Enabled        bool        `yaml:"enabled"`
 	Files          []string    `yaml:"files"`
