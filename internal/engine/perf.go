@@ -21,24 +21,33 @@ type PerfMetrics struct {
 
 	targetLatency time.Duration
 
-	lastLatency   time.Duration
-	lastExec      time.Duration
-	lastSleep     time.Duration
-	lastLines     int
+	lastLatency time.Duration
+	lastExec    time.Duration
+	lastSleep   time.Duration
+	lastLines   int
+
+	// execWindow is a ring buffer holding the last perfWindow execution times.
+	execWindow []time.Duration
+	windowIdx  int
+	windowFull bool
 
 	cpuSampler *cgroupCPUSampler
 	lastCPU    float64
 }
 
-func NewPerfMetrics(targetLatency time.Duration, serviceName string) *PerfMetrics {
+func NewPerfMetrics(targetLatency time.Duration, perfWindow int, serviceName string) *PerfMetrics {
+	if perfWindow < 1 {
+		perfWindow = 1
+	}
 	return &PerfMetrics{
 		targetLatency: targetLatency,
+		execWindow:    make([]time.Duration, perfWindow),
 		cpuSampler:    newCgroupCPUSampler(serviceName),
 	}
 }
 
 // RecordExecution is called after each batch drain.
-// sleepTime is the duration the backend slept before this drain.
+// sleepTime is the intended sleep before the next drain.
 // batchSize 0 means no lines were processed; CPU is not sampled in that case.
 func (p *PerfMetrics) RecordExecution(execTime, latency, sleepTime time.Duration, batchSize int) {
 	p.mu.Lock()
@@ -48,6 +57,14 @@ func (p *PerfMetrics) RecordExecution(execTime, latency, sleepTime time.Duration
 	p.lastLatency = latency
 	p.lastSleep = sleepTime
 	p.lastLines = batchSize
+
+	// Update the ring buffer with the latest execution time.
+	p.execWindow[p.windowIdx] = execTime
+	p.windowIdx++
+	if p.windowIdx >= len(p.execWindow) {
+		p.windowIdx = 0
+		p.windowFull = true
+	}
 
 	if batchSize > 0 {
 		p.lastCPU = p.cpuSampler.Sample()
@@ -59,6 +76,52 @@ func (p *PerfMetrics) SetTargetLatency(d time.Duration) {
 	p.mu.Lock()
 	p.targetLatency = d
 	p.mu.Unlock()
+}
+
+// MovingAvgExec returns the moving average of execution times over the window.
+// Must be called without p.mu held.
+func (p *PerfMetrics) MovingAvgExec() time.Duration {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.movingAvgExecLocked()
+}
+
+// movingAvgExecLocked returns the moving average of execution times.
+// Must be called with p.mu held (at least RLock).
+func (p *PerfMetrics) movingAvgExecLocked() time.Duration {
+	n := len(p.execWindow)
+	if n == 0 {
+		return 0
+	}
+	count := n
+	if !p.windowFull {
+		count = p.windowIdx
+	}
+	if count == 0 {
+		return 0
+	}
+	var total time.Duration
+	for _, d := range p.execWindow {
+		total += d
+	}
+	return total / time.Duration(n)
+}
+
+// IntendedSleep returns the sleep duration that steers total cycle time
+// towards targetLatency: targetLatency minus the moving-average execution
+// time, clamped to [0, targetLatency].
+func (p *PerfMetrics) IntendedSleep() time.Duration {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	sleep := p.targetLatency - p.movingAvgExecLocked()
+	if sleep < 0 {
+		return 0
+	}
+	if sleep > p.targetLatency {
+		return p.targetLatency
+	}
+	return sleep
 }
 
 // Close releases resources held by the PerfMetrics (e.g. the open cgroup fd).

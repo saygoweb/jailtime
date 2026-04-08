@@ -82,7 +82,7 @@ func TestGlobalOnStartRunsBeforeJails(t *testing.T) {
 		jails:      map[string]*JailRuntime{"alpha": jr},
 		whitelists: map[string]*JailRuntime{},
 		backend:    watch.NewAuto("poll", 50*time.Millisecond),
-		perf:       NewPerfMetrics(50*time.Millisecond, ""),
+		perf:       NewPerfMetrics(50*time.Millisecond, 1, ""),
 	}
 	m.currentInterval = 50 * time.Millisecond
 
@@ -146,7 +146,7 @@ func TestJailsStartInAlphabeticalOrder(t *testing.T) {
 		jails:      jails,
 		whitelists: map[string]*JailRuntime{},
 		backend:    watch.NewAuto("poll", 50*time.Millisecond),
-		perf:       NewPerfMetrics(50*time.Millisecond, ""),
+		perf:       NewPerfMetrics(50*time.Millisecond, 1, ""),
 	}
 	m.currentInterval = 50 * time.Millisecond
 
@@ -173,7 +173,7 @@ func TestJailsStartInAlphabeticalOrder(t *testing.T) {
 // as the elapsed time between successive drain calls.
 func TestManagerCurrentInterval(t *testing.T) {
 	m := &Manager{
-		perf: NewPerfMetrics(3, ""),
+		perf: NewPerfMetrics(3, 1, ""),
 	}
 
 	ctx := context.Background()
