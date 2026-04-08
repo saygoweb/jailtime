@@ -75,6 +75,12 @@ type JailConfig struct {
 	// on_add is always executed on a threshold hit.  When true, the query is
 	// run first; an exit code of 0 suppresses on_add (IP already handled).
 	QueryBeforeMatch bool `yaml:"query_before_match"`
+	// LabelFrom controls what value is exposed as {{.Label}} in action
+	// templates and written to the "label" log field on every match.
+	// Valid values:
+	//   "match"      (default) – text from the (?P<label>...) capture group
+	//   "parent_dir"           – name of the directory that contains the file
+	LabelFrom string `yaml:"label_from"`
 	// ActionTimeout is the maximum time allowed for each individual action
 	// command (on_add, query).  Defaults to defaultActionTimeout.
 	ActionTimeout Duration `yaml:"action_timeout"`

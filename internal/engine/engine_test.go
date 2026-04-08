@@ -1120,3 +1120,109 @@ func TestHandleEventCIDRWithSlashNormalized(t *testing.T) {
 		t.Errorf("expected IP in output to be 192.168.1.0/24, got %q", got)
 	}
 }
+
+// TestResolveLabelMatch verifies that resolveLabel returns the filter-captured
+// label when label_from is "match" or empty.
+func TestResolveLabelMatch(t *testing.T) {
+	for _, labelFrom := range []string{"", "match"} {
+		got := resolveLabel(labelFrom, "captured", "/var/log/svc/access.log")
+		if got != "captured" {
+			t.Errorf("resolveLabel(%q) = %q, want %q", labelFrom, got, "captured")
+		}
+	}
+}
+
+// TestResolveLabelParentDir verifies that resolveLabel returns the parent
+// directory name of the file when label_from is "parent_dir".
+func TestResolveLabelParentDir(t *testing.T) {
+	got := resolveLabel("parent_dir", "captured", "/var/log/apache2/some-domain.com/access.log")
+	if got != "some-domain.com" {
+		t.Errorf("resolveLabel(parent_dir) = %q, want %q", got, "some-domain.com")
+	}
+}
+
+// TestHandleEventLabelFromMatch verifies that with label_from unset the Label
+// template variable is populated from the (?P<label>...) capture group.
+func TestHandleEventLabelFromMatch(t *testing.T) {
+	dir := t.TempDir()
+	outFile := filepath.Join(dir, "output.txt")
+
+	cfg := &config.JailConfig{
+		Name:     "label-match-jail",
+		Enabled:  true,
+		Filters:  []string{`(?P<ip>\d+\.\d+\.\d+\.\d+) (?P<label>\S+)`},
+		HitCount: 1,
+		FindTime: config.Duration{Duration: time.Minute},
+		Actions: config.JailActions{
+			OnAdd: []string{"echo {{ .Label }} > " + outFile},
+		},
+		ActionTimeout: config.Duration{Duration: 5 * time.Second},
+	}
+
+	jr, err := NewJailRuntime(cfg)
+	if err != nil {
+		t.Fatalf("NewJailRuntime: %v", err)
+	}
+
+	if err := jr.HandleEvent(context.Background(), watch.Event{
+		JailName: cfg.Name,
+		FilePath: "/var/log/app.log",
+		Line:     "Failed from 1.2.3.4 webapp",
+		Time:     time.Now(),
+	}); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	jr.WaitForInflight()
+
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("output file not created: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "webapp" {
+		t.Errorf("Label = %q, want %q", got, "webapp")
+	}
+}
+
+// TestHandleEventLabelFromParentDir verifies that with label_from: parent_dir
+// the Label template variable is populated with the parent directory name.
+func TestHandleEventLabelFromParentDir(t *testing.T) {
+	dir := t.TempDir()
+	outFile := filepath.Join(dir, "output.txt")
+
+	cfg := &config.JailConfig{
+		Name:      "label-parentdir-jail",
+		Enabled:   true,
+		LabelFrom: "parent_dir",
+		Filters:   []string{`(?P<ip>\d+\.\d+\.\d+\.\d+)`},
+		HitCount:  1,
+		FindTime:  config.Duration{Duration: time.Minute},
+		Actions: config.JailActions{
+			OnAdd: []string{"echo {{ .Label }} > " + outFile},
+		},
+		ActionTimeout: config.Duration{Duration: 5 * time.Second},
+	}
+
+	jr, err := NewJailRuntime(cfg)
+	if err != nil {
+		t.Fatalf("NewJailRuntime: %v", err)
+	}
+
+	if err := jr.HandleEvent(context.Background(), watch.Event{
+		JailName: cfg.Name,
+		FilePath: "/var/log/apache2/some-domain.com/access.log",
+		Line:     "Failed from 1.2.3.4",
+		Time:     time.Now(),
+	}); err != nil {
+		t.Fatalf("HandleEvent: %v", err)
+	}
+	jr.WaitForInflight()
+
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("output file not created: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "some-domain.com" {
+		t.Errorf("Label = %q, want %q", got, "some-domain.com")
+	}
+}
+

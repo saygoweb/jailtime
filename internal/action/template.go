@@ -11,6 +11,12 @@ type Context struct {
 	Jail      string
 	File      string
 	Line      string
+	// Label is a user-configured value that identifies the source of the match.
+	// Its content is determined by the jail's label_from setting:
+	//   "match"      (default) – text captured by (?P<label>...) in the filter
+	//   "parent_dir"           – name of the directory containing File
+	// Empty when the configured source yields no value.
+	Label     string
 	JailTime  int64 // seconds
 	FindTime  int64 // seconds
 	HitCount  int

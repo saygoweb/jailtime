@@ -171,6 +171,18 @@ func (jr *JailRuntime) lifecycleCtx() action.Context {
 	}
 }
 
+// resolveLabel returns the label value for a match event according to the
+// jail's label_from config:
+//
+//	"parent_dir" – base name of the directory that contains filePath
+//	"match" or "" – text from the (?P<label>...) filter capture group
+func resolveLabel(labelFrom, matchLabel, filePath string) string {
+	if labelFrom == "parent_dir" {
+		return filepath.Base(filepath.Dir(filePath))
+	}
+	return matchLabel
+}
+
 // Reconfigure updates the jail's config and recompiles its filters.
 // It is safe to call concurrently with HandleEvent; the hit tracker is reset
 // because find_time and hit_count may have changed.
@@ -466,6 +478,7 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 			Jail:      cfg.Name,
 			File:      evt.FilePath,
 			Line:      evt.Line,
+			Label:     resolveLabel(cfg.LabelFrom, result.Label, evt.FilePath),
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		}
 		submitted := jr.runner.Submit(result.IP, func() {
@@ -489,6 +502,7 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 			Jail:      cfg.Name,
 			File:      evt.FilePath,
 			Line:      evt.Line,
+			Label:     resolveLabel(cfg.LabelFrom, result.Label, evt.FilePath),
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		}
 		if _, err := action.RunAllCompiled(ctx, onRemoveTmpls, actCtx, cfg.ActionTimeout.Duration); err != nil {
@@ -522,10 +536,11 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 			return nil
 		}
 
+		label := resolveLabel(cfg.LabelFrom, result.Label, evt.FilePath)
 		slog.Info("JAIL on_add",
 			"jail", cfg.Name,
 			"ip", result.IP,
-			"label", result.Label,
+			"label", label,
 			"count", count,
 			"threshold", threshold,
 		)
@@ -544,6 +559,7 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 			Jail:      cfg.Name,
 			File:      evt.FilePath,
 			Line:      evt.Line,
+			Label:     label,
 			JailTime:  int64(cfg.JailTime.Duration.Seconds()),
 			FindTime:  int64(findTime.Seconds()),
 			HitCount:  count,

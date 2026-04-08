@@ -87,6 +87,10 @@ func validateJails(jails []JailConfig, names map[string]struct{}, isWhitelist bo
 			return fmt.Errorf("%s %q: net_type must be \"IP\" or \"CIDR\", got %q", kind, j.Name, j.NetType)
 		}
 
+		if j.LabelFrom != "" && j.LabelFrom != "match" && j.LabelFrom != "parent_dir" {
+			return fmt.Errorf("%s %q: label_from must be \"match\" or \"parent_dir\", got %q", kind, j.Name, j.LabelFrom)
+		}
+
 		for k, f := range j.Filters {
 			if _, err := regexp.Compile(f); err != nil {
 				return fmt.Errorf("%s %q: filter[%d] %q: invalid regex: %w", kind, j.Name, k, f, err)

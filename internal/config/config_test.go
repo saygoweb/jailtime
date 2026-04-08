@@ -176,6 +176,50 @@ func TestLoadActionTimeoutExplicit(t *testing.T) {
 	}
 }
 
+func TestLoadLabelFromDefault(t *testing.T) {
+	path := writeTemp(t, minimalValidYAML)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if c.Jails[0].LabelFrom != "" {
+		t.Errorf("LabelFrom should default to empty string, got %q", c.Jails[0].LabelFrom)
+	}
+}
+
+func TestLoadLabelFromParentDir(t *testing.T) {
+	y := minimalValidYAML + "    label_from: parent_dir\n"
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if c.Jails[0].LabelFrom != "parent_dir" {
+		t.Errorf("LabelFrom = %q, want %q", c.Jails[0].LabelFrom, "parent_dir")
+	}
+}
+
+func TestLoadLabelFromMatch(t *testing.T) {
+	y := minimalValidYAML + "    label_from: match\n"
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if c.Jails[0].LabelFrom != "match" {
+		t.Errorf("LabelFrom = %q, want %q", c.Jails[0].LabelFrom, "match")
+	}
+}
+
+func TestLoadLabelFromInvalid(t *testing.T) {
+	y := minimalValidYAML + "    label_from: bogus\n"
+	path := writeTemp(t, y)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for invalid label_from, got nil")
+	}
+}
+
 const jailFragmentYAML = `
 jails:
   - name: nginx
