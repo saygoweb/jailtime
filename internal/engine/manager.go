@@ -554,3 +554,71 @@ func (m *Manager) RestartWhitelist(ctx context.Context, name string) error {
 	slog.Info("starting whitelist", "whitelist", name)
 	return targetJr.Start(ctx)
 }
+
+// GlobalConfig returns the current EngineConfig as a string map (excluding actions).
+// All duration values are formatted as Go duration strings.
+func (m *Manager) GlobalConfig() map[string]string {
+	m.mu.RLock()
+	eng := m.cfg.Engine
+	m.mu.RUnlock()
+	return map[string]string{
+		"watcher_mode":   eng.WatcherMode,
+		"poll_interval":  eng.PollInterval.Duration.String(),
+		"read_from_end":  fmt.Sprintf("%t", eng.ReadFromEnd),
+		"target_latency": eng.TargetLatency.Duration.String(),
+		"perf_window":    fmt.Sprintf("%d", eng.PerfWindow),
+	}
+}
+
+// SetGlobalConfig updates a single EngineConfig field by key at runtime.
+// For "target_latency" and "poll_interval" the watch backend and perf metrics
+// are also updated so the change takes effect immediately.
+func (m *Manager) SetGlobalConfig(key, value string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	switch key {
+	case "target_latency", "poll_interval":
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("invalid duration %q: %w", value, err)
+		}
+		if d <= 0 {
+			return fmt.Errorf("duration must be positive")
+		}
+		if key == "target_latency" {
+			m.cfg.Engine.TargetLatency = config.Duration{Duration: d}
+		} else {
+			m.cfg.Engine.PollInterval = config.Duration{Duration: d}
+		}
+		// Update backend interval and perf metrics without holding m.mu to
+		// avoid deadlock — but we still hold it here since backend.SetInterval
+		// and perf.SetTargetLatency are independently safe.
+		m.backend.SetInterval(d)
+		if key == "target_latency" {
+			m.perf.SetTargetLatency(d)
+		}
+	case "watcher_mode":
+		m.cfg.Engine.WatcherMode = value
+	case "read_from_end":
+		switch value {
+		case "true":
+			m.cfg.Engine.ReadFromEnd = true
+		case "false":
+			m.cfg.Engine.ReadFromEnd = false
+		default:
+			return fmt.Errorf("invalid boolean %q: must be \"true\" or \"false\"", value)
+		}
+	case "perf_window":
+		var n int
+		if _, err := fmt.Sscanf(value, "%d", &n); err != nil || n < 1 {
+			return fmt.Errorf("invalid perf_window %q: must be a positive integer", value)
+		}
+		m.cfg.Engine.PerfWindow = n
+	default:
+		return fmt.Errorf("unknown global config key %q", key)
+	}
+
+	slog.Info("global config updated", "key", key, "value", value)
+	return nil
+}

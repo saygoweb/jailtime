@@ -209,3 +209,11 @@ func (a *JailControllerAdapter) AllWhitelistStatuses() map[string]string {
 	}
 	return out
 }
+
+func (a *JailControllerAdapter) GlobalConfig() map[string]string {
+	return a.m.GlobalConfig()
+}
+
+func (a *JailControllerAdapter) SetGlobalConfig(key, value string) error {
+	return a.m.SetGlobalConfig(key, value)
+}

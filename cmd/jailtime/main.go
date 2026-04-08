@@ -197,6 +197,46 @@ matched. No hit counts are modified and no actions are executed.`,
 
 	configCmd.AddCommand(filesCmd, testCmd)
 
+	// config global [<key> <value>]
+	globalCmd := &cobra.Command{
+		Use:   "global [<key> <value>]",
+		Short: "Read or update global engine configuration at runtime",
+		Long: `Without arguments, lists all global engine config fields (excluding actions).
+With <key> and <value>, updates the named field immediately in the running daemon.
+
+Settable keys: target_latency, poll_interval, watcher_mode, read_from_end, perf_window.
+Duration values use Go duration syntax, e.g. "2s", "500ms", "1m".`,
+		Example: `  jailtime config global
+  jailtime config global target_latency 5s
+  jailtime config global perf_window 5`,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 || len(args) == 2 {
+				return nil
+			}
+			return fmt.Errorf("accepts 0 or 2 arguments, got %d", len(args))
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c := client()
+			if len(args) == 2 {
+				return c.SetGlobalConfig(args[0], args[1])
+			}
+			resp, err := c.GlobalConfig()
+			if err != nil {
+				return err
+			}
+			tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(tw, "KEY\tVALUE")
+			keys := []string{"watcher_mode", "poll_interval", "read_from_end", "target_latency", "perf_window"}
+			for _, k := range keys {
+				if v, ok := resp.Config[k]; ok {
+					fmt.Fprintf(tw, "%s\t%s\n", k, v)
+				}
+			}
+			return tw.Flush()
+		},
+	}
+	configCmd.AddCommand(globalCmd)
+
 	// ── whitelist ─────────────────────────────────────────────────────────────
 	whitelistCmd := &cobra.Command{
 		Use:   "whitelist",

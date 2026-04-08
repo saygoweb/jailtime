@@ -12,8 +12,8 @@ import (
 
 // PollBackend implements Backend by polling the filesystem at a fixed interval.
 type PollBackend struct {
-	interval time.Duration
 	mu       sync.RWMutex
+	interval time.Duration
 	specs    []WatchSpec
 }
 
@@ -22,6 +22,20 @@ func NewPollBackend(interval time.Duration) *PollBackend {
 }
 
 func (b *PollBackend) Name() string { return "poll" }
+
+// SetInterval updates the poll interval. The change takes effect on the next
+// ticker reset inside Start.
+func (b *PollBackend) SetInterval(d time.Duration) {
+	b.mu.Lock()
+	b.interval = d
+	b.mu.Unlock()
+}
+
+func (b *PollBackend) getInterval() time.Duration {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.interval
+}
 
 // UpdateSpecs replaces the current watch specs. The change takes effect on
 // the next poll cycle.
@@ -73,7 +87,8 @@ func (b *PollBackend) Start(ctx context.Context, specs []WatchSpec, drain DrainF
 	tailers := make(map[string]*FileTailer)
 	staticSnapshots := make(map[string]map[string]bool)
 
-	ticker := time.NewTicker(b.interval)
+	currentInterval := b.getInterval()
+	ticker := time.NewTicker(currentInterval)
 	defer ticker.Stop()
 
 	for {
@@ -84,6 +99,10 @@ func (b *PollBackend) Start(ctx context.Context, specs []WatchSpec, drain DrainF
 			}
 			return ctx.Err()
 		case <-ticker.C:
+			if d := b.getInterval(); d != currentInterval {
+				currentInterval = d
+				ticker.Reset(currentInterval)
+			}
 			currentSpecs := b.getSpecs()
 
 			excluded := buildExcludeSet(currentSpecs)

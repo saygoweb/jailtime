@@ -26,6 +26,8 @@ type JailController interface {
 	RestartWhitelist(ctx context.Context, name string) error
 	WhitelistStatus(name string) (string, error)
 	AllWhitelistStatuses() map[string]string
+	GlobalConfig() map[string]string
+	SetGlobalConfig(key, value string) error
 }
 
 // Server serves the control API over a Unix domain socket.
@@ -55,6 +57,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/health", s.handleHealth)
 	mux.HandleFunc("/v1/perf", s.handlePerf)
+	mux.HandleFunc("/v1/config/global", s.handleGlobalConfig)
 	mux.HandleFunc("/v1/jails", s.handleJails)
 	mux.HandleFunc("/v1/jails/", s.handleJailAction)
 	mux.HandleFunc("/v1/whitelists", s.handleWhitelists)
@@ -88,6 +91,34 @@ func (s *Server) handlePerf(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.controller.PerfStats())
+}
+
+// handleGlobalConfig handles GET/POST /v1/config/global.
+// GET returns all EngineConfig fields as a key-value map (actions excluded).
+// POST accepts {"key": "...", "value": "..."} and updates the named field.
+func (s *Server) handleGlobalConfig(w http.ResponseWriter, r *http.Request) {
+	slog.Info("control request", "method", r.Method, "path", r.URL.Path)
+	switch r.Method {
+	case http.MethodGet:
+		writeJSON(w, http.StatusOK, GlobalConfigResponse{Config: s.controller.GlobalConfig()})
+	case http.MethodPost:
+		var req SetGlobalConfigRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "invalid request body: " + err.Error()})
+			return
+		}
+		if req.Key == "" {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: "missing required field: key"})
+			return
+		}
+		if err := s.controller.SetGlobalConfig(req.Key, req.Value); err != nil {
+			writeJSON(w, http.StatusBadRequest, ErrorResponse{Error: err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, HealthResponse{Status: "ok"})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, ErrorResponse{Error: "method not allowed"})
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
