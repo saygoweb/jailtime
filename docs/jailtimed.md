@@ -301,7 +301,8 @@ jails:
   - name: apache-vhosts
     files:
       - /var/log/apache2/*/access.log
-    tags_from: [parent_dir]
+    tags_from:
+      - parent_dir
     filters:
       - '(?P<ip>[0-9.]+) .* " [45][0-9][0-9] '
     actions:
@@ -314,7 +315,9 @@ If the matched file is `/var/log/apache2/site.example/access.log` then `{{ .Tags
 **Example — combine parent directory and a filter capture group:**
 
 ```yaml
-tags_from: [parent_dir, match_tag1]
+tags_from:
+  - parent_dir
+  - match_tag1
 filters:
   - '(?P<ip>[0-9.]+).*service=(?P<tag1>\w+)'
 # Tags = "site.example,webapp"
