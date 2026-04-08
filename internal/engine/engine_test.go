@@ -1026,3 +1026,97 @@ func TestIgnoreSetsSuppress(t *testing.T) {
 		t.Errorf("expected 5.6.7.8 in output, got %q", string(data))
 	}
 }
+
+// TestHandleEventCIDRPlainIPNormalized verifies that a plain IP extracted when
+// net_type is CIDR gets normalised to IP/32 and the on_match action still fires.
+func TestHandleEventCIDRPlainIPNormalized(t *testing.T) {
+dir := t.TempDir()
+outFile := filepath.Join(dir, "output.txt")
+
+cfg := &config.JailConfig{
+Name:    "cidr-jail",
+Enabled: true,
+// Pattern matches both CIDR (e.g. 1.2.3.4/24) and plain IPs (e.g. 1.2.3.4).
+Filters:  []string{`(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?:/\d{1,2})?)$`},
+NetType:  "CIDR",
+HitCount: 1,
+FindTime: config.Duration{Duration: time.Minute},
+Actions: config.JailActions{
+OnAdd: []string{"echo {{ .IP }} >> " + outFile},
+},
+ActionTimeout: config.Duration{Duration: 5 * time.Second},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+
+ctx := context.Background()
+
+// Send a plain IP (no /nn); should be normalised to /32 and trigger.
+if err := jr.HandleEvent(ctx, watch.Event{
+JailName: cfg.Name,
+FilePath: "/var/log/test.log",
+Line:     "blocked 10.0.0.5",
+Time:     time.Now(),
+}); err != nil {
+t.Fatalf("HandleEvent: %v", err)
+}
+jr.WaitForInflight()
+
+data, err := os.ReadFile(outFile)
+if err != nil {
+t.Fatalf("output file not created — on_match did not fire: %v", err)
+}
+got := strings.TrimSpace(string(data))
+if got != "10.0.0.5/32" {
+t.Errorf("expected IP in output to be 10.0.0.5/32, got %q", got)
+}
+}
+
+// TestHandleEventCIDRWithSlashNormalized verifies that a CIDR like 192.168.1.0/24
+// extracted when net_type is CIDR still works unchanged.
+func TestHandleEventCIDRWithSlashNormalized(t *testing.T) {
+dir := t.TempDir()
+outFile := filepath.Join(dir, "output.txt")
+
+cfg := &config.JailConfig{
+Name:     "cidr-jail2",
+Enabled:  true,
+Filters:  []string{`(?P<ip>[0-9]{1,3}(?:\.[0-9]{1,3}){3}(?:/\d{1,2})?)$`},
+NetType:  "CIDR",
+HitCount: 1,
+FindTime: config.Duration{Duration: time.Minute},
+Actions: config.JailActions{
+OnAdd: []string{"echo {{ .IP }} >> " + outFile},
+},
+ActionTimeout: config.Duration{Duration: 5 * time.Second},
+}
+
+jr, err := NewJailRuntime(cfg)
+if err != nil {
+t.Fatalf("NewJailRuntime: %v", err)
+}
+
+ctx := context.Background()
+
+if err := jr.HandleEvent(ctx, watch.Event{
+JailName: cfg.Name,
+FilePath: "/var/log/test.log",
+Line:     "blocked 192.168.1.0/24",
+Time:     time.Now(),
+}); err != nil {
+t.Fatalf("HandleEvent: %v", err)
+}
+jr.WaitForInflight()
+
+data, err := os.ReadFile(outFile)
+if err != nil {
+t.Fatalf("output file not created — on_match did not fire: %v", err)
+}
+got := strings.TrimSpace(string(data))
+if got != "192.168.1.0/24" {
+t.Errorf("expected IP in output to be 192.168.1.0/24, got %q", got)
+}
+}
