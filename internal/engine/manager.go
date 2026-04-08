@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"time"
 
+	"github.com/sgw/jailtime/internal/action"
 	"github.com/sgw/jailtime/internal/config"
 	"github.com/sgw/jailtime/internal/watch"
 )
@@ -67,9 +69,21 @@ func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
 
 // Run starts all enabled whitelists (before jails so membership is available),
 // then starts all enabled jails, then starts the watch backend.
+// Global on_start actions run before any whitelist or jail is started;
+// global on_stop actions run after all have stopped.
+// Within each group, start/stop order is alphabetical by name.
 func (m *Manager) Run(ctx context.Context) error {
-	// Start whitelists first so their static membership is ready before jails process events.
-	for name, jr := range m.whitelists {
+	// Run global on_start actions before starting any jail or whitelist.
+	if len(m.cfg.Actions.OnStart) > 0 {
+		actCtx := action.Context{Timestamp: nowUTC()}
+		if _, err := action.RunAll(ctx, m.cfg.Actions.OnStart, actCtx, config.DefaultActionTimeout); err != nil {
+			return fmt.Errorf("global on_start: %w", err)
+		}
+	}
+
+	// Start whitelists first (alphabetical) so their static membership is ready before jails process events.
+	for _, name := range sortedKeys(m.whitelists) {
+		jr := m.whitelists[name]
 		if !jr.cfg.Enabled {
 			continue
 		}
@@ -77,7 +91,9 @@ func (m *Manager) Run(ctx context.Context) error {
 			return fmt.Errorf("starting whitelist %q: %w", name, err)
 		}
 	}
-	for name, jr := range m.jails {
+	// Start jails in alphabetical order.
+	for _, name := range sortedKeys(m.jails) {
+		jr := m.jails[name]
 		if !jr.cfg.Enabled {
 			continue
 		}
@@ -105,6 +121,14 @@ func (m *Manager) Run(ctx context.Context) error {
 	}
 	m.mu.RUnlock()
 	m.perf.Close()
+
+	// Run global on_stop actions after all jails and whitelists have stopped.
+	if len(m.cfg.Actions.OnStop) > 0 {
+		actCtx := action.Context{Timestamp: nowUTC()}
+		if _, stopErr := action.RunAll(stopCtx, m.cfg.Actions.OnStop, actCtx, config.DefaultActionTimeout); stopErr != nil {
+			slog.Warn("global on_stop action failed", "error", stopErr)
+		}
+	}
 
 	if err != nil && err != context.Canceled {
 		return fmt.Errorf("watch backend: %w", err)
@@ -341,6 +365,21 @@ func buildSpecs(jails map[string]*JailRuntime, readFromEnd bool) []watch.WatchSp
 		}
 	}
 	return specs
+}
+
+// sortedKeys returns the keys of m in sorted order.
+func sortedKeys(m map[string]*JailRuntime) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// nowUTC returns the current time formatted as RFC3339 in UTC.
+func nowUTC() string {
+	return time.Now().UTC().Format(time.RFC3339)
 }
 
 // JailStatus returns the status of a jail by name.

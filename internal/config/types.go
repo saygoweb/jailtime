@@ -5,6 +5,13 @@ import (
 	"time"
 )
 
+// GlobalActions holds the shell commands run at daemon start and stop, before
+// any jail or whitelist is started / after all have stopped.
+type GlobalActions struct {
+	OnStart []string `yaml:"on_start"`
+	OnStop  []string `yaml:"on_stop"`
+}
+
 // Config is the top-level configuration structure.
 type Config struct {
 	Version    int           `yaml:"version"`
@@ -12,6 +19,7 @@ type Config struct {
 	Logging    LoggingConfig `yaml:"logging"`
 	Control    ControlConfig `yaml:"control"`
 	Engine     EngineConfig  `yaml:"engine"`
+	Actions    GlobalActions `yaml:"actions"`
 	Jails      []JailConfig  `yaml:"jails"`
 	Whitelists []JailConfig  `yaml:"whitelists"`
 }
@@ -105,6 +113,9 @@ const defaultPollInterval = 2 * time.Second
 
 // defaultActionTimeout is the per-command timeout for on_match and query actions.
 const defaultActionTimeout = 30 * time.Second
+
+// DefaultActionTimeout is the exported default for per-action timeouts.
+const DefaultActionTimeout = defaultActionTimeout
 
 const defaultTargetLatency = 2 * time.Second
 const defaultPerfWindow = 3
