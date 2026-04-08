@@ -44,7 +44,7 @@ jails:
         # Create ipset with timeout support (timeout 0 = entries use per-entry timeout)
         - 'ipset create jt_{{ .Jail }} hash:ip timeout 0 comment'
         # Drop TCP 80/443 for any IP in the set
-        - 'iptables -I INPUT -p tcp -m multiport --dports 80,443 -m set --match-set jt_{{ .Jail }} src -j DROP -m comment --comment "jailtime:{{ .Jail }}"'
+        - 'iptables -A INPUT -p tcp -m multiport --dports 80,443 -m set --match-set jt_{{ .Jail }} src -j DROP -m comment --comment "jailtime:{{ .Jail }}"'
 
       on_stop:
         # Remove the iptables rule first, then destroy the ipset

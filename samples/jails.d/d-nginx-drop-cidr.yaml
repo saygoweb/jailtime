@@ -53,7 +53,7 @@ jails:
         # ipset-ensure.sh is a no-op if the set already exists.
         - '/usr/local/lib/jailtime/ipset-ensure.sh jt_{{ .Jail }} hash:net timeout 0 comment'
         # Insert iptables INPUT DROP rule if not already present.
-        - '/usr/local/lib/jailtime/iptables-ensure.sh -I INPUT -m set --match-set jt_{{ .Jail }} src -j DROP -m comment --comment "jailtime:{{ .Jail }}"'
+        - '/usr/local/lib/jailtime/iptables-ensure.sh -A INPUT -m set --match-set jt_{{ .Jail }} src -j DROP -m comment --comment "jailtime:{{ .Jail }}"'
 
       on_stop:
         # Remove the iptables rule if present.
