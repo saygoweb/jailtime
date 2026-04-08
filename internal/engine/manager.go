@@ -16,6 +16,7 @@ type Manager struct {
 	cfg             *config.Config
 	configPath      string
 	jails           map[string]*JailRuntime
+	whitelists      map[string]*JailRuntime
 	backend         watch.Backend
 	mu              sync.RWMutex
 	perf            *PerfMetrics
@@ -34,6 +35,16 @@ func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
 		jails[jailCfg.Name] = jr
 	}
 
+	whitelists := make(map[string]*JailRuntime, len(cfg.Whitelists))
+	for i := range cfg.Whitelists {
+		wlCfg := &cfg.Whitelists[i]
+		jr, err := NewJailRuntime(wlCfg)
+		if err != nil {
+			return nil, fmt.Errorf("creating whitelist runtime %q: %w", wlCfg.Name, err)
+		}
+		whitelists[wlCfg.Name] = jr
+	}
+
 	targetLatency := cfg.Engine.TargetLatency.Duration
 	if targetLatency == 0 {
 		targetLatency = 2000 * time.Millisecond
@@ -45,19 +56,31 @@ func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
 		perfWindow = 3
 	}
 
-	return &Manager{
+	m := &Manager{
 		cfg:             cfg,
 		configPath:      configPath,
 		jails:           jails,
+		whitelists:      whitelists,
 		backend:         backend,
 		perf:            NewPerfMetrics(perfWindow, "jailtimed.service"),
 		currentInterval: targetLatency,
-	}, nil
+	}
+	m.injectIgnoreSets()
+	return m, nil
 }
 
-// Run starts all enabled jails, starts the watch backend, and routes events
-// via the DrainFunc callback.
+// Run starts all enabled whitelists (before jails so membership is available),
+// then starts all enabled jails, then starts the watch backend.
 func (m *Manager) Run(ctx context.Context) error {
+	// Start whitelists first so their static membership is ready before jails process events.
+	for name, jr := range m.whitelists {
+		if !jr.cfg.Enabled {
+			continue
+		}
+		if err := jr.Start(ctx); err != nil {
+			return fmt.Errorf("starting whitelist %q: %w", name, err)
+		}
+	}
 	for name, jr := range m.jails {
 		if !jr.cfg.Enabled {
 			continue
@@ -67,7 +90,7 @@ func (m *Manager) Run(ctx context.Context) error {
 		}
 	}
 	m.mu.RLock()
-	specs := buildSpecs(m.jails, m.cfg.Engine.ReadFromEnd)
+	specs := m.buildAllSpecs()
 	m.mu.RUnlock()
 
 	err := m.backend.Start(ctx, specs, m.processDrain)
@@ -75,6 +98,11 @@ func (m *Manager) Run(ctx context.Context) error {
 	stopCtx := context.Background()
 	m.mu.RLock()
 	for _, jr := range m.jails {
+		if jr.Status() == StatusStarted {
+			_ = jr.Stop(stopCtx)
+		}
+	}
+	for _, jr := range m.whitelists {
 		if jr.Status() == StatusStarted {
 			_ = jr.Stop(stopCtx)
 		}
@@ -110,12 +138,14 @@ func (m *Manager) processBatch(ctx context.Context, lines []watch.RawLine) {
 		}
 	}
 
-	// Snapshot jail runtime pointers under RLock, then release before running
+	// Snapshot jail/whitelist runtime pointers under RLock, then release before running
 	// HandleEvent (which may execute slow shell actions).
 	m.mu.RLock()
 	snapshot := make(map[string]*JailRuntime, len(needed))
 	for name := range needed {
 		if jr, exists := m.jails[name]; exists {
+			snapshot[name] = jr
+		} else if jr, exists := m.whitelists[name]; exists {
 			snapshot[name] = jr
 		}
 	}
@@ -132,6 +162,7 @@ func (m *Manager) processBatch(ctx context.Context, lines []watch.RawLine) {
 				FilePath: line.FilePath,
 				Line:     line.Line,
 				Time:     line.EnqueueAt,
+				Kind:     line.Kind,
 			}
 			if err := jr.HandleEvent(ctx, evt); err != nil {
 				slog.Warn("event processing error", "jail", jailName, "error", err)
@@ -223,7 +254,9 @@ func (m *Manager) RestartJail(ctx context.Context, name string) error {
 	targetJr, targetFound := m.jails[name]
 	targetWasStarted := targetFound && targetJr.Status() == StatusStarted
 
-	specs := buildSpecs(m.jails, newCfg.Engine.ReadFromEnd)
+	// Update the stored config so buildAllSpecs uses the new engine settings.
+	m.cfg = newCfg
+	specs := m.buildAllSpecs()
 
 	m.mu.Unlock()
 
@@ -258,15 +291,52 @@ func (m *Manager) RestartJail(ctx context.Context, name string) error {
 	return targetJr.Start(ctx)
 }
 
-// buildSpecs builds watch specs for all enabled jails.
+// buildAllSpecs builds watch specs for all enabled jails and whitelists.
+func (m *Manager) buildAllSpecs() []watch.WatchSpec {
+	specs := buildSpecs(m.jails, m.cfg.Engine.ReadFromEnd)
+	specs = append(specs, buildSpecs(m.whitelists, m.cfg.Engine.ReadFromEnd)...)
+	return specs
+}
+
+// injectIgnoreSets injects MembershipChecker closures into jail runtimes
+// that have ignore_sets configured. Must be called after all runtimes are built.
+// Not concurrency-safe; call only during construction or while holding m.mu.
+func (m *Manager) injectIgnoreSets() {
+	for _, jr := range m.jails {
+		ignoreSets := jr.cfg.IgnoreSets
+		if len(ignoreSets) == 0 {
+			continue
+		}
+		// Capture the whitelist names and the whitelists map.
+		wlNames := ignoreSets
+		wls := m.whitelists
+		checker := func(ip string) bool {
+			for _, name := range wlNames {
+				if wl, ok := wls[name]; ok {
+					if wl.IsMember(ip) {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		jr.mu.Lock()
+		jr.ignoreSetsChecker = checker
+		jr.mu.Unlock()
+	}
+}
+
+// buildSpecs builds watch specs for all enabled jails in the map.
 func buildSpecs(jails map[string]*JailRuntime, readFromEnd bool) []watch.WatchSpec {
 	specs := make([]watch.WatchSpec, 0, len(jails))
 	for _, jr := range jails {
 		if jr.cfg.Enabled {
 			specs = append(specs, watch.WatchSpec{
-				JailName:    jr.cfg.Name,
-				Globs:       jr.cfg.Files,
-				ReadFromEnd: readFromEnd,
+				JailName:     jr.cfg.Name,
+				Globs:        jr.cfg.Files,
+				ExcludeGlobs: jr.cfg.ExcludeFiles,
+				WatchMode:    jr.cfg.WatchMode,
+				ReadFromEnd:  readFromEnd,
 			})
 		}
 	}
@@ -318,4 +388,130 @@ func (m *Manager) ConfigTest(name, filePath string, limit int, returnMatching bo
 		return 0, 0, nil, fmt.Errorf("jail %q not found", name)
 	}
 	return jr.ConfigTest(filePath, limit, returnMatching)
+}
+
+// WhitelistStatus returns the status of a whitelist by name.
+func (m *Manager) WhitelistStatus(name string) (JailStatus, error) {
+	m.mu.RLock()
+	jr, ok := m.whitelists[name]
+	m.mu.RUnlock()
+	if !ok {
+		return "", fmt.Errorf("whitelist %q not found", name)
+	}
+	return jr.Status(), nil
+}
+
+// AllWhitelistStatuses returns a snapshot of whitelist name → status.
+func (m *Manager) AllWhitelistStatuses() map[string]JailStatus {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string]JailStatus, len(m.whitelists))
+	for name, jr := range m.whitelists {
+		out[name] = jr.Status()
+	}
+	return out
+}
+
+// StartWhitelist starts a specific whitelist by name.
+func (m *Manager) StartWhitelist(ctx context.Context, name string) error {
+	m.mu.RLock()
+	jr, ok := m.whitelists[name]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("whitelist %q not found", name)
+	}
+	return jr.Start(ctx)
+}
+
+// StopWhitelist stops a specific whitelist by name.
+func (m *Manager) StopWhitelist(ctx context.Context, name string) error {
+	m.mu.RLock()
+	jr, ok := m.whitelists[name]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("whitelist %q not found", name)
+	}
+	return jr.Stop(ctx)
+}
+
+// RestartWhitelist reloads the config and restarts the named whitelist.
+func (m *Manager) RestartWhitelist(ctx context.Context, name string) error {
+	newCfg, err := config.Load(m.configPath)
+	if err != nil {
+		return fmt.Errorf("reloading config: %w", err)
+	}
+
+	newWlCfgs := make(map[string]*config.JailConfig, len(newCfg.Whitelists))
+	for i := range newCfg.Whitelists {
+		newWlCfgs[newCfg.Whitelists[i].Name] = &newCfg.Whitelists[i]
+	}
+
+	m.mu.Lock()
+
+	var toStop []*JailRuntime
+	for wlName, jr := range m.whitelists {
+		newWlCfg, exists := newWlCfgs[wlName]
+		if !exists || !newWlCfg.Enabled {
+			if jr.Status() == StatusStarted {
+				toStop = append(toStop, jr)
+			}
+			delete(m.whitelists, wlName)
+		} else {
+			if err := jr.Reconfigure(newWlCfg); err != nil {
+				m.mu.Unlock()
+				return fmt.Errorf("reconfiguring whitelist %q: %w", wlName, err)
+			}
+		}
+	}
+
+	var toStart []*JailRuntime
+	for wlName, newWlCfg := range newWlCfgs {
+		if _, exists := m.whitelists[wlName]; !exists {
+			jr, err := NewJailRuntime(newWlCfg)
+			if err != nil {
+				m.mu.Unlock()
+				return fmt.Errorf("creating whitelist runtime %q: %w", wlName, err)
+			}
+			m.whitelists[wlName] = jr
+			if newWlCfg.Enabled && wlName != name {
+				toStart = append(toStart, jr)
+			}
+		}
+	}
+
+	targetJr, targetFound := m.whitelists[name]
+	targetWasStarted := targetFound && targetJr.Status() == StatusStarted
+
+	m.cfg = newCfg
+	m.injectIgnoreSets()
+	specs := m.buildAllSpecs()
+
+	m.mu.Unlock()
+
+	for _, jr := range toStop {
+		slog.Info("stopping removed/disabled whitelist", "whitelist", jr.cfg.Name)
+		if stopErr := jr.Stop(ctx); stopErr != nil {
+			slog.Warn("stopping whitelist", "whitelist", jr.cfg.Name, "error", stopErr)
+		}
+	}
+
+	for _, jr := range toStart {
+		slog.Info("starting new whitelist", "whitelist", jr.cfg.Name)
+		if startErr := jr.Start(ctx); startErr != nil {
+			slog.Warn("starting new whitelist", "whitelist", jr.cfg.Name, "error", startErr)
+		}
+	}
+
+	m.backend.UpdateSpecs(specs)
+
+	if !targetFound {
+		return fmt.Errorf("whitelist %q not found", name)
+	}
+
+	if targetWasStarted {
+		slog.Info("restarting whitelist", "whitelist", name)
+		return targetJr.Restart(ctx)
+	}
+	slog.Info("starting whitelist", "whitelist", name)
+	return targetJr.Start(ctx)
 }

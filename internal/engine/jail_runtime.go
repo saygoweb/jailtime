@@ -95,8 +95,15 @@ type JailRuntime struct {
 	debugLog *debugRateLimiter
 	runner   ActionRunner
 	// Pre-compiled action templates (populated by compileTemplates)
-	onMatchTmpls []*template.Template
-	queryTmpl    *template.Template // nil if no query configured
+	onAddTmpls    []*template.Template
+	onRemoveTmpls []*template.Template
+	queryTmpl     *template.Template // nil if no query configured
+	// Whitelist membership state (only populated for watch_mode: static)
+	memberIPs   map[string]struct{}
+	memberCIDRs []*net.IPNet
+	// ignoreSetsChecker is injected by Manager after all runtimes are created.
+	// When non-nil, a match on the checker suppresses on_add actions.
+	ignoreSetsChecker func(ip string) bool
 }
 
 func NewJailRuntime(cfg *config.JailConfig) (*JailRuntime, error) {
@@ -109,12 +116,14 @@ func NewJailRuntime(cfg *config.JailConfig) (*JailRuntime, error) {
 		return nil, fmt.Errorf("compiling exclude filters for jail %q: %w", cfg.Name, err)
 	}
 	jr := &JailRuntime{
-		cfg:      cfg,
-		includes: includes,
-		excludes: excludes,
-		hits:     NewHitTracker(),
-		status:   StatusStopped,
-		debugLog: newDebugRateLimiter(2),
+		cfg:         cfg,
+		includes:    includes,
+		excludes:    excludes,
+		hits:        NewHitTracker(),
+		status:      StatusStopped,
+		debugLog:    newDebugRateLimiter(2),
+		memberIPs:   make(map[string]struct{}),
+		memberCIDRs: nil,
 	}
 	if err := jr.compileTemplates(cfg); err != nil {
 		return nil, err
@@ -123,15 +132,25 @@ func NewJailRuntime(cfg *config.JailConfig) (*JailRuntime, error) {
 }
 
 func (jr *JailRuntime) compileTemplates(cfg *config.JailConfig) error {
-	tmpls := make([]*template.Template, 0, len(cfg.Actions.OnMatch))
-	for i, tmplStr := range cfg.Actions.OnMatch {
-		t, err := action.CompileTemplate(fmt.Sprintf("on_match[%d]", i), tmplStr)
+	onAddTmpls := make([]*template.Template, 0, len(cfg.Actions.OnAdd))
+	for i, tmplStr := range cfg.Actions.OnAdd {
+		t, err := action.CompileTemplate(fmt.Sprintf("on_add[%d]", i), tmplStr)
 		if err != nil {
-			return fmt.Errorf("compiling on_match[%d]: %w", i, err)
+			return fmt.Errorf("compiling on_add[%d]: %w", i, err)
 		}
-		tmpls = append(tmpls, t)
+		onAddTmpls = append(onAddTmpls, t)
 	}
-	jr.onMatchTmpls = tmpls
+	jr.onAddTmpls = onAddTmpls
+
+	onRemoveTmpls := make([]*template.Template, 0, len(cfg.Actions.OnRemove))
+	for i, tmplStr := range cfg.Actions.OnRemove {
+		t, err := action.CompileTemplate(fmt.Sprintf("on_remove[%d]", i), tmplStr)
+		if err != nil {
+			return fmt.Errorf("compiling on_remove[%d]: %w", i, err)
+		}
+		onRemoveTmpls = append(onRemoveTmpls, t)
+	}
+	jr.onRemoveTmpls = onRemoveTmpls
 
 	if cfg.Query != "" {
 		t, err := action.CompileTemplate("query", cfg.Query)
@@ -164,13 +183,21 @@ func (jr *JailRuntime) Reconfigure(cfg *config.JailConfig) error {
 	if err != nil {
 		return fmt.Errorf("compiling exclude filters: %w", err)
 	}
-	tmpls := make([]*template.Template, 0, len(cfg.Actions.OnMatch))
-	for i, tmplStr := range cfg.Actions.OnMatch {
-		t, err := action.CompileTemplate(fmt.Sprintf("on_match[%d]", i), tmplStr)
+	onAddTmpls := make([]*template.Template, 0, len(cfg.Actions.OnAdd))
+	for i, tmplStr := range cfg.Actions.OnAdd {
+		t, err := action.CompileTemplate(fmt.Sprintf("on_add[%d]", i), tmplStr)
 		if err != nil {
-			return fmt.Errorf("compiling on_match[%d]: %w", i, err)
+			return fmt.Errorf("compiling on_add[%d]: %w", i, err)
 		}
-		tmpls = append(tmpls, t)
+		onAddTmpls = append(onAddTmpls, t)
+	}
+	onRemoveTmpls := make([]*template.Template, 0, len(cfg.Actions.OnRemove))
+	for i, tmplStr := range cfg.Actions.OnRemove {
+		t, err := action.CompileTemplate(fmt.Sprintf("on_remove[%d]", i), tmplStr)
+		if err != nil {
+			return fmt.Errorf("compiling on_remove[%d]: %w", i, err)
+		}
+		onRemoveTmpls = append(onRemoveTmpls, t)
 	}
 	var queryTmpl *template.Template
 	if cfg.Query != "" {
@@ -184,7 +211,8 @@ func (jr *JailRuntime) Reconfigure(cfg *config.JailConfig) error {
 	jr.includes = includes
 	jr.excludes = excludes
 	jr.hits = NewHitTracker()
-	jr.onMatchTmpls = tmpls
+	jr.onAddTmpls = onAddTmpls
+	jr.onRemoveTmpls = onRemoveTmpls
 	jr.queryTmpl = queryTmpl
 	jr.mu.Unlock()
 	return nil
@@ -212,10 +240,68 @@ func (jr *JailRuntime) Stop(ctx context.Context) error {
 	return err
 }
 
-// WaitForInflight blocks until all in-flight on_match goroutines have
+// WaitForInflight blocks until all in-flight on_add goroutines have
 // completed.  Useful in tests and for graceful shutdown.
 func (jr *JailRuntime) WaitForInflight() {
 	jr.runner.Wait()
+}
+
+// IsMember reports whether the given IP string is a member of this runtime's
+// static membership set. It is safe to call from multiple goroutines.
+func (jr *JailRuntime) IsMember(ip string) bool {
+	jr.mu.RLock()
+	memberIPs := jr.memberIPs
+	memberCIDRs := jr.memberCIDRs
+	jr.mu.RUnlock()
+
+	if _, ok := memberIPs[ip]; ok {
+		return true
+	}
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return false
+	}
+	for _, cidr := range memberCIDRs {
+		if cidr.Contains(parsed) {
+			return true
+		}
+	}
+	return false
+}
+
+// addMember adds ip to the in-memory membership set. Must be called with mu held or from single goroutine.
+func (jr *JailRuntime) addMember(ip string) {
+	jr.mu.Lock()
+	defer jr.mu.Unlock()
+	// Try parsing as CIDR first, then plain IP.
+	if _, cidr, err := net.ParseCIDR(ip); err == nil {
+		// Avoid duplicates.
+		for _, existing := range jr.memberCIDRs {
+			if existing.String() == cidr.String() {
+				return
+			}
+		}
+		jr.memberCIDRs = append(jr.memberCIDRs, cidr)
+		return
+	}
+	jr.memberIPs[ip] = struct{}{}
+}
+
+// removeMember removes ip from the in-memory membership set.
+func (jr *JailRuntime) removeMember(ip string) {
+	jr.mu.Lock()
+	defer jr.mu.Unlock()
+	if _, cidr, err := net.ParseCIDR(ip); err == nil {
+		target := cidr.String()
+		for i, existing := range jr.memberCIDRs {
+			if existing.String() == target {
+				jr.memberCIDRs = append(jr.memberCIDRs[:i], jr.memberCIDRs[i+1:]...)
+				return
+			}
+		}
+		return
+	}
+	delete(jr.memberIPs, ip)
 }
 
 // Restart runs on_restart actions; status remains started.
@@ -309,8 +395,10 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 	includes := jr.includes
 	excludes := jr.excludes
 	hits := jr.hits
-	onMatchTmpls := jr.onMatchTmpls
+	onAddTmpls := jr.onAddTmpls
+	onRemoveTmpls := jr.onRemoveTmpls
 	queryTmpl := jr.queryTmpl
+	ignoreSetsChecker := jr.ignoreSetsChecker
 	jr.mu.RUnlock()
 
 	result, err := filter.Match(evt.Line, includes, excludes)
@@ -362,73 +450,125 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		}
 	}
 
-	t := evt.Time
-	if t.IsZero() {
-		t = time.Now()
-	}
+	switch evt.Kind {
+	case watch.EventAdded:
+		// Static-mode: IP first appeared in file.
+		jr.addMember(result.IP)
+		if len(onAddTmpls) == 0 {
+			return nil
+		}
+		actCtx := action.Context{
+			IP:        result.IP,
+			Jail:      cfg.Name,
+			File:      evt.FilePath,
+			Line:      evt.Line,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		submitted := jr.runner.Submit(result.IP, func() {
+			if _, err := action.RunAllCompiled(ctx, onAddTmpls, actCtx, cfg.ActionTimeout.Duration); err != nil {
+				slog.Warn("on_add action failed", "jail", cfg.Name, "ip", result.IP, "error", err)
+			}
+		})
+		if !submitted {
+			slog.Info("on_add already in flight for ip, duplicate dropped", "jail", cfg.Name, "ip", result.IP)
+		}
+		return nil
 
-	findTime := cfg.FindTime.Duration
-	if findTime == 0 {
-		findTime = time.Minute
-	}
-	threshold := cfg.HitCount
-	if threshold == 0 {
-		threshold = 1
-	}
+	case watch.EventRemoved:
+		// Static-mode: IP disappeared from file.
+		jr.removeMember(result.IP)
+		if len(onRemoveTmpls) == 0 {
+			return nil
+		}
+		actCtx := action.Context{
+			IP:        result.IP,
+			Jail:      cfg.Name,
+			File:      evt.FilePath,
+			Line:      evt.Line,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		}
+		if _, err := action.RunAllCompiled(ctx, onRemoveTmpls, actCtx, cfg.ActionTimeout.Duration); err != nil {
+			slog.Warn("on_remove action failed", "jail", cfg.Name, "ip", result.IP, "error", err)
+		}
+		return nil
 
-	count, triggered := hits.Record(result.IP, t, findTime, threshold)
-	if !triggered {
-		slog.Debug("hit count below threshold",
+	default: // EventTail
+		t := evt.Time
+		if t.IsZero() {
+			t = time.Now()
+		}
+
+		findTime := cfg.FindTime.Duration
+		if findTime == 0 {
+			findTime = time.Minute
+		}
+		threshold := cfg.HitCount
+		if threshold == 0 {
+			threshold = 1
+		}
+
+		count, triggered := hits.Record(result.IP, t, findTime, threshold)
+		if !triggered {
+			slog.Debug("hit count below threshold",
+				"jail", cfg.Name,
+				"ip", result.IP,
+				"count", count,
+				"threshold", threshold,
+			)
+			return nil
+		}
+
+		slog.Info("hit threshold reached, running on_add",
 			"jail", cfg.Name,
 			"ip", result.IP,
 			"count", count,
 			"threshold", threshold,
 		)
+
+		// Check ignore_sets before running on_add actions.
+		if ignoreSetsChecker != nil && ignoreSetsChecker(result.IP) {
+			slog.Info("ip suppressed by ignore_sets",
+				"jail", cfg.Name,
+				"ip", result.IP,
+			)
+			return nil
+		}
+
+		actCtx := action.Context{
+			IP:        result.IP,
+			Jail:      cfg.Name,
+			File:      evt.FilePath,
+			Line:      evt.Line,
+			JailTime:  int64(cfg.JailTime.Duration.Seconds()),
+			FindTime:  int64(findTime.Seconds()),
+			HitCount:  count,
+			Timestamp: t.UTC().Format(time.RFC3339),
+		}
+
+		submitted := jr.runner.Submit(result.IP, func() {
+			cfg := jr.cfg
+			// Query pre-check: only run when query_before_match is true.
+			// Exit 0 means the IP is already blocked — skip on_add.
+			if cfg.QueryBeforeMatch && queryTmpl != nil {
+				res, _ := action.RunCompiled(ctx, queryTmpl, actCtx, cfg.ActionTimeout.Duration)
+				if res.ExitCode == 0 && res.Error == nil {
+					slog.Info("query pre-check suppressed on_add",
+						"jail", cfg.Name,
+						"ip", result.IP,
+					)
+					return
+				}
+			}
+			if _, err := action.RunAllCompiled(ctx, onAddTmpls, actCtx, cfg.ActionTimeout.Duration); err != nil {
+				slog.Warn("on_add action failed", "jail", cfg.Name, "ip", result.IP, "error", err)
+			}
+		})
+		if !submitted {
+			slog.Info("on_add already in flight for ip, duplicate dropped",
+				"jail", jr.cfg.Name,
+				"ip", result.IP,
+			)
+		}
 		return nil
 	}
-
-	slog.Info("hit threshold reached, running on_match",
-		"jail", cfg.Name,
-		"ip", result.IP,
-		"count", count,
-		"threshold", threshold,
-	)
-
-	actCtx := action.Context{
-		IP:        result.IP,
-		Jail:      cfg.Name,
-		File:      evt.FilePath,
-		Line:      evt.Line,
-		JailTime:  int64(cfg.JailTime.Duration.Seconds()),
-		FindTime:  int64(findTime.Seconds()),
-		HitCount:  count,
-		Timestamp: t.UTC().Format(time.RFC3339),
-	}
-
-	submitted := jr.runner.Submit(result.IP, func() {
-		cfg := jr.cfg
-		// Query pre-check: only run when query_before_match is true.
-		// Exit 0 means the IP is already blocked — skip on_match.
-		if cfg.QueryBeforeMatch && queryTmpl != nil {
-			res, _ := action.RunCompiled(ctx, queryTmpl, actCtx, cfg.ActionTimeout.Duration)
-			if res.ExitCode == 0 && res.Error == nil {
-				slog.Info("query pre-check suppressed on_match",
-					"jail", cfg.Name,
-					"ip", result.IP,
-				)
-				return
-			}
-		}
-		if _, err := action.RunAllCompiled(ctx, onMatchTmpls, actCtx, cfg.ActionTimeout.Duration); err != nil {
-			slog.Warn("on_match action failed", "jail", cfg.Name, "ip", result.IP, "error", err)
-		}
-	})
-	if !submitted {
-		slog.Info("on_match already in flight for ip, duplicate dropped",
-			"jail", jr.cfg.Name,
-			"ip", result.IP,
-		)
-	}
-
-	return nil
 }

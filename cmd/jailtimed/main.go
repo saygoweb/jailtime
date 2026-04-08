@@ -175,10 +175,36 @@ func (a *JailControllerAdapter) ConfigTest(name, filePath string, limit int, ret
 func (a *JailControllerAdapter) PerfStats() control.PerfResponse {
 	snap := a.m.PerfStats()
 	return control.PerfResponse{
-		CurrentLatencyMs: snap.CurrentLatencyMs,
+		CurrentLatencyMs:  snap.CurrentLatencyMs,
 		CurrentIntervalMs: snap.CurrentIntervalMs,
-		AvgExecTimeMs:    snap.AvgExecTimeMs,
-		AvgCPUPercent:    snap.AvgCPUPercent,
-		WindowSize:       snap.WindowSize,
+		AvgExecTimeMs:     snap.AvgExecTimeMs,
+		AvgCPUPercent:     snap.AvgCPUPercent,
+		WindowSize:        snap.WindowSize,
 	}
+}
+
+func (a *JailControllerAdapter) StartWhitelist(ctx context.Context, name string) error {
+	return a.m.StartWhitelist(ctx, name)
+}
+
+func (a *JailControllerAdapter) StopWhitelist(ctx context.Context, name string) error {
+	return a.m.StopWhitelist(ctx, name)
+}
+
+func (a *JailControllerAdapter) RestartWhitelist(ctx context.Context, name string) error {
+	return a.m.RestartWhitelist(ctx, name)
+}
+
+func (a *JailControllerAdapter) WhitelistStatus(name string) (string, error) {
+	status, err := a.m.WhitelistStatus(name)
+	return string(status), err
+}
+
+func (a *JailControllerAdapter) AllWhitelistStatuses() map[string]string {
+	raw := a.m.AllWhitelistStatuses()
+	out := make(map[string]string, len(raw))
+	for name, status := range raw {
+		out[name] = string(status)
+	}
+	return out
 }

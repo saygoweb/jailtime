@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -23,6 +24,7 @@ type rawJailConfig struct {
 	Name             string      `yaml:"name"`
 	Enabled          *bool       `yaml:"enabled"`
 	Files            []string    `yaml:"files"`
+	ExcludeFiles     []string    `yaml:"exclude_files"`
 	Filters          []string    `yaml:"filters"`
 	ExcludeFilters   []string    `yaml:"exclude_filters"`
 	Actions          JailActions `yaml:"actions"`
@@ -30,24 +32,29 @@ type rawJailConfig struct {
 	FindTime         Duration    `yaml:"find_time"`
 	JailTime         Duration    `yaml:"jail_time"`
 	NetType          string      `yaml:"net_type"`
+	WatchMode        string      `yaml:"watch_mode"`
 	Query            string      `yaml:"query"`
 	QueryBeforeMatch *bool       `yaml:"query_before_match"`
 	ActionTimeout    Duration    `yaml:"action_timeout"`
+	IgnoreSets       []string    `yaml:"ignore_sets"`
 }
 
 // rawConfig mirrors Config but uses raw sub-types to allow default detection.
 type rawConfig struct {
-	Version int             `yaml:"version"`
-	Include []string        `yaml:"include"`
-	Logging LoggingConfig   `yaml:"logging"`
-	Control ControlConfig   `yaml:"control"`
-	Engine  rawEngineConfig `yaml:"engine"`
-	Jails   []rawJailConfig `yaml:"jails"`
+	Version    int             `yaml:"version"`
+	Include    []string        `yaml:"include"`
+	Logging    LoggingConfig   `yaml:"logging"`
+	Control    ControlConfig   `yaml:"control"`
+	Engine     rawEngineConfig `yaml:"engine"`
+	Jails      []rawJailConfig `yaml:"jails"`
+	Whitelists []rawJailConfig `yaml:"whitelists"`
 }
 
-// rawJailsFile is the schema for included fragment files, which may only define jails.
-type rawJailsFile struct {
-	Jails []rawJailConfig `yaml:"jails"`
+// rawFragmentFile is the schema for included fragment files, which may define
+// jails, whitelists, or both.
+type rawFragmentFile struct {
+	Jails      []rawJailConfig `yaml:"jails"`
+	Whitelists []rawJailConfig `yaml:"whitelists"`
 }
 
 // Load reads the YAML config at path, applies defaults, validates, and returns
@@ -65,7 +72,7 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config file %q: %w", path, err)
 	}
 
-	// Expand include globs and merge jails from fragment files.
+	// Expand include globs and merge jails/whitelists from fragment files.
 	for _, pattern := range raw.Include {
 		if !filepath.IsAbs(pattern) {
 			pattern = filepath.Join(filepath.Dir(path), pattern)
@@ -79,11 +86,12 @@ func Load(path string) (*Config, error) {
 			if inc == path {
 				continue
 			}
-			extra, err := loadJailsFile(inc)
+			extraJails, extraWhitelists, err := loadFragmentFile(inc)
 			if err != nil {
 				return nil, fmt.Errorf("include %q: %w", inc, err)
 			}
-			raw.Jails = append(raw.Jails, extra...)
+			raw.Jails = append(raw.Jails, extraJails...)
+			raw.Whitelists = append(raw.Whitelists, extraWhitelists...)
 		}
 	}
 
@@ -100,29 +108,10 @@ func Load(path string) (*Config, error) {
 	}
 
 	for _, rj := range raw.Jails {
-		jc := JailConfig{
-			Name:           rj.Name,
-			Files:          rj.Files,
-			Filters:        rj.Filters,
-			ExcludeFilters: rj.ExcludeFilters,
-			Actions:        rj.Actions,
-			HitCount:       rj.HitCount,
-			FindTime:       rj.FindTime,
-			JailTime:       rj.JailTime,
-			NetType:        rj.NetType,
-			Query:          rj.Query,
-			ActionTimeout:  rj.ActionTimeout,
-		}
-		if rj.Enabled == nil {
-			jc.Enabled = true
-		} else {
-			jc.Enabled = *rj.Enabled
-		}
-		if rj.QueryBeforeMatch != nil {
-			jc.QueryBeforeMatch = *rj.QueryBeforeMatch
-		}
-		// QueryBeforeMatch defaults to false when unset (zero value).
-		c.Jails = append(c.Jails, jc)
+		c.Jails = append(c.Jails, buildJailConfig(rj))
+	}
+	for _, rj := range raw.Whitelists {
+		c.Whitelists = append(c.Whitelists, buildJailConfig(rj))
 	}
 
 	applyDefaults(c, raw.Engine.ReadFromEnd, raw.Engine.PerfWindow)
@@ -133,19 +122,57 @@ func Load(path string) (*Config, error) {
 	return c, nil
 }
 
-// loadJailsFile loads a jails-only fragment YAML file and returns its raw jail configs.
-func loadJailsFile(path string) ([]rawJailConfig, error) {
+// buildJailConfig converts a rawJailConfig to a JailConfig, applying
+// OnMatch→OnAdd deprecation alias and pointer-bool defaults.
+func buildJailConfig(rj rawJailConfig) JailConfig {
+	actions := rj.Actions
+	// OnMatch is a deprecated alias for OnAdd; merge at load time.
+	if len(actions.OnAdd) == 0 && len(actions.OnMatch) > 0 {
+		slog.Warn("on_match is deprecated; please rename to on_add", "jail", rj.Name)
+		actions.OnAdd = actions.OnMatch
+	}
+
+	jc := JailConfig{
+		Name:           rj.Name,
+		Files:          rj.Files,
+		ExcludeFiles:   rj.ExcludeFiles,
+		Filters:        rj.Filters,
+		ExcludeFilters: rj.ExcludeFilters,
+		Actions:        actions,
+		HitCount:       rj.HitCount,
+		FindTime:       rj.FindTime,
+		JailTime:       rj.JailTime,
+		NetType:        rj.NetType,
+		WatchMode:      rj.WatchMode,
+		Query:          rj.Query,
+		ActionTimeout:  rj.ActionTimeout,
+		IgnoreSets:     rj.IgnoreSets,
+	}
+	if rj.Enabled == nil {
+		jc.Enabled = true
+	} else {
+		jc.Enabled = *rj.Enabled
+	}
+	if rj.QueryBeforeMatch != nil {
+		jc.QueryBeforeMatch = *rj.QueryBeforeMatch
+	}
+	return jc
+}
+
+// loadFragmentFile loads a fragment YAML file and returns its raw jail and
+// whitelist configs.
+func loadFragmentFile(path string) (jails []rawJailConfig, whitelists []rawJailConfig, err error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("reading file: %w", err)
+		return nil, nil, fmt.Errorf("reading file: %w", err)
 	}
-	var f rawJailsFile
+	var f rawFragmentFile
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&f); err != nil {
-		return nil, fmt.Errorf("parsing file: %w", err)
+		return nil, nil, fmt.Errorf("parsing file: %w", err)
 	}
-	return f.Jails, nil
+	return f.Jails, f.Whitelists, nil
 }
 
 func applyDefaults(c *Config, readFromEnd *bool, perfWindow *int) {
@@ -171,12 +198,20 @@ func applyDefaults(c *Config, readFromEnd *bool, perfWindow *int) {
 	} else {
 		c.Engine.PerfWindow = *perfWindow
 	}
-	for i := range c.Jails {
-		if c.Jails[i].NetType == "" {
-			c.Jails[i].NetType = "IP"
+	applyJailDefaults(c.Jails)
+	applyJailDefaults(c.Whitelists)
+}
+
+func applyJailDefaults(jails []JailConfig) {
+	for i := range jails {
+		if jails[i].NetType == "" {
+			jails[i].NetType = "IP"
 		}
-		if c.Jails[i].ActionTimeout.Duration == 0 {
-			c.Jails[i].ActionTimeout.Duration = defaultActionTimeout
+		if jails[i].WatchMode == "" {
+			jails[i].WatchMode = "tail"
+		}
+		if jails[i].ActionTimeout.Duration == 0 {
+			jails[i].ActionTimeout.Duration = defaultActionTimeout
 		}
 	}
 }

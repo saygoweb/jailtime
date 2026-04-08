@@ -51,7 +51,7 @@ func newApacheWPJailConfig(logGlob, outFile string, hitCount int) *config.JailCo
 		HitCount: hitCount,
 		FindTime: config.Duration{Duration: time.Minute},
 		Actions: config.JailActions{
-			OnMatch: []string{"echo {{ .IP }} >> " + outFile},
+			OnAdd: []string{"echo {{ .IP }} >> " + outFile},
 		},
 	}
 }
@@ -290,6 +290,7 @@ func TestManagerRunRoutesEvents(t *testing.T) {
 
 	waitForContent(t, outFile, "31.24.155.180", 3*time.Second)
 }
+
 // writeRestartTestCfg writes a minimal jail YAML config to cfgFile.
 // The on_match action appends the literal jail_time seconds value to outFile
 // so tests can verify which config was in effect when the action ran.

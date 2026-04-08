@@ -16,10 +16,10 @@ func main() {
 	var socketPath string
 
 	root := &cobra.Command{
-		Use:          "jailtime",
-		Short:        "Control the jailtimed daemon",
-		Long:         "jailtime is the command-line client for the jailtimed intrusion-prevention daemon.\nIt communicates with jailtimed over a Unix domain socket.",
-		SilenceUsage: true,
+		Use:           "jailtime",
+		Short:         "Control the jailtimed daemon",
+		Long:          "jailtime is the command-line client for the jailtimed intrusion-prevention daemon.\nIt communicates with jailtimed over a Unix domain socket.",
+		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
 	root.PersistentFlags().StringVar(&socketPath, "socket", defaultSocket, "path to the jailtimed control socket")
@@ -193,7 +193,68 @@ matched. No hit counts are modified and no actions are executed.`,
 	}
 
 	configCmd.AddCommand(filesCmd, testCmd)
-	root.AddCommand(statusCmd, startCmd, stopCmd, restartCmd, versionCmd, configCmd, perfCmd)
+
+	// ── whitelist ─────────────────────────────────────────────────────────────
+	whitelistCmd := &cobra.Command{
+		Use:   "whitelist",
+		Short: "Manage whitelists",
+		Long:  "Commands for listing, starting, stopping and restarting whitelists in a running jailtimed daemon.",
+	}
+
+	whitelistStatusCmd := &cobra.Command{
+		Use:   "status [whitelist]",
+		Short: "Show status of all whitelists, or a specific whitelist",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c := client()
+			if len(args) == 1 {
+				resp, err := c.WhitelistStatus(args[0])
+				if err != nil {
+					return err
+				}
+				fmt.Printf("%-30s %s\n", resp.Name, resp.Status)
+				return nil
+			}
+			resp, err := c.ListWhitelists()
+			if err != nil {
+				return err
+			}
+			for _, wl := range resp.Whitelists {
+				fmt.Printf("%-30s %s\n", wl.Name, wl.Status)
+			}
+			return nil
+		},
+	}
+
+	whitelistStartCmd := &cobra.Command{
+		Use:   "start <whitelist>",
+		Short: "Start a whitelist",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return client().StartWhitelist(args[0])
+		},
+	}
+
+	whitelistStopCmd := &cobra.Command{
+		Use:   "stop <whitelist>",
+		Short: "Stop a whitelist",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return client().StopWhitelist(args[0])
+		},
+	}
+
+	whitelistRestartCmd := &cobra.Command{
+		Use:   "restart <whitelist>",
+		Short: "Restart a whitelist (reloads config from disk)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return client().RestartWhitelist(args[0])
+		},
+	}
+
+	whitelistCmd.AddCommand(whitelistStatusCmd, whitelistStartCmd, whitelistStopCmd, whitelistRestartCmd)
+	root.AddCommand(statusCmd, startCmd, stopCmd, restartCmd, versionCmd, configCmd, perfCmd, whitelistCmd)
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

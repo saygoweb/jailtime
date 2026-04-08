@@ -1,26 +1,26 @@
 package watch
 
 import (
-"context"
-"log/slog"
-"path/filepath"
-"sync"
-"time"
+	"context"
+	"log/slog"
+	"path/filepath"
+	"sync"
+	"time"
 
-"github.com/fsnotify/fsnotify"
+	"github.com/fsnotify/fsnotify"
 )
 
 // FsnotifyBackend implements Backend using fsnotify for event-driven watching.
 // It uses a lazy one-shot drain timer: the timer is only armed when a dirty
 // path is detected, so the goroutine is truly idle when no files change.
 type FsnotifyBackend struct {
-drainInterval time.Duration
-mu            sync.RWMutex
-specs         []WatchSpec
+	drainInterval time.Duration
+	mu            sync.RWMutex
+	specs         []WatchSpec
 }
 
 func NewFsnotifyBackend(drainInterval time.Duration) *FsnotifyBackend {
-return &FsnotifyBackend{drainInterval: drainInterval}
+	return &FsnotifyBackend{drainInterval: drainInterval}
 }
 
 func (b *FsnotifyBackend) Name() string { return "fsnotify" }
@@ -28,228 +28,316 @@ func (b *FsnotifyBackend) Name() string { return "fsnotify" }
 // UpdateSpecs replaces the current watch specs. The change takes effect on
 // the next rescan.
 func (b *FsnotifyBackend) UpdateSpecs(specs []WatchSpec) {
-b.mu.Lock()
-b.specs = specs
-b.mu.Unlock()
+	b.mu.Lock()
+	b.specs = specs
+	b.mu.Unlock()
 }
 
 func (b *FsnotifyBackend) getSpecs() []WatchSpec {
-b.mu.RLock()
-defer b.mu.RUnlock()
-return b.specs
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.specs
 }
 
 func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain DrainFunc) error {
-b.UpdateSpecs(specs)
+	b.UpdateSpecs(specs)
 
-watcher, err := fsnotify.NewWatcher()
-if err != nil {
-slog.Info("fsnotify unavailable, falling back to poll", "error", err)
-return NewPollBackend(b.drainInterval).Start(ctx, b.getSpecs(), drain)
-}
-defer watcher.Close()
-slog.Info("fsnotify backend started")
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		slog.Info("fsnotify unavailable, falling back to poll", "error", err)
+		return NewPollBackend(b.drainInterval).Start(ctx, b.getSpecs(), drain)
+	}
+	defer watcher.Close()
+	slog.Info("fsnotify backend started")
 
-tailers := make(map[string]*FileTailer)
-pathToJails := make(map[string][]string)
-dirty := make(map[string]struct{})
-parentDirs := make(map[string][]string) // parent dir → []glob patterns
+	tailers := make(map[string]*FileTailer)
+	pathToJails := make(map[string][]string) // tail-mode paths
+	staticPathToJails := make(map[string][]string)
+	staticSnapshots := make(map[string]map[string]bool)
+	dirty := make(map[string]struct{})       // tail-mode dirty paths
+	staticDirty := make(map[string]struct{}) // static-mode dirty paths
+	parentDirs := make(map[string][]string)  // parent dir → []glob patterns
 
-var drainTimerC <-chan time.Time // nil = idle
-var lastDrainTime time.Duration // previous drain wall time
+	var drainTimerC <-chan time.Time // nil = idle
+	var lastDrainTime time.Duration  // previous drain wall time
 
-readLines := func(p string) []RawLine {
-ft, ok := tailers[p]
-if !ok {
-return nil
-}
-lines, err := ft.ReadLines()
-if err != nil {
-return nil
-}
-jails := pathToJails[p]
-now := time.Now()
-var result []RawLine
-for _, line := range lines {
-if slog.Default().Enabled(ctx, slog.LevelDebug) && ft.debugLog.Allow() {
-slog.DebugContext(ctx, "line notified", "jails", jails, "file", p, "line", line)
-}
-result = append(result, RawLine{FilePath: p, Line: line, Jails: jails, EnqueueAt: now})
-}
-return result
-}
+	readTailLines := func(p string) []RawLine {
+		ft, ok := tailers[p]
+		if !ok {
+			return nil
+		}
+		lines, err := ft.ReadLines()
+		if err != nil {
+			return nil
+		}
+		jails := pathToJails[p]
+		now := time.Now()
+		var result []RawLine
+		for _, line := range lines {
+			if slog.Default().Enabled(ctx, slog.LevelDebug) && ft.debugLog.Allow() {
+				slog.DebugContext(ctx, "line notified", "jails", jails, "file", p, "line", line)
+			}
+			result = append(result, RawLine{FilePath: p, Line: line, Jails: jails, EnqueueAt: now, Kind: EventTail})
+		}
+		return result
+	}
 
-openTailer := func(p string, readFromEnd bool) {
-if _, ok := tailers[p]; ok {
-return
-}
-ft, err := NewFileTailer(p, readFromEnd)
-if err != nil {
-return
-}
-tailers[p] = ft
-dirty[p] = struct{}{}
-_ = watcher.Add(p)
-}
+	diffStaticLines := func(p string) []RawLine {
+		jails := staticPathToJails[p]
+		current := readAllLines(p)
+		prev := staticSnapshots[p]
+		if prev == nil {
+			prev = make(map[string]bool)
+		}
+		now := time.Now()
+		var result []RawLine
+		for line := range current {
+			if !prev[line] {
+				result = append(result, RawLine{FilePath: p, Line: line, Jails: jails, EnqueueAt: now, Kind: EventAdded})
+			}
+		}
+		for line := range prev {
+			if !current[line] {
+				result = append(result, RawLine{FilePath: p, Line: line, Jails: jails, EnqueueAt: now, Kind: EventRemoved})
+			}
+		}
+		staticSnapshots[p] = current
+		return result
+	}
 
-initialScan := func() {
-currentSpecs := b.getSpecs()
-globCache := make(map[string][]string)
-for _, spec := range currentSpecs {
-for _, pattern := range spec.Globs {
-if _, seen := globCache[pattern]; !seen {
-paths, err := filepath.Glob(pattern)
-if err != nil || paths == nil {
-paths = []string{}
-}
-globCache[pattern] = paths
-}
-}
-}
-newPathToJails := make(map[string][]string)
-pathReadFromEnd := make(map[string]bool)
-for _, spec := range currentSpecs {
-for _, pattern := range spec.Globs {
-for _, p := range globCache[pattern] {
-newPathToJails[p] = append(newPathToJails[p], spec.JailName)
-if _, set := pathReadFromEnd[p]; !set {
-pathReadFromEnd[p] = spec.ReadFromEnd
-}
-}
-// Watch parent dir for CREATE events.
-pd := globParentDir(pattern)
-parentDirs[pd] = appendUniq(parentDirs[pd], pattern)
-_ = watcher.Add(pd)
-}
-}
-for p := range newPathToJails {
-openTailer(p, pathReadFromEnd[p])
-}
-pathToJails = newPathToJails
-}
+	openTailer := func(p string, readFromEnd bool) {
+		if _, ok := tailers[p]; ok {
+			return
+		}
+		ft, err := NewFileTailer(p, readFromEnd)
+		if err != nil {
+			return
+		}
+		tailers[p] = ft
+		dirty[p] = struct{}{}
+		_ = watcher.Add(p)
+	}
 
-handleCreate := func(name string) {
-// Case 1: known file recreated (rotation).
-if ft, ok := tailers[name]; ok {
-_ = ft.Reopen(false)
-dirty[name] = struct{}{}
-return
-}
-// Case 2: new file matching a glob.
-currentSpecs := b.getSpecs()
-for _, spec := range currentSpecs {
-for _, pattern := range spec.Globs {
-if matched, err := filepath.Match(pattern, name); err == nil && matched {
-pathToJails[name] = appendUniq(pathToJails[name], spec.JailName)
-openTailer(name, spec.ReadFromEnd)
-return
-}
-}
-}
-// Case 3: new directory — check if its parent dir is being watched for globs.
-// Watch the new dir so CREATE events inside it are detected.
-if patterns, ok := parentDirs[filepath.Dir(name)]; ok {
-_ = watcher.Add(name)
-for _, pattern := range patterns {
-paths, err := filepath.Glob(pattern)
-if err != nil {
-continue
-}
-for _, p := range paths {
-for _, spec := range currentSpecs {
-for _, sp := range spec.Globs {
-if sp == pattern {
-pathToJails[p] = appendUniq(pathToJails[p], spec.JailName)
-}
-}
-}
-openTailer(p, false)
-}
-}
-}
-}
+	openStatic := func(p string) {
+		if _, ok := staticPathToJails[p]; ok {
+			// Already tracked; mark dirty to do initial diff.
+			staticDirty[p] = struct{}{}
+			return
+		}
+		staticDirty[p] = struct{}{}
+		_ = watcher.Add(p)
+	}
 
-initialScan()
+	armDrainTimer := func() {
+		if drainTimerC != nil {
+			return
+		}
+		wait := b.drainInterval - lastDrainTime
+		if wait < time.Millisecond {
+			wait = time.Millisecond
+		}
+		drainTimerC = time.NewTimer(wait).C
+	}
 
-// Arm drain timer if initial scan found dirty files.
-if len(dirty) > 0 {
-wait := b.drainInterval
-if wait < time.Millisecond {
-wait = time.Millisecond
-}
-drainTimerC = time.NewTimer(wait).C
-}
+	initialScan := func() {
+		currentSpecs := b.getSpecs()
+		excluded := buildExcludeSet(currentSpecs)
 
-for {
-select {
-case <-ctx.Done():
-for _, ft := range tailers {
-ft.Close()
-}
-return ctx.Err()
+		newPathToJails := make(map[string][]string)
+		newStaticPathToJails := make(map[string][]string)
+		pathReadFromEnd := make(map[string]bool)
 
-case event, ok := <-watcher.Events:
-if !ok {
-return nil
-}
-switch {
-case event.Has(fsnotify.Create):
-handleCreate(event.Name)
-if len(dirty) > 0 && drainTimerC == nil {
-wait := b.drainInterval - lastDrainTime
-if wait < time.Millisecond {
-wait = time.Millisecond
-}
-drainTimerC = time.NewTimer(wait).C
-}
-case event.Has(fsnotify.Write):
-if _, known := pathToJails[event.Name]; known {
-dirty[event.Name] = struct{}{}
-if drainTimerC == nil {
-wait := b.drainInterval - lastDrainTime
-if wait < time.Millisecond {
-wait = time.Millisecond
-}
-drainTimerC = time.NewTimer(wait).C
-}
-}
-}
+		for _, spec := range currentSpecs {
+			for _, pattern := range spec.Globs {
+				paths, err := filepath.Glob(pattern)
+				if err != nil || paths == nil {
+					paths = []string{}
+				}
+				for _, p := range paths {
+					if _, ex := excluded[p]; ex {
+						continue
+					}
+					if spec.WatchMode == "static" {
+						newStaticPathToJails[p] = appendUniq(newStaticPathToJails[p], spec.JailName)
+					} else {
+						newPathToJails[p] = appendUniq(newPathToJails[p], spec.JailName)
+						if _, set := pathReadFromEnd[p]; !set {
+							pathReadFromEnd[p] = spec.ReadFromEnd
+						}
+					}
+				}
+				// Watch parent dir for CREATE events.
+				pd := globParentDir(pattern)
+				parentDirs[pd] = appendUniq(parentDirs[pd], pattern)
+				_ = watcher.Add(pd)
+			}
+		}
+		for p := range newPathToJails {
+			openTailer(p, pathReadFromEnd[p])
+		}
+		for p, jails := range newStaticPathToJails {
+			staticPathToJails[p] = jails
+			openStatic(p)
+		}
+		pathToJails = newPathToJails
+	}
 
-case <-drainTimerC:
-drainStart := time.Now()
-drainTimerC = nil
-var batch []RawLine
-for p := range dirty {
-batch = append(batch, readLines(p)...)
-delete(dirty, p)
-}
-drain(ctx, batch)
-lastDrainTime = time.Since(drainStart)
+	handleCreate := func(name string) {
+		currentSpecs := b.getSpecs()
+		excluded := buildExcludeSet(currentSpecs)
+		if _, ex := excluded[name]; ex {
+			return
+		}
 
-case _, ok := <-watcher.Errors:
-if !ok {
-return nil
-}
-}
-}
+		// Check static specs first.
+		for _, spec := range currentSpecs {
+			if spec.WatchMode != "static" {
+				continue
+			}
+			for _, pattern := range spec.Globs {
+				if matched, err := filepath.Match(pattern, name); err == nil && matched {
+					staticPathToJails[name] = appendUniq(staticPathToJails[name], spec.JailName)
+					openStatic(name)
+					return
+				}
+			}
+		}
+
+		// Case 1: known tail file recreated (rotation).
+		if ft, ok := tailers[name]; ok {
+			_ = ft.Reopen(false)
+			dirty[name] = struct{}{}
+			return
+		}
+		// Case 2: new tail file matching a glob.
+		for _, spec := range currentSpecs {
+			if spec.WatchMode == "static" {
+				continue
+			}
+			for _, pattern := range spec.Globs {
+				if matched, err := filepath.Match(pattern, name); err == nil && matched {
+					pathToJails[name] = appendUniq(pathToJails[name], spec.JailName)
+					openTailer(name, spec.ReadFromEnd)
+					return
+				}
+			}
+		}
+		// Case 3: new directory — check if its parent dir is being watched for globs.
+		if patterns, ok := parentDirs[filepath.Dir(name)]; ok {
+			_ = watcher.Add(name)
+			for _, pattern := range patterns {
+				paths, err := filepath.Glob(pattern)
+				if err != nil {
+					continue
+				}
+				for _, p := range paths {
+					if _, ex := excluded[p]; ex {
+						continue
+					}
+					// Determine mode for this pattern.
+					mode := "tail"
+					readFromEnd := false
+					for _, spec := range currentSpecs {
+						for _, sp := range spec.Globs {
+							if sp == pattern {
+								mode = spec.WatchMode
+								readFromEnd = spec.ReadFromEnd
+								pathToJails[p] = appendUniq(pathToJails[p], spec.JailName)
+							}
+						}
+					}
+					if mode == "static" {
+						openStatic(p)
+					} else {
+						openTailer(p, readFromEnd)
+					}
+				}
+			}
+		}
+	}
+
+	initialScan()
+
+	// Arm drain timer if initial scan found dirty files.
+	if len(dirty) > 0 || len(staticDirty) > 0 {
+		armDrainTimer()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			for _, ft := range tailers {
+				ft.Close()
+			}
+			return ctx.Err()
+
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return nil
+			}
+			switch {
+			case event.Has(fsnotify.Create):
+				handleCreate(event.Name)
+				if (len(dirty) > 0 || len(staticDirty) > 0) && drainTimerC == nil {
+					armDrainTimer()
+				}
+			case event.Has(fsnotify.Write):
+				if _, known := pathToJails[event.Name]; known {
+					dirty[event.Name] = struct{}{}
+					armDrainTimer()
+				}
+				if _, known := staticPathToJails[event.Name]; known {
+					staticDirty[event.Name] = struct{}{}
+					armDrainTimer()
+				}
+			case event.Has(fsnotify.Rename):
+				// Atomic replacements (e.g. rename(tmp, dst)) trigger Rename on
+				// the destination file. Treat as a create for static paths.
+				if _, known := staticPathToJails[event.Name]; known {
+					staticDirty[event.Name] = struct{}{}
+					armDrainTimer()
+				}
+			}
+
+		case <-drainTimerC:
+			drainStart := time.Now()
+			drainTimerC = nil
+			var batch []RawLine
+			for p := range dirty {
+				batch = append(batch, readTailLines(p)...)
+				delete(dirty, p)
+			}
+			for p := range staticDirty {
+				batch = append(batch, diffStaticLines(p)...)
+				delete(staticDirty, p)
+			}
+			drain(ctx, batch)
+			lastDrainTime = time.Since(drainStart)
+
+		case _, ok := <-watcher.Errors:
+			if !ok {
+				return nil
+			}
+		}
+	}
 }
 
 // globParentDir returns the deepest directory prefix before the first wildcard character.
 func globParentDir(pattern string) string {
-for i, ch := range pattern {
-if ch == '*' || ch == '?' || ch == '[' {
-return filepath.Dir(pattern[:i])
-}
-}
-return filepath.Dir(pattern)
+	for i, ch := range pattern {
+		if ch == '*' || ch == '?' || ch == '[' {
+			return filepath.Dir(pattern[:i])
+		}
+	}
+	return filepath.Dir(pattern)
 }
 
 // appendUniq appends s to slice only if it is not already present.
 func appendUniq(slice []string, s string) []string {
-for _, v := range slice {
-if v == s {
-return slice
-}
-}
-return append(slice, s)
+	for _, v := range slice {
+		if v == s {
+			return slice
+		}
+	}
+	return append(slice, s)
 }

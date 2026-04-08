@@ -343,30 +343,228 @@ func TestValidatePerfWindowLessThanOne(t *testing.T) {
 }
 
 func TestEngineConfigLogValue(t *testing.T) {
-cfg := EngineConfig{
-WatcherMode:  "fsnotify",
-PollInterval: Duration{Duration: 5 * time.Second},
-ReadFromEnd:  true,
+	cfg := EngineConfig{
+		WatcherMode:  "fsnotify",
+		PollInterval: Duration{Duration: 5 * time.Second},
+		ReadFromEnd:  true,
+	}
+
+	val := cfg.LogValue()
+	if val.Kind() != slog.KindGroup {
+		t.Fatalf("expected KindGroup, got %v", val.Kind())
+	}
+
+	attrs := val.Group()
+	m := make(map[string]slog.Value, len(attrs))
+	for _, a := range attrs {
+		m[a.Key] = a.Value
+	}
+
+	if got := m["watcher_mode"].String(); got != "fsnotify" {
+		t.Errorf("watcher_mode = %q, want %q", got, "fsnotify")
+	}
+	if got := m["poll_interval"].Duration(); got != 5*time.Second {
+		t.Errorf("poll_interval = %v, want 5s", got)
+	}
+	if got := m["read_from_end"].Bool(); !got {
+		t.Error("read_from_end should be true")
+	}
 }
 
-val := cfg.LogValue()
-if val.Kind() != slog.KindGroup {
-t.Fatalf("expected KindGroup, got %v", val.Kind())
+// ---- New tests for whitelist/static/exclude features ----
+
+const staticWhitelistYAML = `
+version: 1
+whitelists:
+  - name: trusted-ips
+    files:
+      - /tmp/whitelist.txt
+    filters:
+      - '(?P<ip>[0-9.]+)'
+    watch_mode: static
+`
+
+func TestLoadStaticWatchMode(t *testing.T) {
+	// Remove the threshold fields from minimalValidYAML to make it static-valid.
+	staticY := `
+version: 1
+jails:
+  - name: sshd
+    files:
+      - /var/log/auth.log
+    filters:
+      - 'Failed password for .* from (?P<ip>[0-9a-fA-F:\.]+)'
+    actions:
+      on_add:
+        - 'echo {{ .IP }}'
+    watch_mode: static
+`
+	path := writeTemp(t, staticY)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() static: unexpected error: %v", err)
+	}
+	if c.Jails[0].WatchMode != "static" {
+		t.Errorf("WatchMode = %q, want \"static\"", c.Jails[0].WatchMode)
+	}
 }
 
-attrs := val.Group()
-m := make(map[string]slog.Value, len(attrs))
-for _, a := range attrs {
-m[a.Key] = a.Value
+func TestLoadStaticModeRejectsThresholdFields(t *testing.T) {
+	y := `
+version: 1
+jails:
+  - name: sshd
+    files:
+      - /var/log/auth.log
+    filters:
+      - 'Failed password for .* from (?P<ip>[0-9a-fA-F:\.]+)'
+    watch_mode: static
+    find_time: 10m
+`
+	path := writeTemp(t, y)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for static jail with find_time, got nil")
+	}
 }
 
-if got := m["watcher_mode"].String(); got != "fsnotify" {
-t.Errorf("watcher_mode = %q, want %q", got, "fsnotify")
+func TestLoadOnMatchDeprecationMerge(t *testing.T) {
+	// on_match should be merged into on_add by Load.
+	path := writeTemp(t, minimalValidYAML)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Jails[0].Actions.OnAdd) == 0 {
+		t.Error("on_match should have been merged into on_add")
+	}
 }
-if got := m["poll_interval"].Duration(); got != 5*time.Second {
-t.Errorf("poll_interval = %v, want 5s", got)
+
+func TestLoadOnAddDirect(t *testing.T) {
+	y := `
+version: 1
+jails:
+  - name: sshd
+    files:
+      - /var/log/auth.log
+    filters:
+      - 'Failed password for .* from (?P<ip>[0-9a-fA-F:\.]+)'
+    actions:
+      on_add:
+        - 'echo add {{ .IP }}'
+      on_remove:
+        - 'echo remove {{ .IP }}'
+    hit_count: 5
+    find_time: 10m
+    jail_time: 1h
+`
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Jails[0].Actions.OnAdd) != 1 {
+		t.Errorf("OnAdd = %v, want 1 entry", c.Jails[0].Actions.OnAdd)
+	}
+	if len(c.Jails[0].Actions.OnRemove) != 1 {
+		t.Errorf("OnRemove = %v, want 1 entry", c.Jails[0].Actions.OnRemove)
+	}
 }
-if got := m["read_from_end"].Bool(); !got {
-t.Error("read_from_end should be true")
+
+func TestLoadExcludeFiles(t *testing.T) {
+	y := minimalValidYAML + "    exclude_files:\n      - /var/log/exclude.log\n"
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Jails[0].ExcludeFiles) != 1 || c.Jails[0].ExcludeFiles[0] != "/var/log/exclude.log" {
+		t.Errorf("ExcludeFiles = %v, want [\"/var/log/exclude.log\"]", c.Jails[0].ExcludeFiles)
+	}
 }
+
+func TestLoadWhitelistsFromMain(t *testing.T) {
+	y := minimalValidYAML + `
+whitelists:
+  - name: trusted-ips
+    files:
+      - /tmp/whitelist.txt
+    filters:
+      - '(?P<ip>[0-9.]+)'
+    watch_mode: static
+`
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Whitelists) != 1 {
+		t.Fatalf("len(Whitelists) = %d, want 1", len(c.Whitelists))
+	}
+	if c.Whitelists[0].Name != "trusted-ips" {
+		t.Errorf("Whitelist name = %q, want \"trusted-ips\"", c.Whitelists[0].Name)
+	}
+	if c.Whitelists[0].WatchMode != "static" {
+		t.Errorf("Whitelist WatchMode = %q, want \"static\"", c.Whitelists[0].WatchMode)
+	}
+}
+
+func TestLoadWhitelistsFromFragment(t *testing.T) {
+	dir := t.TempDir()
+
+	fragYAML := `
+whitelists:
+  - name: trusted-ips
+    files:
+      - /tmp/whitelist.txt
+    filters:
+      - '(?P<ip>[0-9.]+)'
+    watch_mode: static
+`
+	fragPath := dir + "/whitelists.yaml"
+	if err := os.WriteFile(fragPath, []byte(fragYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mainYAML := minimalValidYAML + "include:\n  - " + dir + "/*.yaml\n"
+	mainPath := dir + "/jail.yaml"
+	if err := os.WriteFile(mainPath, []byte(mainYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := Load(mainPath)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Whitelists) != 1 {
+		t.Fatalf("len(Whitelists) = %d, want 1", len(c.Whitelists))
+	}
+}
+
+func TestLoadJailWhitelistNameCollision(t *testing.T) {
+	y := minimalValidYAML + `
+whitelists:
+  - name: sshd
+    files:
+      - /tmp/whitelist.txt
+    filters:
+      - '(?P<ip>[0-9.]+)'
+    watch_mode: static
+`
+	path := writeTemp(t, y)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for jail/whitelist name collision, got nil")
+	}
+}
+
+func TestLoadWatchModeDefault(t *testing.T) {
+	path := writeTemp(t, minimalValidYAML)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if c.Jails[0].WatchMode != "tail" {
+		t.Errorf("WatchMode default = %q, want \"tail\"", c.Jails[0].WatchMode)
+	}
 }

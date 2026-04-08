@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -445,83 +446,83 @@ func TestFsnotifyBackendBasic(t *testing.T) {
 // TestInotifyBackendBasic verifies that the "inotify" mode alias creates a
 // working backend on Linux (fsnotify uses inotify under the hood).
 func TestInotifyBackendBasic(t *testing.T) {
-dir := t.TempDir()
-path := filepath.Join(dir, "inotify.log")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "inotify.log")
 
-f, err := os.Create(path)
-if err != nil {
-t.Fatal(err)
-}
-f.Close()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
 
-b := NewAuto("inotify", 100*time.Millisecond)
-specs := []WatchSpec{{JailName: "jail-inotify", Globs: []string{path}, ReadFromEnd: false}}
-out, cancel := startBackendDrain(t, b, specs)
-defer cancel()
+	b := NewAuto("inotify", 100*time.Millisecond)
+	specs := []WatchSpec{{JailName: "jail-inotify", Globs: []string{path}, ReadFromEnd: false}}
+	out, cancel := startBackendDrain(t, b, specs)
+	defer cancel()
 
-time.Sleep(150 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 
-af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
-if err != nil {
-t.Fatal(err)
-}
-fmt.Fprintln(af, "inotify test line")
-af.Close()
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(af, "inotify test line")
+	af.Close()
 
-ev, ok := waitEvent(out, 2*time.Second)
-if !ok {
-t.Fatal("timed out waiting for inotify event")
-}
-if ev.Line != "inotify test line" {
-t.Errorf("expected line %q, got %q", "inotify test line", ev.Line)
-}
-if !containsJail(ev.Jails, "jail-inotify") {
-t.Errorf("expected Jails to contain %q, got %v", "jail-inotify", ev.Jails)
-}
-if ev.FilePath != path {
-t.Errorf("expected FilePath %q, got %q", path, ev.FilePath)
-}
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for inotify event")
+	}
+	if ev.Line != "inotify test line" {
+		t.Errorf("expected line %q, got %q", "inotify test line", ev.Line)
+	}
+	if !containsJail(ev.Jails, "jail-inotify") {
+		t.Errorf("expected Jails to contain %q, got %v", "jail-inotify", ev.Jails)
+	}
+	if ev.FilePath != path {
+		t.Errorf("expected FilePath %q, got %q", path, ev.FilePath)
+	}
 }
 
 // TestOsModeBackendBasic verifies that the "os" mode alias creates a working
 // backend (resolves to the platform-native watcher).
 func TestOsModeBackendBasic(t *testing.T) {
-dir := t.TempDir()
-path := filepath.Join(dir, "os-mode.log")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "os-mode.log")
 
-f, err := os.Create(path)
-if err != nil {
-t.Fatal(err)
-}
-f.Close()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
 
-b := NewAuto("os", 100*time.Millisecond)
-specs := []WatchSpec{{JailName: "jail-os", Globs: []string{path}, ReadFromEnd: false}}
-out, cancel := startBackendDrain(t, b, specs)
-defer cancel()
+	b := NewAuto("os", 100*time.Millisecond)
+	specs := []WatchSpec{{JailName: "jail-os", Globs: []string{path}, ReadFromEnd: false}}
+	out, cancel := startBackendDrain(t, b, specs)
+	defer cancel()
 
-time.Sleep(150 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 
-af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
-if err != nil {
-t.Fatal(err)
-}
-fmt.Fprintln(af, "os mode test line")
-af.Close()
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(af, "os mode test line")
+	af.Close()
 
-ev, ok := waitEvent(out, 2*time.Second)
-if !ok {
-t.Fatal("timed out waiting for os-mode event")
-}
-if ev.Line != "os mode test line" {
-t.Errorf("expected line %q, got %q", "os mode test line", ev.Line)
-}
-if !containsJail(ev.Jails, "jail-os") {
-t.Errorf("expected Jails to contain %q, got %v", "jail-os", ev.Jails)
-}
-if ev.FilePath != path {
-t.Errorf("expected FilePath %q, got %q", path, ev.FilePath)
-}
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for os-mode event")
+	}
+	if ev.Line != "os mode test line" {
+		t.Errorf("expected line %q, got %q", "os mode test line", ev.Line)
+	}
+	if !containsJail(ev.Jails, "jail-os") {
+		t.Errorf("expected Jails to contain %q, got %v", "jail-os", ev.Jails)
+	}
+	if ev.FilePath != path {
+		t.Errorf("expected FilePath %q, got %q", path, ev.FilePath)
+	}
 }
 
 // TestPollBackendSharedFile verifies that when two jails watch the same file,
@@ -670,82 +671,230 @@ func TestFsnotifyBackendCoalescing(t *testing.T) {
 // TestDebugRateLimiterInWatch verifies the watch package's debugRateLimiter
 // allows exactly maxPerSec entries per window and resets after one second.
 func TestDebugRateLimiterInWatch(t *testing.T) {
-base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
-mockNow := base
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	mockNow := base
 
-rl := newDebugRateLimiter(2)
-rl.now = func() time.Time { return mockNow }
+	rl := newDebugRateLimiter(2)
+	rl.now = func() time.Time { return mockNow }
 
-if !rl.Allow() {
-t.Fatal("1st call in window should be allowed")
-}
-if !rl.Allow() {
-t.Fatal("2nd call in window should be allowed")
-}
-if rl.Allow() {
-t.Fatal("3rd call in window should be denied")
-}
+	if !rl.Allow() {
+		t.Fatal("1st call in window should be allowed")
+	}
+	if !rl.Allow() {
+		t.Fatal("2nd call in window should be allowed")
+	}
+	if rl.Allow() {
+		t.Fatal("3rd call in window should be denied")
+	}
 
-mockNow = base.Add(time.Second)
-if !rl.Allow() {
-t.Fatal("1st call after window reset should be allowed")
-}
-if !rl.Allow() {
-t.Fatal("2nd call after window reset should be allowed")
-}
-if rl.Allow() {
-t.Fatal("3rd call after window reset should be denied")
-}
+	mockNow = base.Add(time.Second)
+	if !rl.Allow() {
+		t.Fatal("1st call after window reset should be allowed")
+	}
+	if !rl.Allow() {
+		t.Fatal("2nd call after window reset should be allowed")
+	}
+	if rl.Allow() {
+		t.Fatal("3rd call after window reset should be denied")
+	}
 }
 
 // TestFsnotifyBackendIdleNoDrain verifies that when no writes occur the drain
 // callback is never invoked, i.e., the backend is truly idle with no wakeups.
 func TestFsnotifyBackendIdleNoDrain(t *testing.T) {
-dir := t.TempDir()
-path := filepath.Join(dir, "idle.log")
-f, err := os.Create(path)
-if err != nil {
-t.Fatal(err)
-}
-f.Close()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "idle.log")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
 
-const drainInterval = 50 * time.Millisecond
-drainCount := 0
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
+	const drainInterval = 50 * time.Millisecond
+	drainCount := 0
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-b := NewFsnotifyBackend(drainInterval)
-specs := []WatchSpec{{JailName: "idle-jail", Globs: []string{path}, ReadFromEnd: true}}
-go func() {
-_ = b.Start(ctx, specs, func(_ context.Context, lines []RawLine) {
-drainCount += len(lines)
-})
-}()
+	b := NewFsnotifyBackend(drainInterval)
+	specs := []WatchSpec{{JailName: "idle-jail", Globs: []string{path}, ReadFromEnd: true}}
+	go func() {
+		_ = b.Start(ctx, specs, func(_ context.Context, lines []RawLine) {
+			drainCount += len(lines)
+		})
+	}()
 
-// Wait 4× drainInterval with no writes — drain should NOT be called.
-time.Sleep(4 * drainInterval)
-if drainCount != 0 {
-t.Errorf("expected 0 drain calls while idle, got drain count %d", drainCount)
-}
+	// Wait 4× drainInterval with no writes — drain should NOT be called.
+	time.Sleep(4 * drainInterval)
+	if drainCount != 0 {
+		t.Errorf("expected 0 drain calls while idle, got drain count %d", drainCount)
+	}
 
-// Now write a line — it should arrive.
-af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
-if err != nil {
-t.Fatal(err)
-}
-fmt.Fprintln(af, "after idle")
-af.Close()
+	// Now write a line — it should arrive.
+	af, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(af, "after idle")
+	af.Close()
 
-deadline := time.After(2 * time.Second)
-for {
-select {
-case <-time.After(10 * time.Millisecond):
-if drainCount > 0 {
-goto done
-}
-case <-deadline:
-t.Fatal("timed out waiting for line after idle period")
-}
-}
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-time.After(10 * time.Millisecond):
+			if drainCount > 0 {
+				goto done
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for line after idle period")
+		}
+	}
 done:
+}
+
+// ---- New tests for ExcludeGlobs and static watch_mode ----
+
+// drainToSlice collects RawLines from a backend into a slice via channel.
+// It cancels ctx after first drain call that produces at least minLines.
+func drainToSliceN(minLines int) (DrainFunc, func() []RawLine) {
+	var mu sync.Mutex
+	var collected []RawLine
+	done := make(chan struct{})
+	var once sync.Once
+
+	drain := func(ctx context.Context, lines []RawLine) {
+		mu.Lock()
+		collected = append(collected, lines...)
+		total := len(collected)
+		mu.Unlock()
+		if total >= minLines {
+			once.Do(func() { close(done) })
+		}
+	}
+	wait := func() []RawLine {
+		<-done
+		mu.Lock()
+		defer mu.Unlock()
+		out := make([]RawLine, len(collected))
+		copy(out, collected)
+		return out
+	}
+	return drain, wait
+}
+
+func TestPollBackendExcludeGlobs(t *testing.T) {
+	dir := t.TempDir()
+	included := filepath.Join(dir, "included.log")
+	excluded := filepath.Join(dir, "excluded.log")
+
+	if err := os.WriteFile(included, []byte("line-a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(excluded, []byte("line-b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := WatchSpec{
+		JailName:     "test",
+		Globs:        []string{filepath.Join(dir, "*.log")},
+		ExcludeGlobs: []string{excluded},
+		WatchMode:    "tail",
+		ReadFromEnd:  false,
+	}
+
+	drain, wait := drainToSliceN(1)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	b := NewPollBackend(50 * time.Millisecond)
+	go b.Start(ctx, []WatchSpec{spec}, drain)
+	time.Sleep(150 * time.Millisecond)
+
+	lines := wait()
+	cancel()
+
+	for _, l := range lines {
+		if l.FilePath == excluded {
+			t.Errorf("excluded file appeared in drain: %s", l.FilePath)
+		}
+	}
+	found := false
+	for _, l := range lines {
+		if l.Line == "line-a" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("included file line-a not found in drain")
+	}
+}
+
+func TestPollBackendStaticMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "whitelist.txt")
+
+	if err := os.WriteFile(path, []byte("1.2.3.4\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	type kindLine struct {
+		line string
+		kind EventKind
+	}
+	var mu sync.Mutex
+	var got []kindLine
+	addedSeen := make(chan struct{})
+	var addedOnce sync.Once
+
+	drain := func(_ context.Context, lines []RawLine) {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, l := range lines {
+			got = append(got, kindLine{l.Line, l.Kind})
+		}
+		for _, l := range got {
+			if l.kind == EventAdded {
+				addedOnce.Do(func() { close(addedSeen) })
+			}
+		}
+	}
+
+	spec := WatchSpec{
+		JailName:  "wl",
+		Globs:     []string{path},
+		WatchMode: "static",
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	b := NewPollBackend(50 * time.Millisecond)
+	go b.Start(ctx, []WatchSpec{spec}, drain)
+
+	select {
+	case <-addedSeen:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("timed out waiting for EventAdded")
+	}
+
+	// Remove the IP and wait for EventRemoved.
+	if err := os.WriteFile(path, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			cancel()
+			t.Fatal("timed out waiting for EventRemoved")
+		case <-time.After(100 * time.Millisecond):
+			mu.Lock()
+			for _, l := range got {
+				if l.kind == EventRemoved && l.line == "1.2.3.4" {
+					mu.Unlock()
+					cancel()
+					return
+				}
+			}
+			mu.Unlock()
+		}
+	}
 }

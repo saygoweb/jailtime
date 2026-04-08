@@ -11,8 +11,8 @@ type Context struct {
 	Jail      string
 	File      string
 	Line      string
-	JailTime  int64  // seconds
-	FindTime  int64  // seconds
+	JailTime  int64 // seconds
+	FindTime  int64 // seconds
 	HitCount  int
 	Timestamp string // RFC3339
 }

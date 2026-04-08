@@ -7,6 +7,18 @@ import (
 	"time"
 )
 
+// EventKind distinguishes how a line was produced.
+type EventKind int
+
+const (
+	// EventTail is the default: a new line appended to a file being tailed.
+	EventTail EventKind = iota
+	// EventAdded indicates a line (IP/CIDR) appeared in a static file.
+	EventAdded
+	// EventRemoved indicates a line (IP/CIDR) was removed from a static file.
+	EventRemoved
+)
+
 // Event represents a new log line read from a watched file.
 type Event struct {
 	JailName string
@@ -14,6 +26,7 @@ type Event struct {
 	Offset   int64
 	Line     string
 	Time     time.Time
+	Kind     EventKind
 }
 
 // RawLine is a single log line read from a file, annotated with all
@@ -24,13 +37,16 @@ type RawLine struct {
 	Line      string
 	Jails     []string
 	EnqueueAt time.Time
+	Kind      EventKind
 }
 
 // WatchSpec defines what a jail wants to watch.
 type WatchSpec struct {
-	JailName    string
-	Globs       []string
-	ReadFromEnd bool
+	JailName     string
+	Globs        []string
+	ExcludeGlobs []string
+	WatchMode    string // "tail" or "static"
+	ReadFromEnd  bool
 }
 
 // DrainFunc is called synchronously by the backend during each drain cycle.
