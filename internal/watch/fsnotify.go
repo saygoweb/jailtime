@@ -14,8 +14,8 @@ import (
 // It uses a lazy one-shot drain timer: the timer is only armed when a dirty
 // path is detected, so the goroutine is truly idle when no files change.
 type FsnotifyBackend struct {
-	drainInterval time.Duration
 	mu            sync.RWMutex
+	drainInterval time.Duration
 	specs         []WatchSpec
 }
 
@@ -24,6 +24,20 @@ func NewFsnotifyBackend(drainInterval time.Duration) *FsnotifyBackend {
 }
 
 func (b *FsnotifyBackend) Name() string { return "fsnotify" }
+
+// SetInterval updates the drain interval. The change takes effect when the
+// next drain timer is armed.
+func (b *FsnotifyBackend) SetInterval(d time.Duration) {
+	b.mu.Lock()
+	b.drainInterval = d
+	b.mu.Unlock()
+}
+
+func (b *FsnotifyBackend) getDrainInterval() time.Duration {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.drainInterval
+}
 
 // UpdateSpecs replaces the current watch specs. The change takes effect on
 // the next rescan.
@@ -45,7 +59,7 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		slog.Info("fsnotify unavailable, falling back to poll", "error", err)
-		return NewPollBackend(b.drainInterval).Start(ctx, b.getSpecs(), drain)
+		return NewPollBackend(b.getDrainInterval()).Start(ctx, b.getSpecs(), drain)
 	}
 	defer watcher.Close()
 	slog.Info("fsnotify backend started")
@@ -132,7 +146,7 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 		if drainTimerC != nil {
 			return
 		}
-		wait := b.drainInterval - lastDrainTime
+		wait := b.getDrainInterval() - lastDrainTime
 		if wait < time.Millisecond {
 			wait = time.Millisecond
 		}

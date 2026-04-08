@@ -63,6 +63,9 @@ type Backend interface {
 	// UpdateSpecs replaces the set of watch specs. New jails are picked up on
 	// the next rescan/poll cycle; removed jails stop generating events.
 	UpdateSpecs(specs []WatchSpec)
+	// SetInterval updates the drain/poll interval at runtime. The change takes
+	// effect on the next tick or drain-timer arm.
+	SetInterval(d time.Duration)
 }
 
 // debugRateLimiter allows at most maxPerSec log entries per second.

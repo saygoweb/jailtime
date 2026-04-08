@@ -1,6 +1,7 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -45,6 +46,24 @@ func (c *Client) get(path string, out any) error {
 
 func (c *Client) post(path string) error {
 	resp, err := c.httpClient.Post("http://jailtimed"+path, "application/json", nil)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		var e ErrorResponse
+		_ = json.NewDecoder(resp.Body).Decode(&e)
+		return fmt.Errorf("server error: %s", e.Error)
+	}
+	return nil
+}
+
+func (c *Client) postJSON(path string, body any) error {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	resp, err := c.httpClient.Post("http://jailtimed"+path, "application/json", bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -168,4 +187,18 @@ func (c *Client) StopWhitelist(name string) error {
 // RestartWhitelist calls POST /v1/whitelists/{name}/restart.
 func (c *Client) RestartWhitelist(name string) error {
 	return c.post("/v1/whitelists/" + name + "/restart")
+}
+
+// GlobalConfig calls GET /v1/config/global and returns all engine config fields.
+func (c *Client) GlobalConfig() (*GlobalConfigResponse, error) {
+	var resp GlobalConfigResponse
+	if err := c.get("/v1/config/global", &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// SetGlobalConfig calls POST /v1/config/global to update a single config field.
+func (c *Client) SetGlobalConfig(key, value string) error {
+	return c.postJSON("/v1/config/global", SetGlobalConfigRequest{Key: key, Value: value})
 }

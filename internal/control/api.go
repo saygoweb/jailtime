@@ -44,7 +44,16 @@ type PerfResponse struct {
 	CPUPercent      float64 `json:"cpu_percent"`
 }
 
-// WhitelistStatusResponse represents one whitelist's status.
+// GlobalConfigResponse is returned by GET /v1/config/global.
+type GlobalConfigResponse struct {
+	Config map[string]string `json:"config"`
+}
+
+// SetGlobalConfigRequest is the body for POST /v1/config/global.
+type SetGlobalConfigRequest struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
 type WhitelistStatusResponse struct {
 	Name   string `json:"name"`
 	Status string `json:"status"`

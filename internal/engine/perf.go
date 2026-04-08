@@ -54,6 +54,13 @@ func (p *PerfMetrics) RecordExecution(execTime, latency, sleepTime time.Duration
 	}
 }
 
+// SetTargetLatency updates the target latency displayed in performance snapshots.
+func (p *PerfMetrics) SetTargetLatency(d time.Duration) {
+	p.mu.Lock()
+	p.targetLatency = d
+	p.mu.Unlock()
+}
+
 // Close releases resources held by the PerfMetrics (e.g. the open cgroup fd).
 func (p *PerfMetrics) Close() {
 	_ = p.cpuSampler.Close()
