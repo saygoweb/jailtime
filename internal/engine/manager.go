@@ -22,9 +22,9 @@ type Manager struct {
 	backend         watch.Backend
 	mu              sync.RWMutex
 	perf            *PerfMetrics
+	targetLatency   time.Duration
 	currentInterval time.Duration
 	lastDrainAt     time.Time
-	lastExecTime    time.Duration
 }
 
 func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
@@ -54,13 +54,19 @@ func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
 	}
 	backend := watch.NewAuto(cfg.Engine.WatcherMode, targetLatency)
 
+	perfWindow := cfg.Engine.PerfWindow
+	if perfWindow < 1 {
+		perfWindow = 1
+	}
+
 	m := &Manager{
 		cfg:             cfg,
 		configPath:      configPath,
 		jails:           jails,
 		whitelists:      whitelists,
 		backend:         backend,
-		perf:            NewPerfMetrics(targetLatency, "jailtimed.service"),
+		perf:            NewPerfMetrics(targetLatency, perfWindow, "jailtimed.service"),
+		targetLatency:   targetLatency,
 		currentInterval: targetLatency,
 	}
 	m.injectIgnoreSets()
@@ -143,14 +149,15 @@ func (m *Manager) processDrain(ctx context.Context, lines []watch.RawLine) {
 	}
 	m.lastDrainAt = drainStart
 
-	// Sleep time = interval since last drain minus the previous drain's execution time.
-	sleepTime := m.currentInterval - m.lastExecTime
+	// Intended sleep steers towards targetLatency using the moving average of
+	// previous execution times: sleep = targetLatency - movingAvgExec.
+	// This ensures sleep is always <= targetLatency regardless of OS scheduling drift.
+	intendedSleep := m.perf.IntendedSleep()
 
 	m.processBatch(ctx, lines)
 
 	execTime := time.Since(drainStart)
-	m.perf.RecordExecution(execTime, m.currentInterval, sleepTime, len(lines))
-	m.lastExecTime = execTime
+	m.perf.RecordExecution(execTime, m.currentInterval, intendedSleep, len(lines))
 }
 
 func (m *Manager) processBatch(ctx context.Context, lines []watch.RawLine) {
