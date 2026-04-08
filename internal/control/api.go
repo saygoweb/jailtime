@@ -36,11 +36,12 @@ type ConfigTestResponse struct {
 
 // PerfResponse is returned by GET /v1/perf.
 type PerfResponse struct {
-	CurrentLatencyMs  float64 `json:"current_latency_ms"`
-	CurrentIntervalMs float64 `json:"current_interval_ms"`
-	AvgExecTimeMs     float64 `json:"avg_exec_time_ms"`
-	AvgCPUPercent     float64 `json:"avg_cpu_percent"`
-	WindowSize        int     `json:"window_size"`
+	TargetLatencyMs float64 `json:"target_latency_ms"`
+	LatencyMs       float64 `json:"latency_ms"`
+	ExecutionMs     float64 `json:"execution_ms"`
+	SleepMs         float64 `json:"sleep_ms"`
+	LinesProcessed  int     `json:"lines_processed"`
+	CPUPercent      float64 `json:"cpu_percent"`
 }
 
 // WhitelistStatusResponse represents one whitelist's status.

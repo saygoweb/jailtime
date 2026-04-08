@@ -175,7 +175,7 @@ matched. No hit counts are modified and no actions are executed.`,
 	perfCmd := &cobra.Command{
 		Use:   "perf",
 		Short: "Show daemon performance metrics",
-		Long:  "Display current latency, execution delay, average execution time, and CPU usage.",
+		Long:  "Display target latency config and current latency, execution, sleep, lines processed, and CPU usage.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c := client()
@@ -183,11 +183,14 @@ matched. No hit counts are modified and no actions are executed.`,
 			if err != nil {
 				return err
 			}
-			fmt.Printf("Performance Metrics (window=%d):\n", resp.WindowSize)
-			fmt.Printf("  Current latency:     %.0fms\n", resp.CurrentLatencyMs)
-			fmt.Printf("  Current interval:    %.0fms\n", resp.CurrentIntervalMs)
-			fmt.Printf("  Avg execution time:  %.1fms\n", resp.AvgExecTimeMs)
-			fmt.Printf("  Avg CPU usage:       %.1f%%\n", resp.AvgCPUPercent)
+			fmt.Printf("Config:\n")
+			fmt.Printf("  Target Latency: %.0fms\n", resp.TargetLatencyMs)
+			fmt.Printf("\nPerformance:\n")
+			fmt.Printf("  Latency:   %.0fms\n", resp.LatencyMs)
+			fmt.Printf("  Execution: %.0fms\n", resp.ExecutionMs)
+			fmt.Printf("  Sleep:     %.0fms\n", resp.SleepMs)
+			fmt.Printf("  Lines:     %d\n", resp.LinesProcessed)
+			fmt.Printf("  CPU Usage: %.1f%%\n", resp.CPUPercent)
 			return nil
 		},
 	}

@@ -22,6 +22,7 @@ type Manager struct {
 	perf            *PerfMetrics
 	currentInterval time.Duration
 	lastDrainAt     time.Time
+	lastExecTime    time.Duration
 }
 
 func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
@@ -51,18 +52,13 @@ func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
 	}
 	backend := watch.NewAuto(cfg.Engine.WatcherMode, targetLatency)
 
-	perfWindow := cfg.Engine.PerfWindow
-	if perfWindow == 0 {
-		perfWindow = 3
-	}
-
 	m := &Manager{
 		cfg:             cfg,
 		configPath:      configPath,
 		jails:           jails,
 		whitelists:      whitelists,
 		backend:         backend,
-		perf:            NewPerfMetrics(perfWindow, "jailtimed.service"),
+		perf:            NewPerfMetrics(targetLatency, "jailtimed.service"),
 		currentInterval: targetLatency,
 	}
 	m.injectIgnoreSets()
@@ -123,10 +119,14 @@ func (m *Manager) processDrain(ctx context.Context, lines []watch.RawLine) {
 	}
 	m.lastDrainAt = drainStart
 
+	// Sleep time = interval since last drain minus the previous drain's execution time.
+	sleepTime := m.currentInterval - m.lastExecTime
+
 	m.processBatch(ctx, lines)
 
 	execTime := time.Since(drainStart)
-	m.perf.RecordExecution(execTime, m.currentInterval, len(lines))
+	m.perf.RecordExecution(execTime, m.currentInterval, sleepTime, len(lines))
+	m.lastExecTime = execTime
 }
 
 func (m *Manager) processBatch(ctx context.Context, lines []watch.RawLine) {
