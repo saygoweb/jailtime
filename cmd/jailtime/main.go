@@ -116,18 +116,19 @@ any included fragment files under jails.d/.`,
 		Long:  "Helpers that query a running jailtimed daemon to inspect or test jail configuration without affecting running state.",
 	}
 
-	// config files <jail>
+	// config files <jail|whitelist>
 	var filesLimit int
 	var filesLog bool
 	filesCmd := &cobra.Command{
-		Use:   "files <jail>",
-		Short: "List files currently matched by a jail's glob patterns",
-		Long: `Expand the configured file globs for a jail and list every matching path.
+		Use:   "files <jail|whitelist>",
+		Short: "List files currently matched by a jail's or whitelist's glob patterns",
+		Long: `Expand the configured file globs for a jail or whitelist and list every matching path.
 Globs are re-evaluated at query time, so files in newly-created subdirectories
 will appear even if they did not exist when jailtimed was started.`,
 		Example: `  jailtime config files sshd
   jailtime config files apache2 --limit=0
-  jailtime config files nginx --log`,
+  jailtime config files nginx --log
+  jailtime config files my-whitelist`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resp, err := client().ConfigFiles(args[0], filesLimit, filesLog)
@@ -144,18 +145,19 @@ will appear even if they did not exist when jailtimed was started.`,
 	filesCmd.Flags().IntVar(&filesLimit, "limit", 10, "maximum number of files to return (0 = no limit)")
 	filesCmd.Flags().BoolVar(&filesLog, "log", false, "also log matched file paths via the daemon's logger")
 
-	// config test <jail> <file>
+	// config test <jail|whitelist> <file>
 	var testLimit int
 	var testMatching bool
 	testCmd := &cobra.Command{
-		Use:   "test <jail> <file>",
-		Short: "Test a jail's filters against a log file (no actions triggered)",
-		Long: `Read every line of the given log file and run it through the jail's include
-and exclude filters. Reports the total lines processed and the number that
+		Use:   "test <jail|whitelist> <file>",
+		Short: "Test a jail's or whitelist's filters against a log file (no actions triggered)",
+		Long: `Read every line of the given log file and run it through the jail's or whitelist's
+include and exclude filters. Reports the total lines processed and the number that
 matched. No hit counts are modified and no actions are executed.`,
 		Example: `  jailtime config test sshd /var/log/auth.log
   jailtime config test nginx /var/log/nginx/access.log --matching
-  jailtime config test apache2 /var/log/apache2/access.log --matching --limit=20`,
+  jailtime config test apache2 /var/log/apache2/access.log --matching --limit=20
+  jailtime config test my-whitelist /var/log/mail.log`,
 		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			resp, err := client().ConfigTest(args[0], args[1], testLimit, testMatching)
