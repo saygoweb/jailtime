@@ -12,17 +12,31 @@ import (
 	"github.com/sgw/jailtime/internal/watch"
 )
 
-// TestSortedKeys verifies that sortedKeys returns map keys in alphabetical order.
+// TestSortedKeys verifies that sortedKeys orders by source filename first, then
+// by jail name as a tiebreaker for jails in the same file.
 func TestSortedKeys(t *testing.T) {
+	// All keys with no source file — falls back to name order.
 	m := map[string]*JailRuntime{
-		"zebra":  {},
-		"alpha":  {},
-		"middle": {},
+		"zebra":  {cfg: &config.JailConfig{Name: "zebra"}},
+		"alpha":  {cfg: &config.JailConfig{Name: "alpha"}},
+		"middle": {cfg: &config.JailConfig{Name: "middle"}},
 	}
 	got := sortedKeys(m)
 	want := []string{"alpha", "middle", "zebra"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
-		t.Errorf("sortedKeys = %v, want %v", got, want)
+		t.Errorf("sortedKeys (no source file) = %v, want %v", got, want)
+	}
+
+	// Keys with distinct source files — ordered by filename, not by name.
+	m2 := map[string]*JailRuntime{
+		"stripe":      {cfg: &config.JailConfig{Name: "stripe", SourceFile: "/etc/jailtime/jails/010-stripe.yaml"}},
+		"apache":      {cfg: &config.JailConfig{Name: "apache", SourceFile: "/etc/jailtime/jails/020-apache.yaml"}},
+		"uptimerobot": {cfg: &config.JailConfig{Name: "uptimerobot", SourceFile: "/etc/jailtime/jails/005-uptimerobot.yaml"}},
+	}
+	got2 := sortedKeys(m2)
+	want2 := []string{"uptimerobot", "stripe", "apache"}
+	if fmt.Sprint(got2) != fmt.Sprint(want2) {
+		t.Errorf("sortedKeys (by source file) = %v, want %v", got2, want2)
 	}
 }
 
@@ -112,7 +126,81 @@ func TestGlobalOnStartRunsBeforeJails(t *testing.T) {
 	}
 }
 
-// TestJailsStartInAlphabeticalOrder verifies that jails are started in sorted order.
+// TestJailsStartInFilenameOrder verifies that jails without a source file fall
+// back to name order, and that jails with distinct source files start in
+// source-filename order regardless of jail name.
+func TestJailsStartInFilenameOrder(t *testing.T) {
+	dir := t.TempDir()
+	outFile := dir + "/order.txt"
+	logFile := dir + "/app.log"
+	if err := os.WriteFile(logFile, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Engine: config.EngineConfig{
+			WatcherMode:   "poll",
+			PollInterval:  config.Duration{Duration: 50 * time.Millisecond},
+			ReadFromEnd:   true,
+			TargetLatency: config.Duration{Duration: 50 * time.Millisecond},
+			PerfWindow:    1,
+		},
+	}
+
+	// Jail names are reverse-alphabetical but source files are numbered so that
+	// the expected startup order is stripe → apache → uptimerobot.
+	type entry struct {
+		name string
+		file string
+	}
+	entries := []entry{
+		{"uptimerobot", "/etc/jailtime/jails/030-uptimerobot.yaml"},
+		{"stripe", "/etc/jailtime/jails/010-stripe.yaml"},
+		{"apache", "/etc/jailtime/jails/020-apache.yaml"},
+	}
+
+	jails := map[string]*JailRuntime{}
+	for _, e := range entries {
+		jailCfg := makeMinimalJailCfg(e.name, logFile, outFile)
+		jailCfg.SourceFile = e.file
+		jr, err := NewJailRuntime(jailCfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		jails[e.name] = jr
+	}
+
+	m := &Manager{
+		cfg:        cfg,
+		jails:      jails,
+		whitelists: map[string]*JailRuntime{},
+		backend:    watch.NewAuto("poll", 50*time.Millisecond),
+		perf:       NewPerfMetrics(50*time.Millisecond, 1, ""),
+	}
+	m.currentInterval = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- m.Run(ctx)
+	}()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	<-done
+
+	data, err := os.ReadFile(outFile)
+	if err != nil {
+		t.Fatalf("reading output file: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	want := []string{"stripe", "apache", "uptimerobot"}
+	if fmt.Sprint(lines) != fmt.Sprint(want) {
+		t.Errorf("jail startup order = %v, want %v", lines, want)
+	}
+}
+
+// TestJailsStartInAlphabeticalOrder verifies that jails without a source file
+// fall back to alphabetical name order.
 func TestJailsStartInAlphabeticalOrder(t *testing.T) {
 	dir := t.TempDir()
 	outFile := dir + "/order.txt"

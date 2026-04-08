@@ -77,7 +77,9 @@ func NewManager(cfg *config.Config, configPath string) (*Manager, error) {
 // then starts all enabled jails, then starts the watch backend.
 // Global on_start actions run before any whitelist or jail is started;
 // global on_stop actions run after all have stopped.
-// Within each group, start/stop order is alphabetical by name.
+// Within each group, start/stop order is by source filename (lexicographic),
+// matching the 010-/020-/... naming convention used for fragment files.
+// Jails with the same source file are ordered by name as a tiebreaker.
 func (m *Manager) Run(ctx context.Context) error {
 	// Run global on_start actions before starting any jail or whitelist.
 	if len(m.cfg.Actions.OnStart) > 0 {
@@ -87,7 +89,7 @@ func (m *Manager) Run(ctx context.Context) error {
 		}
 	}
 
-	// Start whitelists first (alphabetical) so their static membership is ready before jails process events.
+	// Start whitelists first (by source filename) so their static membership is ready before jails process events.
 	for _, name := range sortedKeys(m.whitelists) {
 		jr := m.whitelists[name]
 		if !jr.cfg.Enabled {
@@ -97,7 +99,7 @@ func (m *Manager) Run(ctx context.Context) error {
 			return fmt.Errorf("starting whitelist %q: %w", name, err)
 		}
 	}
-	// Start jails in alphabetical order.
+	// Start jails in source filename order.
 	for _, name := range sortedKeys(m.jails) {
 		jr := m.jails[name]
 		if !jr.cfg.Enabled {
@@ -374,13 +376,22 @@ func buildSpecs(jails map[string]*JailRuntime, readFromEnd bool) []watch.WatchSp
 	return specs
 }
 
-// sortedKeys returns the keys of m in sorted order.
+// sortedKeys returns the keys of m sorted by source filename, with jail name
+// as a tiebreaker for jails sharing the same source file. This preserves the
+// 010-/020-/... fragment file naming convention as the startup/stop order.
 func sortedKeys(m map[string]*JailRuntime) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Strings(keys)
+	sort.Slice(keys, func(i, j int) bool {
+		si := m[keys[i]].cfg.SourceFile
+		sj := m[keys[j]].cfg.SourceFile
+		if si != sj {
+			return si < sj
+		}
+		return keys[i] < keys[j]
+	})
 	return keys
 }
 

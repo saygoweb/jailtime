@@ -73,7 +73,30 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config file %q: %w", path, err)
 	}
 
-	// Expand include globs and merge jails/whitelists from fragment files.
+	c := &Config{
+		Version: raw.Version,
+		Include: raw.Include,
+		Logging: raw.Logging,
+		Control: raw.Control,
+		Engine: EngineConfig{
+			WatcherMode:   raw.Engine.WatcherMode,
+			PollInterval:  raw.Engine.PollInterval,
+			TargetLatency: raw.Engine.TargetLatency,
+		},
+		Actions: raw.Actions,
+	}
+
+	// Main config jails/whitelists come first; source file is the main config path.
+	for _, rj := range raw.Jails {
+		c.Jails = append(c.Jails, buildJailConfig(rj, path))
+	}
+	for _, rj := range raw.Whitelists {
+		c.Whitelists = append(c.Whitelists, buildJailConfig(rj, path))
+	}
+
+	// Expand include globs and append fragment jails/whitelists in filename order.
+	// filepath.Glob returns matches sorted lexicographically, so the 010-/020-/...
+	// naming convention naturally yields the intended startup order.
 	for _, pattern := range raw.Include {
 		if !filepath.IsAbs(pattern) {
 			pattern = filepath.Join(filepath.Dir(path), pattern)
@@ -91,29 +114,13 @@ func Load(path string) (*Config, error) {
 			if err != nil {
 				return nil, fmt.Errorf("include %q: %w", inc, err)
 			}
-			raw.Jails = append(raw.Jails, extraJails...)
-			raw.Whitelists = append(raw.Whitelists, extraWhitelists...)
+			for _, rj := range extraJails {
+				c.Jails = append(c.Jails, buildJailConfig(rj, inc))
+			}
+			for _, rj := range extraWhitelists {
+				c.Whitelists = append(c.Whitelists, buildJailConfig(rj, inc))
+			}
 		}
-	}
-
-	c := &Config{
-		Version: raw.Version,
-		Include: raw.Include,
-		Logging: raw.Logging,
-		Control: raw.Control,
-		Engine: EngineConfig{
-			WatcherMode:   raw.Engine.WatcherMode,
-			PollInterval:  raw.Engine.PollInterval,
-			TargetLatency: raw.Engine.TargetLatency,
-		},
-		Actions: raw.Actions,
-	}
-
-	for _, rj := range raw.Jails {
-		c.Jails = append(c.Jails, buildJailConfig(rj))
-	}
-	for _, rj := range raw.Whitelists {
-		c.Whitelists = append(c.Whitelists, buildJailConfig(rj))
 	}
 
 	applyDefaults(c, raw.Engine.ReadFromEnd, raw.Engine.PerfWindow)
@@ -126,7 +133,8 @@ func Load(path string) (*Config, error) {
 
 // buildJailConfig converts a rawJailConfig to a JailConfig, applying
 // OnMatch→OnAdd deprecation alias and pointer-bool defaults.
-func buildJailConfig(rj rawJailConfig) JailConfig {
+// sourceFile is the path of the config file that defined this jail.
+func buildJailConfig(rj rawJailConfig, sourceFile string) JailConfig {
 	actions := rj.Actions
 	// OnMatch is a deprecated alias for OnAdd; merge at load time.
 	if len(actions.OnAdd) == 0 && len(actions.OnMatch) > 0 {
@@ -135,6 +143,7 @@ func buildJailConfig(rj rawJailConfig) JailConfig {
 	}
 
 	jc := JailConfig{
+		SourceFile:     sourceFile,
 		Name:           rj.Name,
 		Files:          rj.Files,
 		ExcludeFiles:   rj.ExcludeFiles,
