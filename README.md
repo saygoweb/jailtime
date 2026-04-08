@@ -81,7 +81,7 @@ journalctl -u jailtimed -f
 ### Verify
 
 ```sh
-jailtime status
+jailtime jail status
 jailtime config files nginx
 jailtime config test nginx /var/log/nginx/access.log --matching
 ```

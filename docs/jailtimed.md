@@ -246,10 +246,10 @@ is run.
 
 | Hook | When it runs |
 |------|-------------|
-| `on_start` | When the jail starts (daemon startup or `jailtime start`) |
+| `on_start` | When the jail starts (daemon startup or `jailtime jail start`) |
 | `on_match` | When `hit_count` is reached within `find_time`; skipped if `query` exits 0 |
-| `on_stop` | When the jail stops (`jailtime stop` or daemon shutdown) |
-| `on_restart` | When `jailtime restart` is issued (runs after `on_stop`/`on_start` for the named jail) |
+| `on_stop` | When the jail stops (`jailtime jail stop` or daemon shutdown) |
+| `on_restart` | When `jailtime jail restart` is issued (runs after `on_stop`/`on_start` for the named jail) |
 
 `on_match` is **required** — a jail with no `on_match` actions fails validation.
 
@@ -324,5 +324,5 @@ and are installed to `/usr/local/lib/jailtime/` by `deploy/setup.sh`.
 # Use a sample jail
 cp /usr/share/doc/jailtime/jails.d/a-nginx-drop.yaml /etc/jailtime/jails.d/
 $EDITOR /etc/jailtime/jails.d/a-nginx-drop.yaml
-jailtime restart nginx
+jailtime jail restart nginx
 ```

@@ -13,27 +13,27 @@ These flags are available on every command.
 
 ```sh
 # Use a non-default socket
-jailtime --socket /run/custom/jailtime.sock status
+jailtime --socket /run/custom/jailtime.sock jail status
 ```
 
 ---
 
 ## Commands
 
-### `status`
+### `jail status`
 
 Show the running status of all jails, or a single named jail.
 
 ```
-jailtime status [jail]
+jailtime jail status [jail]
 ```
 
 ```sh
 # All jails
-jailtime status
+jailtime jail status
 
 # One jail
-jailtime status sshd
+jailtime jail status sshd
 ```
 
 **Output** (tabular):
@@ -47,46 +47,46 @@ webapp   stopped
 
 ---
 
-### `start`
+### `jail start`
 
 Start a jail. Runs the jail's `on_start` actions.
 
 ```
-jailtime start <jail>
+jailtime jail start <jail>
 ```
 
 ```sh
-jailtime start sshd
+jailtime jail start sshd
 ```
 
 ---
 
-### `stop`
+### `jail stop`
 
 Stop a jail. Runs the jail's `on_stop` actions.
 
 ```
-jailtime stop <jail>
+jailtime jail stop <jail>
 ```
 
 ```sh
-jailtime stop sshd
+jailtime jail stop sshd
 ```
 
 ---
 
-### `restart`
+### `jail restart`
 
 Restart a jail. jailtimed reloads its configuration from disk before restarting,
 so any changes to `jail.yaml` or fragment files under `jails.d/` take effect immediately.
 Also reconciles new or removed jails found in the updated config.
 
 ```
-jailtime restart <jail>
+jailtime jail restart <jail>
 ```
 
 ```sh
-jailtime restart sshd
+jailtime jail restart sshd
 ```
 
 ---
