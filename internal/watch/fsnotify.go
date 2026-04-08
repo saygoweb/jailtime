@@ -205,7 +205,8 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 			return
 		}
 
-		// Check static specs first.
+		// Check static specs first: collect all matching jails before calling
+		// openStatic so that every jail watching this path is registered.
 		for _, spec := range currentSpecs {
 			if spec.WatchMode != "static" {
 				continue
@@ -213,10 +214,12 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 			for _, pattern := range spec.Globs {
 				if matched, err := filepath.Match(pattern, name); err == nil && matched {
 					staticPathToJails[name] = appendUniq(staticPathToJails[name], spec.JailName)
-					openStatic(name)
-					return
 				}
 			}
+		}
+		if len(staticPathToJails[name]) > 0 {
+			openStatic(name)
+			return
 		}
 
 		// Case 1: known tail file recreated (rotation).
@@ -225,18 +228,28 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 			dirty[name] = struct{}{}
 			return
 		}
-		// Case 2: new tail file matching a glob.
+		// Case 2: new tail file matching a glob. Collect all matching jails across
+		// all specs before calling openTailer — an early return after the first
+		// match would leave subsequent jails unregistered for this file.
+		firstReadFromEnd := false
+		anyTailMatch := false
 		for _, spec := range currentSpecs {
 			if spec.WatchMode == "static" {
 				continue
 			}
 			for _, pattern := range spec.Globs {
 				if matched, err := filepath.Match(pattern, name); err == nil && matched {
+					if !anyTailMatch {
+						firstReadFromEnd = spec.ReadFromEnd
+						anyTailMatch = true
+					}
 					pathToJails[name] = appendUniq(pathToJails[name], spec.JailName)
-					openTailer(name, spec.ReadFromEnd)
-					return
 				}
 			}
+		}
+		if anyTailMatch {
+			openTailer(name, firstReadFromEnd)
+			return
 		}
 		// Case 3: new directory — check if its parent dir is being watched for globs.
 		if patterns, ok := parentDirs[filepath.Dir(name)]; ok {
