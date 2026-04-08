@@ -187,3 +187,128 @@ Matching lines: 37
 > **Note:** The file path is resolved on the daemon's host filesystem.
 > When running jailtimed in a container or remote host, the path must be
 > accessible to the daemon process, not the jailtime client.
+
+---
+
+### `config global`
+
+Read or update global engine configuration at runtime without restarting the daemon.
+
+```
+jailtime config global [<key> <value>]
+```
+
+Without arguments, lists all current global engine config values. With `<key>` and
+`<value>`, updates the named field immediately.
+
+**Settable keys:** `target_latency`, `poll_interval`, `watcher_mode`, `read_from_end`, `perf_window`
+
+```sh
+# Show current global config
+jailtime config global
+
+# Change the drain timer interval
+jailtime config global target_latency 5s
+
+# Increase the perf rolling-average window
+jailtime config global perf_window 5
+```
+
+**Output (no args):**
+
+```
+target_latency  2s
+poll_interval   2s
+watcher_mode    auto
+read_from_end   true
+perf_window     3
+```
+
+---
+
+### `perf`
+
+Show daemon performance metrics.
+
+```
+jailtime perf
+```
+
+```sh
+jailtime perf
+```
+
+**Output:**
+
+```
+target_latency_ms   2000.0
+latency_ms          2001.3
+execution_ms        0.4
+sleep_ms            1999.6
+lines_processed     142
+cpu_percent         0.1
+```
+
+| Field | Description |
+|-------|-------------|
+| `target_latency_ms` | Configured drain interval target |
+| `latency_ms` | Measured inter-drain interval (rolling average) |
+| `execution_ms` | Time spent processing lines per drain (rolling average) |
+| `sleep_ms` | Idle time between drains (rolling average) |
+| `lines_processed` | Lines processed in the last drain cycle |
+| `cpu_percent` | Estimated daemon CPU usage |
+
+---
+
+### `whitelist status`
+
+Show the running status of all whitelists, or a single named whitelist.
+
+```
+jailtime whitelist status [whitelist]
+```
+
+```sh
+# All whitelists
+jailtime whitelist status
+
+# One whitelist
+jailtime whitelist status trusted
+```
+
+**Output** (tabular):
+
+```
+NAME     STATUS
+trusted  started
+```
+
+---
+
+### `whitelist start`
+
+Start a whitelist. Reads the static file(s) and runs `on_add` actions for each entry.
+
+```
+jailtime whitelist start <whitelist>
+```
+
+---
+
+### `whitelist stop`
+
+Stop a whitelist. Runs `on_remove` actions for each entry currently in the set.
+
+```
+jailtime whitelist stop <whitelist>
+```
+
+---
+
+### `whitelist restart`
+
+Restart a whitelist. Reloads the config and static file(s) from disk.
+
+```
+jailtime whitelist restart <whitelist>
+```
