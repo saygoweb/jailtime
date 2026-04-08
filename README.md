@@ -21,6 +21,20 @@ no log activity occurs.
 - **[jailtime CLI](docs/jailtime.md)** — command reference, flags, examples
 - **[jailtimed configuration](docs/jailtimed.md)** — daemon config, jail fields, action templates, sample jails
 
+## Feature Highlights
+
+- Highly Performant (close to zero, even on a loaded server)
+- Maintain Jails and Whitelists
+- Jails can easily ignore dynamic sets of CIDR
+- Super simple configuration of jails, it's all in a per jail yaml file
+
+## Why JailTime
+
+- It's faster than crowdsec
+- It's more configurable that Fail2ban, especially in support of whitelists
+- It's really very efficient at what it does. Approx 3x more performant that Fail2ban
+- Dynamic start, stop, restart (including reload of config) of jails / whitelists
+
 ## Architecture
 
 ```
