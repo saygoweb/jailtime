@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"text/template"
 	"time"
@@ -169,6 +170,30 @@ func (jr *JailRuntime) lifecycleCtx() action.Context {
 		Jail:      jr.cfg.Name,
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
 	}
+}
+
+// resolveTags builds the list of tag values for a match event according to
+// the jail's tags_from config. Each entry in tagsFrom produces one element:
+//
+//	"parent_dir"              – base name of the directory containing filePath
+//	"match_tag1"…"match_tag9" – text from the (?P<tag1>…)…(?P<tag9>…) capture group
+//
+// Entries whose source yields an empty string are omitted.
+func resolveTags(tagsFrom []string, namedGroups map[string]string, filePath string) []string {
+	tags := make([]string, 0, len(tagsFrom))
+	for _, src := range tagsFrom {
+		var v string
+		if src == "parent_dir" {
+			v = filepath.Base(filepath.Dir(filePath))
+		} else if len(src) == len("match_tag1") && src[:9] == "match_tag" {
+			groupName := src[len("match_"):] // "tag1"…"tag9"
+			v = namedGroups[groupName]
+		}
+		if v != "" {
+			tags = append(tags, v)
+		}
+	}
+	return tags
 }
 
 // Reconfigure updates the jail's config and recompiles its filters.
@@ -466,6 +491,7 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 			Jail:      cfg.Name,
 			File:      evt.FilePath,
 			Line:      evt.Line,
+			Tags:      strings.Join(resolveTags(cfg.TagsFrom, result.NamedGroups, evt.FilePath), ","),
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		}
 		submitted := jr.runner.Submit(result.IP, func() {
@@ -489,6 +515,7 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 			Jail:      cfg.Name,
 			File:      evt.FilePath,
 			Line:      evt.Line,
+			Tags:      strings.Join(resolveTags(cfg.TagsFrom, result.NamedGroups, evt.FilePath), ","),
 			Timestamp: time.Now().UTC().Format(time.RFC3339),
 		}
 		if _, err := action.RunAllCompiled(ctx, onRemoveTmpls, actCtx, cfg.ActionTimeout.Duration); err != nil {
@@ -522,10 +549,11 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 			return nil
 		}
 
+		tags := resolveTags(cfg.TagsFrom, result.NamedGroups, evt.FilePath)
 		slog.Info("JAIL on_add",
 			"jail", cfg.Name,
 			"ip", result.IP,
-			"label", result.Label,
+			"tags", strings.Join(tags, ","),
 			"count", count,
 			"threshold", threshold,
 		)
@@ -544,6 +572,7 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 			Jail:      cfg.Name,
 			File:      evt.FilePath,
 			Line:      evt.Line,
+			Tags:      strings.Join(tags, ","),
 			JailTime:  int64(cfg.JailTime.Duration.Seconds()),
 			FindTime:  int64(findTime.Seconds()),
 			HitCount:  count,

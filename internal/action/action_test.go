@@ -28,6 +28,26 @@ func TestRenderJailTime(t *testing.T) {
 	}
 }
 
+func TestRenderTags(t *testing.T) {
+	result, err := Render("tags={{ .Tags }}", Context{Tags: "some-domain.com,webapp"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "tags=some-domain.com,webapp" {
+		t.Errorf("got %q, want %q", result, "tags=some-domain.com,webapp")
+	}
+}
+
+func TestRenderTagsEmpty(t *testing.T) {
+	result, err := Render("{{ .IP }} tags={{ .Tags }}", Context{IP: "1.2.3.4"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "1.2.3.4 tags=" {
+		t.Errorf("got %q, want %q", result, "1.2.3.4 tags=")
+	}
+}
+
 func TestRenderInvalidTemplate(t *testing.T) {
 	_, err := Render("{{ .IP", Context{})
 	if err == nil {

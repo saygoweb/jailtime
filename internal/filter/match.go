@@ -2,10 +2,10 @@ package filter
 
 // Result is returned from a successful match.
 type Result struct {
-	IP      string // extracted IP or CIDR text
-	Label   string // extracted label text (from (?P<label>...) group), may be empty
-	Line    string // original log line
-	Pattern string // matched filter pattern
+	IP          string            // extracted IP or CIDR text
+	NamedGroups map[string]string // all named capture groups from the match (excluding "ip")
+	Line        string            // original log line
+	Pattern     string            // matched filter pattern
 }
 
 // Match applies include-first + optional exclude semantics:
@@ -13,7 +13,7 @@ type Result struct {
 //  2. If no include filter matches, return nil, nil (line ignored).
 //  3. Try each excludeFilter; if any matches, return nil, nil (suppressed).
 //  4. Extract the named capture group "ip" from the include match.
-//  5. Return a Result with IP, Line, Pattern.
+//  5. Return a Result with IP, NamedGroups, Line, Pattern.
 func Match(line string, includes, excludes []*CompiledFilter) (*Result, error) {
 	// Step 1 & 2: find first matching include filter.
 	var matched *CompiledFilter
@@ -34,15 +34,15 @@ func Match(line string, includes, excludes []*CompiledFilter) (*Result, error) {
 		}
 	}
 
-	// Step 4: extract IP from named (or first) capture group.
+	// Step 4: extract IP and all other named groups.
 	ip := Extract(matched.re, line)
-	label := ExtractLabel(matched.re, line)
+	namedGroups := ExtractNamedGroups(matched.re, line)
 
 	// Step 5: return result.
 	return &Result{
-		IP:      ip,
-		Label:   label,
-		Line:    line,
-		Pattern: matched.pattern,
+		IP:          ip,
+		NamedGroups: namedGroups,
+		Line:        line,
+		Pattern:     matched.pattern,
 	}, nil
 }

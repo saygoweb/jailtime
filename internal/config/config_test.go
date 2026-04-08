@@ -176,6 +176,61 @@ func TestLoadActionTimeoutExplicit(t *testing.T) {
 	}
 }
 
+func TestLoadTagsFromDefault(t *testing.T) {
+	path := writeTemp(t, minimalValidYAML)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Jails[0].TagsFrom) != 0 {
+		t.Errorf("TagsFrom should default to empty, got %v", c.Jails[0].TagsFrom)
+	}
+}
+
+func TestLoadTagsFromParentDir(t *testing.T) {
+	y := minimalValidYAML + "    tags_from: [parent_dir]\n"
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if len(c.Jails[0].TagsFrom) != 1 || c.Jails[0].TagsFrom[0] != "parent_dir" {
+		t.Errorf("TagsFrom = %v, want [parent_dir]", c.Jails[0].TagsFrom)
+	}
+}
+
+func TestLoadTagsFromMultiple(t *testing.T) {
+	y := minimalValidYAML + "    tags_from: [parent_dir, match_tag1]\n"
+	path := writeTemp(t, y)
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	want := []string{"parent_dir", "match_tag1"}
+	if len(c.Jails[0].TagsFrom) != 2 || c.Jails[0].TagsFrom[0] != want[0] || c.Jails[0].TagsFrom[1] != want[1] {
+		t.Errorf("TagsFrom = %v, want %v", c.Jails[0].TagsFrom, want)
+	}
+}
+
+func TestLoadTagsFromInvalid(t *testing.T) {
+	y := minimalValidYAML + "    tags_from: [bogus]\n"
+	path := writeTemp(t, y)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for invalid tags_from entry, got nil")
+	}
+}
+
+func TestLoadTagsFromMatchTag0Invalid(t *testing.T) {
+	// match_tag0 is not valid; only match_tag1..match_tag9.
+	y := minimalValidYAML + "    tags_from: [match_tag0]\n"
+	path := writeTemp(t, y)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected error for match_tag0, got nil")
+	}
+}
+
 const jailFragmentYAML = `
 jails:
   - name: nginx

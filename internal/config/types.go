@@ -75,6 +75,14 @@ type JailConfig struct {
 	// on_add is always executed on a threshold hit.  When true, the query is
 	// run first; an exit code of 0 suppresses on_add (IP already handled).
 	QueryBeforeMatch bool `yaml:"query_before_match"`
+	// TagsFrom is an ordered list of tag sources whose resolved values are
+	// joined with "," and exposed as {{.Tags}} in action templates and as the
+	// "tags" structured log field on every match.
+	// Valid sources:
+	//   "parent_dir"              – base name of the directory containing the file
+	//   "match_tag1"…"match_tag9" – text from (?P<tag1>…)…(?P<tag9>…) in the filter
+	// Defaults to empty (no tags).
+	TagsFrom []string `yaml:"tags_from"`
 	// ActionTimeout is the maximum time allowed for each individual action
 	// command (on_add, query).  Defaults to defaultActionTimeout.
 	ActionTimeout Duration `yaml:"action_timeout"`

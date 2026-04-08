@@ -87,6 +87,12 @@ func validateJails(jails []JailConfig, names map[string]struct{}, isWhitelist bo
 			return fmt.Errorf("%s %q: net_type must be \"IP\" or \"CIDR\", got %q", kind, j.Name, j.NetType)
 		}
 
+		for k, src := range j.TagsFrom {
+			if src != "parent_dir" && !isMatchTagSource(src) {
+				return fmt.Errorf("%s %q: tags_from[%d] %q: must be \"parent_dir\" or \"match_tag1\"…\"match_tag9\"", kind, j.Name, k, src)
+			}
+		}
+
 		for k, f := range j.Filters {
 			if _, err := regexp.Compile(f); err != nil {
 				return fmt.Errorf("%s %q: filter[%d] %q: invalid regex: %w", kind, j.Name, k, f, err)
@@ -99,4 +105,17 @@ func validateJails(jails []JailConfig, names map[string]struct{}, isWhitelist bo
 		}
 	}
 	return nil
+}
+
+// isMatchTagSource reports whether s is a valid match_tagN source name
+// (match_tag1 through match_tag9).
+func isMatchTagSource(s string) bool {
+	if len(s) != len("match_tag1") {
+		return false
+	}
+	if s[:9] != "match_tag" {
+		return false
+	}
+	c := s[9]
+	return c >= '1' && c <= '9'
 }

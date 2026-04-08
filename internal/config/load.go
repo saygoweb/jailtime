@@ -37,6 +37,7 @@ type rawJailConfig struct {
 	QueryBeforeMatch *bool       `yaml:"query_before_match"`
 	ActionTimeout    Duration    `yaml:"action_timeout"`
 	IgnoreSets       []string    `yaml:"ignore_sets"`
+	TagsFrom         []string    `yaml:"tags_from"`
 }
 
 // rawConfig mirrors Config but uses raw sub-types to allow default detection.
@@ -158,6 +159,7 @@ func buildJailConfig(rj rawJailConfig, sourceFile string) JailConfig {
 		Query:          rj.Query,
 		ActionTimeout:  rj.ActionTimeout,
 		IgnoreSets:     rj.IgnoreSets,
+		TagsFrom:       rj.TagsFrom,
 	}
 	if rj.Enabled == nil {
 		jc.Enabled = true

@@ -7,10 +7,13 @@ import (
 
 // Context holds values available in action command templates.
 type Context struct {
-	IP        string
-	Jail      string
-	File      string
-	Line      string
+	IP       string
+	Jail     string
+	File     string
+	Line     string
+	// Tags is the comma-joined list of tag values resolved from the jail's
+	// tags_from config. Empty string when tags_from is empty or yields no values.
+	Tags      string
 	JailTime  int64 // seconds
 	FindTime  int64 // seconds
 	HitCount  int
