@@ -191,11 +191,12 @@ matched. No hit counts are modified and no actions are executed.`,
 			fmt.Printf("Config:\n")
 			fmt.Printf("  Target Latency: %.0fms\n", resp.TargetLatencyMs)
 			fmt.Printf("\nPerformance:\n")
-			fmt.Printf("  Latency:   %.0fms\n", resp.LatencyMs)
-			fmt.Printf("  Execution: %.0fms\n", resp.ExecutionMs)
-			fmt.Printf("  Sleep:     %.0fms\n", resp.SleepMs)
-			fmt.Printf("  Lines:     %d\n", resp.LinesProcessed)
-			fmt.Printf("  CPU Usage: %.1f%%\n", resp.CPUPercent)
+			fmt.Printf("  Latency:    %.0fms\n", resp.LatencyMs)
+			fmt.Printf("  Inter Drain:%.0fms\n", resp.InterDrainMs)
+			fmt.Printf("  Execution:  %.0fms\n", resp.ExecutionMs)
+			fmt.Printf("  Sleep:      %.0fms\n", resp.SleepMs)
+			fmt.Printf("  Lines:      %d\n", resp.LinesProcessed)
+			fmt.Printf("  CPU Usage:  %.1f%%\n", resp.CPUPercent)
 			return nil
 		},
 	}

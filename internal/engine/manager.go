@@ -151,6 +151,18 @@ func (m *Manager) processDrain(ctx context.Context, lines []watch.RawLine) {
 	}
 	m.lastDrainAt = drainStart
 
+	// Compute event-to-drain latency as the time from the earliest EnqueueAt
+	// in the batch to drain start. For fsnotify, EnqueueAt is set when the
+	// write event first triggers the drain timer; for poll, it's the tick time.
+	var eventLatency time.Duration
+	for _, l := range lines {
+		if !l.EnqueueAt.IsZero() {
+			if d := drainStart.Sub(l.EnqueueAt); eventLatency == 0 || d < eventLatency {
+				eventLatency = d
+			}
+		}
+	}
+
 	// Intended sleep steers towards targetLatency using the moving average of
 	// previous execution times: sleep = targetLatency - movingAvgExec.
 	// This ensures sleep is always <= targetLatency regardless of OS scheduling drift.
@@ -159,7 +171,7 @@ func (m *Manager) processDrain(ctx context.Context, lines []watch.RawLine) {
 	m.processBatch(ctx, lines)
 
 	execTime := time.Since(drainStart)
-	m.perf.RecordExecution(execTime, m.currentInterval, intendedSleep, len(lines))
+	m.perf.RecordExecution(execTime, eventLatency, m.currentInterval, intendedSleep, len(lines))
 }
 
 func (m *Manager) processBatch(ctx context.Context, lines []watch.RawLine) {

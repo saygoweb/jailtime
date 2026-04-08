@@ -38,6 +38,7 @@ type ConfigTestResponse struct {
 type PerfResponse struct {
 	TargetLatencyMs float64 `json:"target_latency_ms"`
 	LatencyMs       float64 `json:"latency_ms"`
+	InterDrainMs    float64 `json:"inter_drain_ms"`
 	ExecutionMs     float64 `json:"execution_ms"`
 	SleepMs         float64 `json:"sleep_ms"`
 	LinesProcessed  int     `json:"lines_processed"`

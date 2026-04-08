@@ -9,6 +9,7 @@ import (
 type PerfSnapshot struct {
 	TargetLatencyMs float64 `json:"target_latency_ms"`
 	LatencyMs       float64 `json:"latency_ms"`
+	InterDrainMs    float64 `json:"inter_drain_ms"`
 	ExecutionMs     float64 `json:"execution_ms"`
 	SleepMs         float64 `json:"sleep_ms"`
 	LinesProcessed  int     `json:"lines_processed"`
@@ -21,10 +22,11 @@ type PerfMetrics struct {
 
 	targetLatency time.Duration
 
-	lastLatency time.Duration
-	lastExec    time.Duration
-	lastSleep   time.Duration
-	lastLines   int
+	lastLatency   time.Duration
+	lastInterDrain time.Duration
+	lastExec      time.Duration
+	lastSleep     time.Duration
+	lastLines     int
 
 	// execWindow is a ring buffer holding the last perfWindow execution times.
 	execWindow []time.Duration
@@ -47,14 +49,17 @@ func NewPerfMetrics(targetLatency time.Duration, perfWindow int, serviceName str
 }
 
 // RecordExecution is called after each batch drain.
+// latency is the time from the first event trigger to drain start.
+// interDrain is the elapsed time between this drain and the previous one.
 // sleepTime is the intended sleep before the next drain.
 // batchSize 0 means no lines were processed; CPU is not sampled in that case.
-func (p *PerfMetrics) RecordExecution(execTime, latency, sleepTime time.Duration, batchSize int) {
+func (p *PerfMetrics) RecordExecution(execTime, latency, interDrain, sleepTime time.Duration, batchSize int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	p.lastExec = execTime
 	p.lastLatency = latency
+	p.lastInterDrain = interDrain
 	p.lastSleep = sleepTime
 	p.lastLines = batchSize
 
@@ -137,6 +142,7 @@ func (p *PerfMetrics) Snapshot() PerfSnapshot {
 	return PerfSnapshot{
 		TargetLatencyMs: float64(p.targetLatency.Microseconds()) / 1000.0,
 		LatencyMs:       float64(p.lastLatency.Microseconds()) / 1000.0,
+		InterDrainMs:    float64(p.lastInterDrain.Microseconds()) / 1000.0,
 		ExecutionMs:     float64(p.lastExec.Microseconds()) / 1000.0,
 		SleepMs:         float64(p.lastSleep.Microseconds()) / 1000.0,
 		LinesProcessed:  p.lastLines,

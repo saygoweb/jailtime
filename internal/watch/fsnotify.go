@@ -74,6 +74,7 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 
 	var drainTimerC <-chan time.Time // nil = idle
 	var lastDrainTime time.Duration  // previous drain wall time
+	var pendingTriggerAt time.Time   // when the current pending drain was first triggered
 
 	readTailLines := func(p string) []RawLine {
 		ft, ok := tailers[p]
@@ -146,6 +147,7 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 		if drainTimerC != nil {
 			return
 		}
+		pendingTriggerAt = time.Now()
 		wait := b.getDrainInterval() - lastDrainTime
 		if wait < time.Millisecond {
 			wait = time.Millisecond
@@ -316,6 +318,8 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 		case <-drainTimerC:
 			drainStart := time.Now()
 			drainTimerC = nil
+			triggerAt := pendingTriggerAt
+			pendingTriggerAt = time.Time{}
 			var batch []RawLine
 			for p := range dirty {
 				batch = append(batch, readTailLines(p)...)
@@ -324,6 +328,13 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 			for p := range staticDirty {
 				batch = append(batch, diffStaticLines(p)...)
 				delete(staticDirty, p)
+			}
+			// Backfill EnqueueAt to the event trigger time so callers can
+			// compute true event-to-drain latency.
+			if !triggerAt.IsZero() {
+				for i := range batch {
+					batch[i].EnqueueAt = triggerAt
+				}
 			}
 			drain(ctx, batch)
 			lastDrainTime = time.Since(drainStart)
