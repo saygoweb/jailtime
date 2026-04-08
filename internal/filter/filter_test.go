@@ -120,4 +120,41 @@ func TestValidateNetTypeCIDR(t *testing.T) {
 	if err := ValidateNetType("not-a-cidr", "CIDR"); err == nil {
 		t.Error("invalid CIDR should return error")
 	}
+	// Plain IPs are valid in CIDR mode (normalised to /32 or /128 by the engine).
+	if err := ValidateNetType("10.0.0.1", "CIDR"); err != nil {
+		t.Errorf("plain IP in CIDR mode should be accepted: %v", err)
+	}
+	if err := ValidateNetType("2001:db8::1", "CIDR"); err != nil {
+		t.Errorf("plain IPv6 in CIDR mode should be accepted: %v", err)
+	}
+}
+
+// --- NormalizeToCIDR tests ---
+
+func TestNormalizeToCIDR(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"192.168.1.0/24", "192.168.1.0/24"},
+		{"10.0.0.1", "10.0.0.1/32"},
+		{"2001:db8::1", "2001:db8::1/128"},
+	}
+	for _, tc := range tests {
+		got, err := NormalizeToCIDR(tc.input)
+		if err != nil {
+			t.Errorf("NormalizeToCIDR(%q) unexpected error: %v", tc.input, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("NormalizeToCIDR(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}
+
+func TestNormalizeToCIDRInvalid(t *testing.T) {
+	_, err := NormalizeToCIDR("not-an-ip")
+	if err == nil {
+		t.Error("expected error for invalid input, got nil")
+	}
 }
