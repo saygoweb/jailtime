@@ -218,6 +218,7 @@ jails:
 | `watch_mode` | string | `tail` | `tail` — watch log files for new lines; `static` — watch a file of IP/CIDR entries (see Whitelists) |
 | `query` | string | — | Pre-check command; see `query_before_match` |
 | `query_before_match` | bool | `false` | When `true`, run `query` before `on_add`; if `query` exits **0**, `on_add` is skipped |
+| `tags_from` | []string | `[]` | Ordered list of tag sources; resolved values are joined with `,` and exposed as `{{ .Tags }}` — see [Tags](#tags) |
 | `action_timeout` | duration | `30s` | Maximum time allowed for each individual action command |
 | `actions` | object | — | Shell commands for lifecycle events (see below) |
 
@@ -282,6 +283,45 @@ exclude_filters:
   - 'from 192\.168\.'        # ignore RFC-1918 sources
 ```
 
+### Tags
+
+The `tags_from` field is an ordered array of tag source names. Each source is resolved to a string; empty values are omitted. The remaining values are joined with `,` to form the `{{ .Tags }}` template variable and the `tags` structured log field.
+
+| Source | Produces |
+|---|---|
+| `parent_dir` | Base name of the directory containing the matched log file |
+| `match_tag1`…`match_tag9` | Text captured by `(?P<tag1>…)`…`(?P<tag9>…)` named groups in the matched filter |
+
+`tags_from` defaults to `[]` (empty — no tags computed or logged).
+
+**Example — log the virtual-host name:**
+
+```yaml
+jails:
+  - name: apache-vhosts
+    files:
+      - /var/log/apache2/*/access.log
+    tags_from: [parent_dir]
+    filters:
+      - '(?P<ip>[0-9.]+) .* " [45][0-9][0-9] '
+    actions:
+      on_add:
+        - 'nft add element inet filter blacklist { {{ .IP }} } comment "{{ .Tags }}"'
+```
+
+If the matched file is `/var/log/apache2/site.example/access.log` then `{{ .Tags }}` evaluates to `site.example`.
+
+**Example — combine parent directory and a filter capture group:**
+
+```yaml
+tags_from: [parent_dir, match_tag1]
+filters:
+  - '(?P<ip>[0-9.]+).*service=(?P<tag1>\w+)'
+# Tags = "site.example,webapp"
+```
+
+---
+
 ### `query` — pre-check
 
 When `query_before_match: true` and `query` is set, jailtimed runs the query as
@@ -327,6 +367,7 @@ actions fails validation. (`on_match` is accepted as a deprecated alias for `on_
 | `{{ .FindTime }}` | `find_time` expressed in seconds (integer) |
 | `{{ .HitCount }}` | Hit count at the moment the threshold was crossed |
 | `{{ .Timestamp }}` | RFC3339 timestamp of the match event |
+| `{{ .Tags }}` | Comma-joined tag values from `tags_from` (empty string when no tags configured) |
 
 ---
 
@@ -370,6 +411,7 @@ reported with the jail name and field:
 - `hit_count` must be ≥ 1
 - `net_type` must be `IP` or `CIDR`
 - All `filters` and `exclude_filters` must be valid Go regular expressions
+- Each entry in `tags_from` must be `"parent_dir"` or `"match_tag1"`…`"match_tag9"`
 
 ---
 

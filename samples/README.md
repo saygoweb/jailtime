@@ -106,3 +106,4 @@ All action command strings are Go `text/template` strings. Available variables:
 | `{{ .File }}` | Source log file |
 | `{{ .Line }}` | Matching log line |
 | `{{ .Timestamp }}` | RFC3339 timestamp of the match event |
+| `{{ .Tags }}` | Comma-joined tag values from `tags_from` (empty string when no tags configured) |
