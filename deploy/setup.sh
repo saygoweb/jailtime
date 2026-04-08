@@ -256,5 +256,5 @@ echo "    1. Copy a sample jail:  cp /usr/share/doc/jailtime/jails.d/a-nginx-dro
 echo "                               /etc/jailtime/jails.d/"
 echo "    2. Edit as needed:      \$EDITOR /etc/jailtime/jails.d/a-nginx-drop.yaml"
 echo "    3. Start the daemon:    systemctl start jailtimed"
-echo "    4. Check status:        jailtime status"
+echo "    4. Check status:        jailtime jail status"
 echo

@@ -28,13 +28,19 @@ func main() {
 		return control.NewClient(socketPath)
 	}
 
-	// ── status ───────────────────────────────────────────────────────────────
-	statusCmd := &cobra.Command{
+	// ── jail ─────────────────────────────────────────────────────────────────
+	jailCmd := &cobra.Command{
+		Use:   "jail",
+		Short: "Manage jails",
+		Long:  "Commands for listing, starting, stopping and restarting jails in a running jailtimed daemon.",
+	}
+
+	jailStatusCmd := &cobra.Command{
 		Use:   "status [jail]",
 		Short: "Show status of all jails, or a specific jail",
 		Long:  "Show the running status of all jails managed by jailtimed.\nPass a jail name to query a single jail.",
-		Example: `  jailtime status
-  jailtime status sshd`,
+		Example: `  jailtime jail status
+  jailtime jail status sshd`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c := client()
@@ -59,41 +65,40 @@ func main() {
 		},
 	}
 
-	// ── start ────────────────────────────────────────────────────────────────
-	startCmd := &cobra.Command{
+	jailStartCmd := &cobra.Command{
 		Use:     "start <jail>",
 		Short:   "Start a jail",
-		Example: "  jailtime start sshd",
+		Example: "  jailtime jail start sshd",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return client().StartJail(args[0])
 		},
 	}
 
-	// ── stop ─────────────────────────────────────────────────────────────────
-	stopCmd := &cobra.Command{
+	jailStopCmd := &cobra.Command{
 		Use:     "stop <jail>",
 		Short:   "Stop a jail",
-		Example: "  jailtime stop sshd",
+		Example: "  jailtime jail stop sshd",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return client().StopJail(args[0])
 		},
 	}
 
-	// ── restart ──────────────────────────────────────────────────────────────
-	restartCmd := &cobra.Command{
+	jailRestartCmd := &cobra.Command{
 		Use:   "restart <jail>",
 		Short: "Restart a jail (reloads config from disk)",
 		Long: `Restart a jail. jailtimed reloads its configuration from disk before
 restarting the named jail, picking up any changes to the config file or
 any included fragment files under jails.d/.`,
-		Example: "  jailtime restart sshd",
+		Example: "  jailtime jail restart sshd",
 		Args:    cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return client().RestartJail(args[0])
 		},
 	}
+
+	jailCmd.AddCommand(jailStatusCmd, jailStartCmd, jailStopCmd, jailRestartCmd)
 
 	// ── version ──────────────────────────────────────────────────────────────
 	versionCmd := &cobra.Command{
@@ -257,7 +262,7 @@ matched. No hit counts are modified and no actions are executed.`,
 	}
 
 	whitelistCmd.AddCommand(whitelistStatusCmd, whitelistStartCmd, whitelistStopCmd, whitelistRestartCmd)
-	root.AddCommand(statusCmd, startCmd, stopCmd, restartCmd, versionCmd, configCmd, perfCmd, whitelistCmd)
+	root.AddCommand(jailCmd, versionCmd, configCmd, perfCmd, whitelistCmd)
 
 	if err := root.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
