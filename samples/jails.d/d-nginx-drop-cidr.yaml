@@ -16,7 +16,7 @@
 # Prerequisites:
 #   - iptocidr on PATH (returns the network CIDR for a given IP)
 #   - Wrapper scripts installed: see deploy/setup.sh or copy manually:
-#       install -m755 samples/tools/*.sh /usr/local/lib/jailtime/
+#       install -m755 tools/*.sh /usr/local/lib/jailtime/
 #   - Optional but recommended for persistence across reboots:
 #       apt install ipset-persistent netfilter-persistent
 

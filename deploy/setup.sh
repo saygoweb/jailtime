@@ -146,7 +146,7 @@ success "Installed /usr/sbin/jailtimed and /usr/sbin/jailtime."
 TOOLS_DIR=/usr/local/lib/jailtime
 info "Installing wrapper tools to $TOOLS_DIR ..."
 mkdir -p "$TOOLS_DIR"
-install -m 755 "$REPO_ROOT"/samples/tools/*.sh "$TOOLS_DIR/"
+install -m 755 "$REPO_ROOT"/tools/*.sh "$TOOLS_DIR/"
 success "Installed wrapper scripts to $TOOLS_DIR."
 
 # ── Config directory ──────────────────────────────────────────────────────────
