@@ -450,7 +450,7 @@ by `deploy/setup.sh`, and are also available in the repository under `samples/ja
 | `d-nginx-drop-cidr.yaml` | Nginx — ban entire CIDR blocks, survives reboot |
 | `e-apache-wordpress.yaml` | Apache — WordPress login and xmlrpc brute-force |
 
-Wrapper scripts for idempotent ipset/iptables operations are in `samples/tools/`
+Wrapper scripts for idempotent ipset/iptables operations are in `tools/`
 and are installed to `/usr/local/lib/jailtime/` by `deploy/setup.sh`.
 
 ```sh

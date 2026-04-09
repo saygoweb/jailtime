@@ -12,7 +12,7 @@
 #   on_restart — nothing; existing set and rule remain untouched
 #
 # Install the tools once system-wide:
-#   cp samples/tools/*.sh /usr/local/lib/jailtime/
+#   cp tools/*.sh /usr/local/lib/jailtime/
 #   chmod +x /usr/local/lib/jailtime/*.sh
 #
 # Then adjust TOOLS below to match the install path.
