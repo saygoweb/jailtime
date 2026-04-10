@@ -157,7 +157,6 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 
 	initialScan := func() {
 		currentSpecs := b.getSpecs()
-		excluded := buildExcludeSet(currentSpecs)
 
 		newPathToJails := make(map[string][]string)
 		newStaticPathToJails := make(map[string][]string)
@@ -170,7 +169,7 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 					paths = []string{}
 				}
 				for _, p := range paths {
-					if _, ex := excluded[p]; ex {
+					if isExcluded(p, currentSpecs) {
 						continue
 					}
 					if spec.WatchMode == "static" {
@@ -200,8 +199,7 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 
 	handleCreate := func(name string) {
 		currentSpecs := b.getSpecs()
-		excluded := buildExcludeSet(currentSpecs)
-		if _, ex := excluded[name]; ex {
+		if isExcluded(name, currentSpecs) {
 			return
 		}
 
@@ -260,7 +258,7 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 					continue
 				}
 				for _, p := range paths {
-					if _, ex := excluded[p]; ex {
+					if isExcluded(p, currentSpecs) {
 						continue
 					}
 					// Determine mode for this pattern.

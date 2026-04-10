@@ -974,6 +974,70 @@ func TestPollBackendExcludeGlobs(t *testing.T) {
 	}
 }
 
+// TestPollBackendExcludeGlobsPartialName verifies that exclude_files entries
+// that are partial path components (e.g. "kitchendraw.co.nz") correctly
+// exclude files whose full path contains that substring, such as
+// /var/log/apache2/kitchendraw.co.nz/access.log.
+func TestPollBackendExcludeGlobsPartialName(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create subdirectory structure mirroring /var/log/apache2/<vhost>/access.log
+	excludedDir := filepath.Join(dir, "kitchendraw.co.nz")
+	includedDir := filepath.Join(dir, "example.com")
+	if err := os.MkdirAll(excludedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(includedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	excludedFile := filepath.Join(excludedDir, "access.log")
+	includedFile := filepath.Join(includedDir, "access.log")
+
+	if err := os.WriteFile(excludedFile, []byte("excluded-line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(includedFile, []byte("included-line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := WatchSpec{
+		JailName:     "test",
+		Globs:        []string{filepath.Join(dir, "*/access.log")},
+		ExcludeGlobs: []string{"kitchendraw.co.nz"}, // partial name only
+		WatchMode:    "tail",
+		ReadFromEnd:  false,
+	}
+
+	drain, wait := drainToSliceN(1)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	b := NewPollBackend(50 * time.Millisecond)
+	go b.Start(ctx, []WatchSpec{spec}, drain)
+	time.Sleep(150 * time.Millisecond)
+
+	lines := wait()
+	cancel()
+
+	for _, l := range lines {
+		if l.FilePath == excludedFile {
+			t.Errorf("excluded file appeared in drain: %s", l.FilePath)
+		}
+		if l.Line == "excluded-line" {
+			t.Errorf("excluded line appeared in drain: %s", l.Line)
+		}
+	}
+	found := false
+	for _, l := range lines {
+		if l.Line == "included-line" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("included file line not found in drain")
+	}
+}
+
 func TestPollBackendStaticMode(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "whitelist.txt")

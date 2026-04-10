@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -60,22 +61,23 @@ type staticPathInfo struct {
 	jails []string
 }
 
-// buildExcludeSet expands all ExcludeGlobs patterns from specs and returns
-// a set of paths to exclude.
-func buildExcludeSet(specs []WatchSpec) map[string]struct{} {
-	excluded := make(map[string]struct{})
+// isExcluded reports whether path should be excluded based on the ExcludeGlobs
+// patterns in any of the specs. Each pattern is matched in two ways:
+//  1. As a filepath.Match glob against the full path (e.g. "/var/log/*/access.log").
+//  2. As a substring of the path, allowing partial names (e.g. "kitchendraw.co.nz"
+//     will exclude "/var/log/apache2/kitchendraw.co.nz/access.log").
+func isExcluded(path string, specs []WatchSpec) bool {
 	for _, spec := range specs {
 		for _, pattern := range spec.ExcludeGlobs {
-			paths, err := filepath.Glob(pattern)
-			if err != nil {
-				continue
+			if matched, err := filepath.Match(pattern, path); err == nil && matched {
+				return true
 			}
-			for _, p := range paths {
-				excluded[p] = struct{}{}
+			if strings.Contains(path, pattern) {
+				return true
 			}
 		}
 	}
-	return excluded
+	return false
 }
 
 // Start begins polling. Every interval it expands globs across all WatchSpecs,
@@ -105,8 +107,6 @@ func (b *PollBackend) Start(ctx context.Context, specs []WatchSpec, drain DrainF
 			}
 			currentSpecs := b.getSpecs()
 
-			excluded := buildExcludeSet(currentSpecs)
-
 			tailPaths := make(map[string]*tailPathInfo)
 			staticPaths := make(map[string]*staticPathInfo)
 
@@ -117,7 +117,7 @@ func (b *PollBackend) Start(ctx context.Context, specs []WatchSpec, drain DrainF
 						continue
 					}
 					for _, p := range paths {
-						if _, ex := excluded[p]; ex {
+						if isExcluded(p, currentSpecs) {
 							continue
 						}
 						if spec.WatchMode == "static" {
