@@ -1,0 +1,79 @@
+name: Release
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Version bump & tag
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Use a PAT so the pushed commit/tag can trigger downstream workflows
+          # if needed. Falls back to GITHUB_TOKEN (sufficient for tag creation).
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine version bump from PR labels
+        id: bump
+        run: |
+          LABELS="${{ join(github.event.pull_request.labels.*.name, ',') }}"
+          if echo "$LABELS" | grep -qi "semver:major"; then
+            echo "type=major" >> "$GITHUB_OUTPUT"
+          elif echo "$LABELS" | grep -qi "semver:minor"; then
+            echo "type=minor" >> "$GITHUB_OUTPUT"
+          else
+            echo "type=patch" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute next version
+        id: version
+        run: |
+          CURRENT=$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          if [ -z "$CURRENT" ]; then
+            CURRENT="v0.0.0"
+          fi
+          BARE="${CURRENT#v}"
+          MAJOR=$(echo "$BARE" | cut -d. -f1)
+          MINOR=$(echo "$BARE" | cut -d. -f2)
+          PATCH=$(echo "$BARE" | cut -d. -f3)
+
+          case "${{ steps.bump.outputs.type }}" in
+            major) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR+1)); PATCH=0 ;;
+            *)     PATCH=$((PATCH+1)) ;;
+          esac
+
+          NEXT="${MAJOR}.${MINOR}.${PATCH}"
+          echo "bare=${NEXT}"   >> "$GITHUB_OUTPUT"
+          echo "tag=v${NEXT}"   >> "$GITHUB_OUTPUT"
+
+      - name: Update version file
+        run: |
+          printf 'package version\n\n// Version is set at build time via -ldflags "-X github.com/sgw/jailtime/pkg/version.Version=<tag>".\n// It defaults to "dev" when not set.\nvar Version = "%s"\n\nconst AppName = "jailtime"\n' \
+            "${{ steps.version.outputs.bare }}" > pkg/version/version.go
+
+      - name: Commit version bump
+        run: |
+          git add pkg/version/version.go
+          git commit -m "chore: bump version to ${{ steps.version.outputs.tag }} [skip ci]"
+
+      - name: Create and push tag
+        run: |
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin main
+          git push origin "${{ steps.version.outputs.tag }}"
