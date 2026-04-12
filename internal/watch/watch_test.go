@@ -403,6 +403,65 @@ func TestFsnotifyBackendSubdirGlob(t *testing.T) {
 	}
 }
 
+// TestFsnotifyBackendSubdirGlobRotation verifies that an already-matched file in
+// an existing wildcard subdirectory is rediscovered after log rotation
+// (rename + recreate) and continues to emit events from the recreated file.
+func TestFsnotifyBackendSubdirGlobRotation(t *testing.T) {
+	base := t.TempDir()
+	subdir := filepath.Join(base, "site1")
+	if err := os.Mkdir(subdir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(subdir, "access.log")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	pattern := filepath.Join(base, "*", "access.log")
+	b := NewFsnotifyBackend(100 * time.Millisecond)
+	specs := []WatchSpec{{JailName: "apache", Globs: []string{pattern}, ReadFromEnd: false}}
+	out, cancel := startBackendDrain(t, b, specs)
+	defer cancel()
+
+	time.Sleep(150 * time.Millisecond)
+	drainTimeout := time.After(300 * time.Millisecond)
+drainLoop:
+	for {
+		select {
+		case <-out:
+		case <-drainTimeout:
+			break drainLoop
+		}
+	}
+
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	newF, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	fmt.Fprintln(newF, "9.8.7.6 GET /rotated 200")
+	newF.Close()
+
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for event after glob-backed rotation")
+	}
+	if ev.Line != "9.8.7.6 GET /rotated 200" {
+		t.Errorf("expected line %q, got %q", "9.8.7.6 GET /rotated 200", ev.Line)
+	}
+	if ev.FilePath != path {
+		t.Errorf("expected FilePath %q, got %q", path, ev.FilePath)
+	}
+	if !containsJail(ev.Jails, "apache") {
+		t.Errorf("expected Jails to contain %q, got %v", "apache", ev.Jails)
+	}
+}
+
 // TestFsnotifyBackendBasic mirrors TestPollBackendBasic but uses fsnotify backend.
 func TestFsnotifyBackendBasic(t *testing.T) {
 	dir := t.TempDir()
