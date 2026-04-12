@@ -71,10 +71,20 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 	dirty := make(map[string]struct{})       // tail-mode dirty paths
 	staticDirty := make(map[string]struct{}) // static-mode dirty paths
 	parentDirs := make(map[string][]string)  // parent dir → []glob patterns
+	watchedDirs := make(map[string]struct{}) // directories watched for creates
 
 	var drainTimerC <-chan time.Time // nil = idle
 	var lastDrainTime time.Duration  // previous drain wall time
 	var pendingTriggerAt time.Time   // when the current pending drain was first triggered
+
+	ensureDirWatch := func(dir string) {
+		if _, ok := watchedDirs[dir]; ok {
+			return
+		}
+		if err := watcher.Add(dir); err == nil {
+			watchedDirs[dir] = struct{}{}
+		}
+	}
 
 	readTailLines := func(p string) []RawLine {
 		ft, ok := tailers[p]
@@ -130,10 +140,12 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 		}
 		tailers[p] = ft
 		dirty[p] = struct{}{}
+		ensureDirWatch(filepath.Dir(p))
 		_ = watcher.Add(p)
 	}
 
 	openStatic := func(p string) {
+		ensureDirWatch(filepath.Dir(p))
 		if _, ok := staticPathToJails[p]; ok {
 			// Already tracked; mark dirty to do initial diff.
 			staticDirty[p] = struct{}{}
@@ -184,7 +196,7 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 				// Watch parent dir for CREATE events.
 				pd := globParentDir(pattern)
 				parentDirs[pd] = appendUniq(parentDirs[pd], pattern)
-				_ = watcher.Add(pd)
+				ensureDirWatch(pd)
 			}
 		}
 		for p := range newPathToJails {
@@ -222,6 +234,8 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 
 		// Case 1: known tail file recreated (rotation).
 		if ft, ok := tailers[name]; ok {
+			ensureDirWatch(filepath.Dir(name))
+			_ = watcher.Add(name)
 			_ = ft.Reopen(false)
 			dirty[name] = struct{}{}
 			return
