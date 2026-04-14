@@ -459,7 +459,7 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		// This lets mixed IP/CIDR files work with net_type: cidr.
 		normalized, cidrErr := filter.NormalizeToCIDR(result.IP)
 		if cidrErr != nil {
-			slog.Debug("ip validation failed",
+			slog.Error("ip validation failed",
 				"jail", cfg.Name,
 				"ip", result.IP,
 				"net_type", "CIDR",
@@ -470,7 +470,7 @@ func (jr *JailRuntime) HandleEvent(ctx context.Context, evt watch.Event) error {
 		result.IP = normalized
 	default: // "IP" or unset
 		if net.ParseIP(result.IP) == nil {
-			slog.Debug("ip validation failed",
+			slog.Error("ip validation failed",
 				"jail", cfg.Name,
 				"ip", result.IP,
 				"net_type", cfg.NetType,
