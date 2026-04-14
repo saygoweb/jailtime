@@ -10,6 +10,16 @@ import (
 	"github.com/fsnotify/fsnotify"
 )
 
+// rotationScanMultiple is the ratio of drainInterval used as the rotation-scan
+// fallback period. The scan calls CheckRotation for every tailer so that
+// copytruncate rotations and dropped Create events (inotify queue overflow on
+// busy hosts) are caught within rotationScanMultiple × drainInterval.
+const rotationScanMultiple = 60
+
+// rotationScanMin is the floor for the rotation-scan period so the fallback
+// fires even when the drain interval is very short (e.g. in tests).
+const rotationScanMin = 5 * time.Second
+
 // FsnotifyBackend implements Backend using fsnotify for event-driven watching.
 // It uses a lazy one-shot drain timer: the timer is only armed when a dirty
 // path is detected, so the goroutine is truly idle when no files change.
@@ -89,6 +99,11 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 	readTailLines := func(p string) []RawLine {
 		ft, ok := tailers[p]
 		if !ok {
+			return nil
+		}
+		// CheckRotation handles copytruncate-style rotation (size shrank) and
+		// self-heals when a previous Reopen attempt failed (inode mismatch).
+		if _, err := ft.CheckRotation(); err != nil {
 			return nil
 		}
 		lines, err := ft.ReadLines()
@@ -304,6 +319,16 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 		armDrainTimer()
 	}
 
+	// Rotation-scan fallback: periodically call CheckRotation for every tailer
+	// so that copytruncate rotations and inotify-overflow-dropped Create events
+	// are caught even when no fsnotify event arrives.
+	scanInterval := time.Duration(rotationScanMultiple) * b.getDrainInterval()
+	if scanInterval < rotationScanMin {
+		scanInterval = rotationScanMin
+	}
+	rotationScanTicker := time.NewTicker(scanInterval)
+	defer rotationScanTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -338,6 +363,12 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 					staticDirty[event.Name] = struct{}{}
 					armDrainTimer()
 				}
+				// For tail-mode paths, drain any lines written since the last
+				// drain but before the rotation so they are not silently lost.
+				if _, known := pathToJails[event.Name]; known {
+					dirty[event.Name] = struct{}{}
+					armDrainTimer()
+				}
 			}
 
 		case <-drainTimerC:
@@ -363,6 +394,21 @@ func (b *FsnotifyBackend) Start(ctx context.Context, specs []WatchSpec, drain Dr
 			}
 			drain(ctx, batch)
 			lastDrainTime = time.Since(drainStart)
+
+		case <-rotationScanTicker.C:
+			// Fallback: detect rotations that were missed because the inotify
+			// event queue overflowed, or because a previous Reopen failed.
+			for p, ft := range tailers {
+				rotated, err := ft.CheckRotation()
+				if err != nil {
+					// Reopen failed (new file not yet present); will retry next tick.
+					continue
+				}
+				if rotated {
+					dirty[p] = struct{}{}
+					armDrainTimer()
+				}
+			}
 
 		case _, ok := <-watcher.Errors:
 			if !ok {

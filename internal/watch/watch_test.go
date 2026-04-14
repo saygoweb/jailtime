@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -459,6 +460,372 @@ drainLoop:
 	}
 	if !containsJail(ev.Jails, "apache") {
 		t.Errorf("expected Jails to contain %q, got %v", "apache", ev.Jails)
+	}
+}
+
+// TestFsnotifyBackendSubdirGlobRotationMultiple verifies that log rotation is
+// correctly detected for all domain directories when multiple subdirectory files
+// are rotated simultaneously — the typical Apache/logrotate pattern.
+func TestFsnotifyBackendSubdirGlobRotationMultiple(t *testing.T) {
+	base := t.TempDir()
+	domains := []string{"site-a.com", "site-b.com", "site-c.com"}
+
+	paths := make(map[string]string) // domain → log path
+	for _, d := range domains {
+		subdir := filepath.Join(base, d)
+		if err := os.Mkdir(subdir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		p := filepath.Join(subdir, "access.log")
+		if err := os.WriteFile(p, []byte("old line\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		paths[d] = p
+	}
+
+	pattern := filepath.Join(base, "*", "access.log")
+	b := NewFsnotifyBackend(100 * time.Millisecond)
+	specs := []WatchSpec{{JailName: "apache", Globs: []string{pattern}, ReadFromEnd: true}}
+	out, cancel := startBackendDrain(t, b, specs)
+	defer cancel()
+
+	// Let the backend settle; drain any startup events.
+	time.Sleep(200 * time.Millisecond)
+	drainTimeout := time.After(400 * time.Millisecond)
+drainLoop:
+	for {
+		select {
+		case <-out:
+		case <-drainTimeout:
+			break drainLoop
+		}
+	}
+
+	// Rotate all domains simultaneously (rename then create new empty file).
+	for _, d := range domains {
+		p := paths[d]
+		if err := os.Rename(p, p+".1"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Create(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	time.Sleep(150 * time.Millisecond) // let Create events propagate
+
+	// Write a distinct line to each new log file.
+	want := make(map[string]string)
+	for _, d := range domains {
+		line := d + " - rotated line"
+		want[paths[d]] = line
+		if err := os.WriteFile(paths[d], []byte(line+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Collect events; every domain must be heard from within 3 seconds.
+	seen := make(map[string]bool)
+	deadline := time.After(3 * time.Second)
+	for len(seen) < len(domains) {
+		select {
+		case ev := <-out:
+			if wantLine, ok := want[ev.FilePath]; ok && ev.Line == wantLine {
+				seen[ev.FilePath] = true
+			}
+		case <-deadline:
+			t.Errorf("timed out: only %d/%d domains received events after simultaneous rotation; missing files: %v",
+				len(seen), len(domains), missingKeys(want, seen))
+			return
+		}
+	}
+}
+
+// missingKeys returns keys present in want but not in seen.
+func missingKeys(want map[string]string, seen map[string]bool) []string {
+	var out []string
+	for k := range want {
+		if !seen[k] {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// TestFsnotifyBackendSubdirGlobRotationReadFromEnd verifies that after rotation,
+// only content from the new file is emitted — the old pre-rotation content is
+// not re-read — when ReadFromEnd is true (the production default).
+func TestFsnotifyBackendSubdirGlobRotationReadFromEnd(t *testing.T) {
+	base := t.TempDir()
+	subdir := filepath.Join(base, "site1")
+	if err := os.Mkdir(subdir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(subdir, "access.log")
+	// File already has content; with ReadFromEnd:true this must NOT be re-emitted.
+	if err := os.WriteFile(path, []byte("old line 1\nold line 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pattern := filepath.Join(base, "*", "access.log")
+	b := NewFsnotifyBackend(100 * time.Millisecond)
+	specs := []WatchSpec{{JailName: "apache", Globs: []string{pattern}, ReadFromEnd: true}}
+	out, cancel := startBackendDrain(t, b, specs)
+	defer cancel()
+
+	time.Sleep(200 * time.Millisecond)
+	// Drain any (unwanted) startup events.
+	drainTimeout := time.After(400 * time.Millisecond)
+drainLoop:
+	for {
+		select {
+		case <-out:
+		case <-drainTimeout:
+			break drainLoop
+		}
+	}
+
+	// Rotate and write a fresh line to the new file.
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	newF, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	fmt.Fprintln(newF, "new line after rotation")
+	newF.Close()
+
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for event after rotation with ReadFromEnd:true")
+	}
+	if ev.Line != "new line after rotation" {
+		t.Errorf("expected %q, got %q (old content must not be re-emitted)", "new line after rotation", ev.Line)
+	}
+}
+
+// TestFsnotifyBackendSubdirGlobRotationImmediate verifies that rotation is
+// detected even when writes to the new file begin immediately (no sleep between
+// create and write), mirroring how Apache opens and writes to the new log file
+// right after logrotate sends SIGHUP.
+func TestFsnotifyBackendSubdirGlobRotationImmediate(t *testing.T) {
+	base := t.TempDir()
+	subdir := filepath.Join(base, "site1")
+	if err := os.Mkdir(subdir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(subdir, "access.log")
+	if _, err := os.Create(path); err != nil {
+		t.Fatal(err)
+	}
+
+	pattern := filepath.Join(base, "*", "access.log")
+	b := NewFsnotifyBackend(100 * time.Millisecond)
+	specs := []WatchSpec{{JailName: "apache", Globs: []string{pattern}, ReadFromEnd: false}}
+	out, cancel := startBackendDrain(t, b, specs)
+	defer cancel()
+
+	time.Sleep(150 * time.Millisecond)
+	drainTimeout := time.After(300 * time.Millisecond)
+drainLoop:
+	for {
+		select {
+		case <-out:
+		case <-drainTimeout:
+			break drainLoop
+		}
+	}
+
+	// Rename then immediately create and write — no sleep.
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	newF, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(newF, "immediate write after rotation")
+	newF.Close()
+
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for event after immediate-write rotation")
+	}
+	if ev.Line != "immediate write after rotation" {
+		t.Errorf("expected %q, got %q", "immediate write after rotation", ev.Line)
+	}
+}
+
+// TestFsnotifyBackendSubdirGlobCopyTruncate verifies that copytruncate-style log
+// rotation (file is truncated in-place rather than renamed) is detected by the
+// fsnotify backend.  This exercises the CheckRotation path in readTailLines.
+func TestFsnotifyBackendSubdirGlobCopyTruncate(t *testing.T) {
+	base := t.TempDir()
+	subdir := filepath.Join(base, "site1")
+	if err := os.Mkdir(subdir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(subdir, "access.log")
+	if err := os.WriteFile(path, []byte("old content line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pattern := filepath.Join(base, "*", "access.log")
+	b := NewFsnotifyBackend(100 * time.Millisecond)
+	// ReadFromEnd:false so we'd pick up old content if CheckRotation is broken.
+	specs := []WatchSpec{{JailName: "apache", Globs: []string{pattern}, ReadFromEnd: false}}
+	out, cancel := startBackendDrain(t, b, specs)
+	defer cancel()
+
+	// Drain startup events (the existing "old content line").
+	time.Sleep(150 * time.Millisecond)
+	drainTimeout := time.After(400 * time.Millisecond)
+drainLoop:
+	for {
+		select {
+		case <-out:
+		case <-drainTimeout:
+			break drainLoop
+		}
+	}
+
+	// copytruncate step 1: truncate the file to zero (simulates logrotate's
+	// truncation of the live log). This generates a Write event; the drain
+	// will call CheckRotation and detect size(0) < offset → Reopen.
+	if err := os.Truncate(path, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Wait long enough for the drain to fire and detect the truncation.
+	time.Sleep(300 * time.Millisecond)
+
+	// copytruncate step 2: append new content (simulates Apache writing after
+	// receiving SIGHUP and having its fd reset to the same file).
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintln(f, "post-truncate line")
+	f.Close()
+
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for event after copytruncate-style rotation")
+	}
+	if ev.Line != "post-truncate line" {
+		t.Errorf("expected %q, got %q", "post-truncate line", ev.Line)
+	}
+}
+
+// TestFsnotifyBackendSubdirGlobRotationSecond verifies that a second rotation
+// (the day after the first) is detected correctly — i.e. the backend does not
+// get stuck after the first rotation has already been handled.
+func TestFsnotifyBackendSubdirGlobRotationSecond(t *testing.T) {
+	base := t.TempDir()
+	subdir := filepath.Join(base, "site1")
+	if err := os.Mkdir(subdir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(subdir, "access.log")
+	if _, err := os.Create(path); err != nil {
+		t.Fatal(err)
+	}
+
+	pattern := filepath.Join(base, "*", "access.log")
+	b := NewFsnotifyBackend(100 * time.Millisecond)
+	specs := []WatchSpec{{JailName: "apache", Globs: []string{pattern}, ReadFromEnd: false}}
+	out, cancel := startBackendDrain(t, b, specs)
+	defer cancel()
+
+	rotate := func(expectLine string) {
+		t.Helper()
+		// Drain pending events first.
+		time.Sleep(150 * time.Millisecond)
+		drainTimeout := time.After(300 * time.Millisecond)
+	drain:
+		for {
+			select {
+			case <-out:
+			case <-drainTimeout:
+				break drain
+			}
+		}
+
+		if err := os.Rename(path, path+".1"); err != nil {
+			t.Fatal(err)
+		}
+		newF, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(150 * time.Millisecond)
+		fmt.Fprintln(newF, expectLine)
+		newF.Close()
+
+		ev, ok := waitEvent(out, 2*time.Second)
+		if !ok {
+			t.Fatalf("timed out waiting for %q", expectLine)
+		}
+		if ev.Line != expectLine {
+			t.Errorf("expected %q, got %q", expectLine, ev.Line)
+		}
+	}
+
+	rotate("line after first rotation")
+	rotate("line after second rotation")
+}
+
+// TestPollBackendSubdirGlobRotation verifies that the poll backend also handles
+// log rotation in a wildcard-subdirectory glob pattern.
+func TestPollBackendSubdirGlobRotation(t *testing.T) {
+	base := t.TempDir()
+	subdir := filepath.Join(base, "site1")
+	if err := os.Mkdir(subdir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(subdir, "access.log")
+	if _, err := os.Create(path); err != nil {
+		t.Fatal(err)
+	}
+
+	pattern := filepath.Join(base, "*", "access.log")
+	b := NewPollBackend(100 * time.Millisecond)
+	specs := []WatchSpec{{JailName: "apache", Globs: []string{pattern}, ReadFromEnd: false}}
+	out, cancel := startBackendDrain(t, b, specs)
+	defer cancel()
+
+	time.Sleep(150 * time.Millisecond)
+	drainTimeout := time.After(400 * time.Millisecond)
+drainLoop:
+	for {
+		select {
+		case <-out:
+		case <-drainTimeout:
+			break drainLoop
+		}
+	}
+
+	if err := os.Rename(path, path+".1"); err != nil {
+		t.Fatal(err)
+	}
+	newF, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	fmt.Fprintln(newF, "poll rotation line")
+	newF.Close()
+
+	ev, ok := waitEvent(out, 2*time.Second)
+	if !ok {
+		t.Fatal("timed out waiting for event after poll-backend glob rotation")
+	}
+	if ev.Line != "poll rotation line" {
+		t.Errorf("expected %q, got %q", "poll rotation line", ev.Line)
+	}
+	if !containsJail(ev.Jails, "apache") {
+		t.Errorf("expected Jails to contain 'apache', got %v", ev.Jails)
 	}
 }
 
@@ -917,7 +1284,7 @@ func TestFsnotifyBackendIdleNoDrain(t *testing.T) {
 	f.Close()
 
 	const drainInterval = 50 * time.Millisecond
-	drainCount := 0
+	var drainCount atomic.Int64
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -925,14 +1292,14 @@ func TestFsnotifyBackendIdleNoDrain(t *testing.T) {
 	specs := []WatchSpec{{JailName: "idle-jail", Globs: []string{path}, ReadFromEnd: true}}
 	go func() {
 		_ = b.Start(ctx, specs, func(_ context.Context, lines []RawLine) {
-			drainCount += len(lines)
+			drainCount.Add(int64(len(lines)))
 		})
 	}()
 
 	// Wait 4× drainInterval with no writes — drain should NOT be called.
 	time.Sleep(4 * drainInterval)
-	if drainCount != 0 {
-		t.Errorf("expected 0 drain calls while idle, got drain count %d", drainCount)
+	if n := drainCount.Load(); n != 0 {
+		t.Errorf("expected 0 drain calls while idle, got drain count %d", n)
 	}
 
 	// Now write a line — it should arrive.
@@ -947,7 +1314,7 @@ func TestFsnotifyBackendIdleNoDrain(t *testing.T) {
 	for {
 		select {
 		case <-time.After(10 * time.Millisecond):
-			if drainCount > 0 {
+			if drainCount.Load() > 0 {
 				goto done
 			}
 		case <-deadline:

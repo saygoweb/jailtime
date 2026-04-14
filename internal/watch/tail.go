@@ -65,15 +65,16 @@ func (ft *FileTailer) ReadLines() ([]string, error) {
 	return lines, nil
 }
 
-// Reopen closes the current file descriptor and reopens the file at ft.path.
-// If readFromEnd is true, seeks to EOF; otherwise starts at the beginning.
+// Reopen reopens the file at ft.path, optionally seeking to EOF when readFromEnd
+// is true. The old file descriptor is closed only after the new one is successfully
+// opened, so a failed open never leaves the tailer with an invalid fd.
 // Used for rotation handling (called after a CREATE event or by CheckRotation).
 func (ft *FileTailer) Reopen(readFromEnd bool) error {
-	ft.file.Close()
 	f, err := os.Open(ft.path)
 	if err != nil {
 		return err
 	}
+	ft.file.Close()
 	ft.file = f
 	ft.reader.Reset(f)
 	ft.offset = 0
