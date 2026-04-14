@@ -4,4 +4,4 @@ package version
 // It defaults to "dev" when not set.
 var Version = "1.0.3"
 
-const AppName = "jailtime"
+const AppName = "Jailtime"

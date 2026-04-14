@@ -105,9 +105,12 @@ any included fragment files under jails.d/.`,
 		Use:   "version",
 		Short: "Print version information",
 		Run: func(cmd *cobra.Command, args []string) {
-			fmt.Printf("%s %s\n", version.AppName, version.Version)
+			fmt.Printf("%s v%s\n", version.AppName, version.Version)
 		},
 	}
+
+	root.Version = version.Version
+	root.SetVersionTemplate(fmt.Sprintf("%s v%s\n", version.AppName, version.Version))
 
 	// ── config ───────────────────────────────────────────────────────────────
 	configCmd := &cobra.Command{
