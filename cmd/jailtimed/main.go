@@ -35,7 +35,7 @@ func main() {
 	root.Flags().Bool("version", false, "print version and exit")
 	root.PreRunE = func(cmd *cobra.Command, args []string) error {
 		if v, _ := cmd.Flags().GetBool("version"); v {
-			fmt.Printf("%s %s\n", version.AppName, version.Version)
+			fmt.Printf("%s v%s\n", version.AppName, version.Version)
 			os.Exit(0)
 		}
 		return nil
