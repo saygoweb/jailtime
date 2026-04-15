@@ -9,6 +9,10 @@ Restart=on-failure
 RestartSec=2s
 RuntimeDirectory=jailtime
 RuntimeDirectoryMode=0755
+CacheDirectory=whois_cache
+CacheDirectoryMode=0755
+LogsDirectory=intrusion
+LogsDirectoryMode=0755
 
 # Hardening (tune for firewall backend needs)
 NoNewPrivileges=true
