@@ -133,6 +133,10 @@ sudo systemctl status jailtimed
 journalctl -u jailtimed -f
 ```
 
+The packaged unit keeps the filesystem mostly read-only and grants write access
+only to `/var/cache/whois_cache` and `/var/log/intrusion` for the bundled
+whois/RDAP cache and intrusion-log actions.
+
 ### Verify
 
 ```sh

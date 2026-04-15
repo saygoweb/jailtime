@@ -433,6 +433,9 @@ journalctl -u jailtimed -f
 ```
 
 The unit file runs jailtimed as root (required for iptables/nft/ipset operations).
+It keeps `ProtectSystem=strict` enabled while allowing writes only to the
+systemd-managed directories `/var/cache/whois_cache` and `/var/log/intrusion`,
+which are used by the bundled RDAP/cache tooling and intrusion log actions.
 Adjust `deploy/jailtimed.service` if you use a capability-based setup instead.
 
 ---
